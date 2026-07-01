@@ -292,17 +292,17 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-  A[notify / rescan] --> B{readiness ok?}
+  A["notify / rescan"] --> B{"readiness ok?"}
   B -->|no| A
-  B -->|yes| C[enqueue Ready<br/>durable]
-  C --> D[worker acquires<br/>global slot + bandwidth]
-  D --> E[open source<br/>streaming read + hash]
-  E --> F[egress.deliver<br/>resumable]
-  F --> G{verify checksum<br/>vs destination}
-  G -->|mismatch| R[error → retry]
-  G -->|ok| H[persist Verified<br/>write-ahead]
-  H --> I[completion:<br/>delete | archive]
-  I --> J[persist Completed<br/>emit event + retained state]
+  B -->|yes| C["enqueue Ready (durable)"]
+  C --> D["worker acquires global slot + bandwidth"]
+  D --> E["open source: streaming read + hash"]
+  E --> F["egress.deliver (resumable)"]
+  F --> G{"verify checksum vs destination"}
+  G -->|mismatch| R["error — requeue for retry"]
+  G -->|ok| H["persist Verified (write-ahead)"]
+  H --> I["completion: delete or archive"]
+  I --> J["persist Completed; emit event + retained state"]
   R --> C
 ```
 
@@ -680,14 +680,14 @@ sequenceDiagram
   participant D as Destination
   participant S as Durable store
   participant F as Filesystem
-  W->>D: deliver() (resumable)
-  D-->>W: delivered (+checksum)
+  W->>D: deliver() resumable
+  D-->>W: delivered with checksum
   W->>D: verify()
   D-->>W: ok
   W->>S: persist Verified (write-ahead)
-  W->>F: completion (delete | move to archive)
+  W->>F: completion (delete or move to archive)
   W->>S: persist Completed
-  Note over W,S: Crash between Verified and Completed →<br/>on restart re-verify idempotently, then finish completion.<br/>Never re-upload; never lose the source.
+  Note over W,S: Crash between Verified and Completed:<br/>on restart re-verify idempotently, then finish completion.<br/>Never re-upload; never lose the source.
 ```
 
 Object stores use **stable, deterministic keys** (relpath + prefix) so re-delivery overwrites identically
