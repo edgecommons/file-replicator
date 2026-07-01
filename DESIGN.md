@@ -463,7 +463,7 @@ stateDiagram-v2
   InProgress --> Failed: error (attempt++)
   Failed --> Ready: backoff elapsed, within giveUpAfter
   Failed --> Exhausted: giveUpAfter exceeded / maxAttempts hit
-  Verified --> Completed: completion action (delete|archive)
+  Verified --> Completed: completion action (delete or archive)
   Exhausted --> Quarantined: onExhausted=quarantine (move to failedDir)
   Exhausted --> Retained: onExhausted=retainInPlace
   Completed --> [*]
@@ -687,11 +687,13 @@ sequenceDiagram
   W->>S: persist Verified (write-ahead)
   W->>F: completion (delete or move to archive)
   W->>S: persist Completed
-  Note over W,S: Crash between Verified and Completed:<br/>on restart re-verify idempotently, then finish completion.<br/>Never re-upload; never lose the source.
+  Note over W,S: crash between Verified and Completed is recovered idempotently on restart
 ```
 
-Object stores use **stable, deterministic keys** (relpath + prefix) so re-delivery overwrites identically
-(idempotent), avoiding duplicates (FR-REL-4).
+**Crash recovery:** a crash between *persist Verified* and *persist Completed* is safe — on restart the item
+is re-verified idempotently (the destination object already matches), then the completion action re-runs. The
+file is **never re-uploaded and never lost**. Object stores use **stable, deterministic keys** (relpath +
+prefix) so re-delivery overwrites identically (idempotent), avoiding duplicates (FR-REL-4).
 
 ### 13.3 Failure handling & the Failed folder (FR-CMP-6 — your question #9)
 
