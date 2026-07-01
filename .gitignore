@@ -1,0 +1,20 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Local-dev override: point ggcommons at the sibling libs/rust instead of the pinned git rev.
+# Gitignored so CI uses the git rev; see the org CLAUDE.md "Local-dev notes".
+/.cargo/config.toml
+
+# Greengrass build output
+/greengrass-build
+/zip-build
+
+# Local runtime data (durable state, vault, spool/archive scratch)
+/data
+*.redb
+vault.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
