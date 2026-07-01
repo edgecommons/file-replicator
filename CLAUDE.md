@@ -26,19 +26,22 @@ follows the phase plan (DESIGN §19) after sign-off. Do not write engine code be
 - Docs: Diátaxis `.md` (+`.mdx` only where Starlight `<Tabs>` needed), **no frontmatter**; synced to the site.
 
 ## Key design choices (see DESIGN.md v0.2 for rationale)
-- **Durable state = SQLite** (`rusqlite` bundled, WAL) — recommended over redb now that the Windows C
-  toolchain exists ([[windows-msvc-build-toolchain]]): crash-safe AND better fit for the get-status/stats
-  query surface + operational introspection. `redb` kept as a pure-Rust fallback behind the same
-  `state.rs` trait (feature `state-redb`). **Pending user's final call (DESIGN §14/§20-F).**
+- **Durable state = SQLite** (`rusqlite` bundled, WAL) — DECIDED (user confirmed). Chosen over redb now the
+  Windows C toolchain exists ([[windows-msvc-build-toolchain]]): crash-safe AND better fit for the
+  get-status/stats query surface + operational introspection. `redb` kept only as a `state-redb` fallback
+  feature behind the same `state.rs` trait.
 - **New ecosystem dep:** `aws-sdk-s3` (kinesis/sm/kms/ssm exist in ggcommons; s3 did not).
 - Backends behind a `Destination` trait + cargo features; default = `local` + `dest-s3`; immature crates
   (azure/gcs) OFF by default (the `greengrass`/`streaming-kafka` pattern).
 - **Scheduling = cron-first** (`croner`, tz/DST-aware); plain-English is optional sugar → cron. Windows =
   `open`+`close` (or `open`+`durationMins`) crons; `onWindowClose` = pauseResume (resume if dest supports,
   else finishCurrent) | finishCurrent.
-- **Unified namespace** for all cmd/evt/state: `edgecommons/v1/{enterprise}/{site}/{thing}/file-replicator/
-  {cmd|evt|state}/…` — RESTful, site-scoped, cloud-bridge-safe; retained `state/…` snapshots. Replaces the
-  v0.1 mixed ggcommons/+edgecommons/ roots. Core `ggcommons/…` control topics = separate migration proposal.
+- **Unified namespace** for all cmd/evt/state: **`{thing}/file-replicator/{cmd|evt|state}/{resource…}`** —
+  rooted on the IoT-Core-globally-unique ThingName; NO vendor root/version/site/enterprise in the path
+  (version is in the envelope; site/enterprise are unreliable tags → carried in the envelope for
+  consumer-side filtering). Fits IoT Core's 256-byte / 7-slash limits. Retained `state/…` snapshots.
+  Configurable prefix (default `{ThingName}/file-replicator`). Core `ggcommons/…` topics = separate
+  migration proposal + optional legacy `GetConfiguration` alias.
 - Durable **write-ahead** state → crash-safe move+delete with checksum-verify-before-complete.
 - **Long-outage tolerant** (hours–~2d): time-based `giveUpAfter` (default 7d, not attempt caps), resume
   in-flight, disconnection circuit-breaker.

@@ -331,7 +331,7 @@ under `limits`. `completion` is its own section (§20-C, accepted).
         "timezone": "America/Chicago"
       },
       "limits": { "maxConcurrentFiles": 8, "maxBandwidth": "50MB/s" },   // aggregate caps
-      "topics": { "prefix": "edgecommons/v1/{enterprise}/{site}/{thing}/file-replicator" }  // UNS root (defaulted)
+      "topics": { "prefix": "{ThingName}/file-replicator" }   // UNS root (defaulted; §15)
     },
     "instances": [
       {
@@ -382,7 +382,7 @@ under `limits`. `completion` is its own section (§20-C, accepted).
 
   "credentials": { "vault": { "path": "/data/vault.json" }, "keyProvider": { "type": "file" } },
   "messaging":   { /* platform-appropriate broker block */ },
-  "tags":        { "enterprise": "acme", "site": "site42" },   // feed the UNS + envelope
+  "tags":        { "enterprise": "acme", "site": "site42" },   // in the ENVELOPE for consumer-side filtering — NOT in the topic path (§15)
   "logging":     { "level": "INFO" },
   "metricEmission": { "namespace": "filereplicator" }
 }
@@ -764,14 +764,12 @@ isn't crash-safe, use redb" test resolves in SQLite's favor — SQLite *is* cras
 | Build cost | none | one C amalgamation compile (Linux builders + Windows both have the toolchain now) |
 | Binary/runtime | slightly smaller | statically linked, no runtime dep |
 
-**Recommendation: switch to SQLite** (`rusqlite` with the `bundled` feature, WAL mode). The status/statistics
-surface (FR-CTL-2) and per-file diagnostics map directly onto SQL, and an on-disk SQLite file an operator can
-inspect is a real advantage for a data-moving component. The only cost — a C compile at build time — is now
-negligible (all build targets have the toolchain; the runtime binary is statically linked with no external
-dep). **`redb` remains the fallback** if you'd rather keep the build 100% pure-Rust; the `state.rs` API is
-written against an internal trait so the backend is swappable and does not leak into the engine. Per your
-#14-F, since SQLite *is* crash-safe and the better functional fit, this flips to SQLite unless you prefer the
-pure-Rust build.
+**Decision: SQLite** (`rusqlite` with the `bundled` feature, WAL mode) — confirmed by review. The
+status/statistics surface (FR-CTL-2) and per-file diagnostics map directly onto SQL, and an on-disk SQLite
+file an operator can inspect is a real advantage for a data-moving component. The only cost — a C compile at
+build time — is now negligible (all build targets have the toolchain; the runtime binary is statically linked
+with no external dep). **`redb` is retained only as a `state-redb` fallback feature** behind the same
+`state.rs` trait (backend swappable, does not leak into the engine).
 
 ### 14.2 Schema (SQLite)
 
@@ -794,79 +792,110 @@ Located under the component data dir (`/data/...` on a k8s PVC; component work d
 
 ## 15. Unified namespace (topic design)
 
-**Your #12 — the most important structural change.** v0.1 mixed two roots (`ggcommons/…` inherited from
-core's `GetConfiguration`, and `edgecommons/filereplicator/…`), placed identity inconsistently, had no
-enterprise/site dimension, and would collide when many edges bridge to one cloud broker. We replace it with a
-single **RESTful, site-scoped, cloud-bridge-safe** UNS.
+**Your #12 — the key structural fix.** v0.1 mixed two roots and leaned on tag-derived location segments. This
+revision roots every topic on identifiers that are **mandatory and reliable**, and fits comfortably inside AWS
+IoT Core's topic limits.
 
-### 15.1 The scheme
+### 15.1 Constraints & principles (your feedback)
+
+- **IoT Core limits:** a topic is ≤ **256 bytes** (UTF-8) and ≤ **7 forward slashes** (8 levels); a level MUST
+  NOT start with `$` (reserved). The scheme must fit *comfortably* inside both.
+- **Only reliable identifiers may be REQUIRED path segments.** `thing` (AWS IoT Core guarantees ThingName is
+  **globally unique** per account/region — we adopt that as a component invariant) and `component` are always
+  present. **`site`/`enterprise` come from optional `tags`, are not mandated, and are therefore REMOVED from
+  the path** — they travel in the message envelope (`tags`) for consumer-side filtering / cloud-rule routing.
+- **No vendor root** — `edgecommons` dropped: `thing` already makes topics collision-free, so a root only
+  costs bytes.
+- **No version segment** — `v1` dropped: the version is carried in the envelope (`header.version`).
+
+### 15.2 The scheme
 
 ```
-edgecommons/{ver}/{enterprise}/{site}/{thing}/{component}/{class}/{resource…}
+{thing}/{component}/{class}/{resource…}
 ```
 
-- **single root** `edgecommons`; **`{ver}`** (`v1`) for evolution.
-- **`{enterprise}/{site}/{thing}`** = ISA-95-style location + edge identity → **globally unique across all
-  sites**, so an edge→cloud bridge forwarding `edgecommons/v1/#` never collides. `enterprise`/`site` come from
-  `tags`; `thing` from ggcommons identity. (Area/line stay in the message `tags`/body to bound topic depth;
-  the prefix is a configurable template if a deeper hierarchy is wanted.)
-- **`{component}`** = `file-replicator`.
-- **`{class}`** — clean separation of interaction kinds:
-  - **`cmd`** — inbound commands (component subscribes). RESTful resource paths.
-  - **`evt`** — outbound event stream (non-retained).
-  - **`state`** — outbound **retained** current state (snapshot-on-connect for UI/cloud).
+- **`{thing}`** — ggcommons ThingName; globally unique → collision-free across the fleet and after
+  cloud-bridging, with no root needed.
+- **`{component}`** — the short registry slug **`file-replicator`** (not the 38-char reverse-DNS full name —
+  saves bytes, reads better).
+- **`{class}`** ∈ `cmd` (inbound commands) · `evt` (event stream, non-retained) · `state` (**retained**
+  current snapshot).
 
-### 15.2 Topic map
+This also *matches what core already does* for metrics (`{ThingName}/{ComponentName}/metric`) — we simply drop
+the inconsistent `ggcommons/` root and add the `class` layer (§15.6).
 
-| Purpose | Class | Topic (under the identity prefix `…/file-replicator`) | Retained |
+### 15.3 Topic map
+
+| Purpose | Class | Topic (prefix = `{thing}/file-replicator`) | Retained |
 |---|---|---|---|
-| Get config | cmd | `/cmd/config` (request/reply) | — |
-| Get status | cmd | `/cmd/status` or `/cmd/instances/{instance}/status` | — |
-| Trigger now | cmd | `/cmd/trigger` or `/cmd/instances/{instance}/trigger` | — |
-| Activate/deactivate | cmd | `/cmd/instances/{instance}/activation`  body `{active,persist,reset}` | — |
-| Event stream | evt | `/evt/instances/{instance}/{event}` (e.g. `…/replication-progress`) | no |
-| Component events | evt | `/evt/{event}` (e.g. `component-ready`) | no |
-| Instance current state | state | `/state/instances/{instance}` | **yes** |
-| Component current state | state | `/state` | **yes** |
+| Get config | cmd | `…/cmd/config` (request/reply) | — |
+| Get status | cmd | `…/cmd/status` · `…/cmd/instances/{instance}/status` | — |
+| Trigger now | cmd | `…/cmd/trigger` · `…/cmd/instances/{instance}/trigger` | — |
+| Activate/deactivate | cmd | `…/cmd/instances/{instance}/activation`  body `{active,persist,reset}` | — |
+| Instance events | evt | `…/evt/instances/{instance}/{event}` | no |
+| Component events | evt | `…/evt/{event}` (e.g. `component-ready`) | no |
+| Instance current state | state | `…/state/instances/{instance}` | **yes** |
+| Component current state | state | `…/state` | **yes** |
 
-Replies use the request's `reply_to` (ephemeral topic) via `messaging.reply` — no fixed reply topics to
-collide.
+Deepest topic = `…/cmd/instances/{instance}/activation` = **5 slashes** (well under 7). Replies use the
+request's `reply_to` (ephemeral) — no fixed reply topics.
 
-### 15.3 Why this bridges to the cloud (RESTful + wildcard-friendly)
+### 15.4 Byte budget (256-byte limit)
+
+Worst-case, all segments long:
+
+```
+{thing}(≤128) / file-replicator(15) / evt(3) / instances(9) / {instance}(≤48) / {event}(≤28)
+= 128 + 1 + 15 + 1 + 3 + 1 + 9 + 1 + 48 + 1 + 28  ≈ 236 bytes  ✓
+```
+
+Comfortable for typical names; the budget only tightens as `thing` nears the 128-char IoT Core max. Docs will
+state the budget and recommend short `instance` ids. (If ever tight, the `instances/` literal can collapse to
+a reserved-id scheme — unnecessary at these budgets.)
+
+### 15.5 Cloud bridging (RESTful + wildcard-friendly)
 
 ```mermaid
 flowchart LR
-  subgraph Edge A - site42
-    A1[gw-01/file-replicator]
+  subgraph EdgeA["Edge — gw-01"]
+    A1["gw-01/file-replicator/…"]
   end
-  subgraph Edge B - site7
-    B1[gw-09/file-replicator]
+  subgraph EdgeB["Edge — gw-09"]
+    B1["gw-09/file-replicator/…"]
   end
-  A1 -->|edgecommons/v1/#| BR[MQTT bridge]
-  B1 -->|edgecommons/v1/#| BR
+  A1 -->|"bridge (# or per-thing)"| BR[MQTT bridge]
+  B1 -->|bridge| BR
   BR --> CLOUD[(Cloud broker /<br/>global UI)]
-  CLOUD -.->|"sub edgecommons/v1/+/site42/+/file-replicator/evt/#"| UI1[Site view]
-  CLOUD -.->|"sub edgecommons/v1/+/+/+/file-replicator/state/#"| UI2[Global fleet state]
+  CLOUD -.->|"sub +/file-replicator/state/#"| UI1[Global fleet state]
+  CLOUD -.->|"sub gw-01/file-replicator/evt/#"| UI2[One edge, live]
 ```
 
-Because identity is *in the topic* (`enterprise/site/thing`), every edge's messages stay distinct after
-bridging, and consumers select by any level with wildcards (one site, one thing, one instance, all state,
-etc.). Retained `state/…` gives a global dashboard the latest snapshot immediately on connect.
+`thing` is globally unique, so bridging (`#`, or per-thing) preserves distinctness with **no location segments
+needed**. Consumers select with wildcards: all file-replicator state across the fleet
+(`+/file-replicator/state/#`), one edge (`{thing}/file-replicator/#`), one instance
+(`+/file-replicator/evt/instances/{id}/#`). Retained `state/…` gives a dashboard the latest snapshot on
+connect. Location filtering (site/enterprise) happens on the envelope `tags` (consumer-side or a cloud rule),
+since those aren't reliable enough to sit in the path.
 
-### 15.4 Reconciling with ggcommons core (the "why two roots" answer)
+### 15.6 Reconciling with ggcommons core
 
-The mixing came from **core**: `GetConfiguration` and heartbeat/metrics publish under `ggcommons/…`. We
-shouldn't perpetuate it. Plan:
-1. **file-replicator** uses the unified `edgecommons/v1/…` for all its cmd/evt/state now.
-2. **Compat alias (optional):** also answer the legacy core `ggcommons/{thing}/config/get/{component}` for
+Core publishes heartbeat/metrics under `ggcommons/{ThingName}/{ComponentName}/…` and answers
+`GetConfiguration` on `ggcommons/{ThingName}/config/get/{ComponentName}`. Our scheme intentionally keeps
+core's `{thing}/{component}` ordering — minus the `ggcommons/` root, plus the `class` layer. Plan:
+1. **file-replicator** uses `{thing}/file-replicator/{class}/…` now.
+2. **Optional legacy alias:** also answer the core `ggcommons/{thing}/config/get/{component}` for
    `GetConfiguration` so existing config-source clients keep working (`legacyConfigTopic: true`).
-3. **Core proposal (separate):** migrate ggcommons core control/heartbeat/metric topics into the same
-   `edgecommons/v1/…` UNS (four-language parity), so the whole ecosystem is one bridge-safe namespace. This is
-   the proper home for the "promote to core" idea (§16, §20-E) — a UNS + control-surface standard, not just a
-   single message.
+3. **Separate core proposal:** drop the `ggcommons/` root and adopt the `class` layer across core
+   (four-language parity) → one consistent, bridge-safe namespace ecosystem-wide. This is the proper home for
+   the "promote to core" idea (§16, §20-E).
 
-All topics are configurable via `component.global.topics.prefix` (+ per-instance override); the values above
-are the intelligent defaults.
+### 15.7 Configurability & non-IoT-Core brokers
+
+Prefix defaults to `{ThingName}/file-replicator` (resolved via the ggcommons template resolver, which
+sanitizes for topic safety); overridable via `component.global.topics.prefix` (+ per-instance). Deployments on
+a *shared* non-IoT-Core broker that want an app namespace can prepend one here. **HOST note:** without IoT Core
+there's no ThingName-uniqueness enforcement, so set a unique `-t/--thing` per HOST deployment (the default
+identity would otherwise collide).
 
 ---
 
@@ -989,12 +1018,13 @@ rehash of the config keys.
 - **D. Readiness default — DECIDED:** stability window; checksum-verify-always. ✔
 - **E. GetConfiguration → core — ACCEPTED:** implement responder locally now against the core contract;
   propose the reusable core **control-surface + UNS** standard separately (§15.4). ✔
-- **F. Durable state — CHANGED RECOMMENDATION → SQLite** (`rusqlite` bundled, WAL): crash-safe *and* the
-  better functional fit for the status/statistics surface + operational introspection, now that the C
-  toolchain is available (§14). `redb` remains the pure-Rust fallback behind the same internal trait —
-  **your call** (§14.1 lays out the trade-off; per your #14-F, SQLite is crash-safe so it wins on fit unless
-  you want a pure-Rust build).
+- **F. Durable state — DECIDED → SQLite** (`rusqlite` bundled, WAL): crash-safe *and* the better functional
+  fit for the status/statistics surface + operational introspection, now that the C toolchain is available
+  (§14). `redb` retained only as a `state-redb` fallback feature behind the same `state.rs` trait. ✔
 - **G. Category — ACCEPTED:** registry `category: "sink"`. ✔
+- **H. UNS shape — REVISED per review:** `{thing}/{component}/{class}/{resource…}` — dropped
+  `edgecommons` root, `v1` (envelope carries version), and `site`/`enterprise` (unreliable tags → envelope);
+  rooted on the IoT-Core-globally-unique `thing`; fits the 256-byte / 7-slash limits (§15). ✔ (confirm §15.2)
 
 **New decisions in this revision (flag if you disagree):**
 - Cron-first scheduling (`croner`), English as optional sugar; windows = open+close/duration crons (§12).
@@ -1003,7 +1033,8 @@ rehash of the config keys.
 - Time-based `giveUpAfter` (default 7d) over attempt caps; circuit-breaker for long outages (§13.4).
 - Bandwidth caps per-instance + global (§13.5).
 - Activation: persisted runtime state wins over config `enabled` (§7.5).
-- UNS: `edgecommons/v1/{enterprise}/{site}/{thing}/file-replicator/{cmd|evt|state}/…`, retained state (§15).
+- UNS: `{thing}/file-replicator/{cmd|evt|state}/…` (rooted on the globally-unique ThingName; no vendor/version/
+  site/enterprise in the path — those are unreliable tags or live in the envelope), retained state (§15).
 
 ---
 
@@ -1049,7 +1080,7 @@ Validation: HOST→Windows + EMQX/floci; GREENGRASS→lab-5950x; k8s→kind + la
 | `ggcommons` | the library | pinned by git rev; local sibling via `.cargo/config.toml` (gitignored) |
 | `tokio` | async runtime | `rt-multi-thread,macros,signal,time,sync,fs` |
 | `notify` | filesystem watch | already used by the ggcommons config watcher |
-| **`rusqlite`** (bundled) | durable state | **recommended (§14)**; C compile OK now. `redb` = pure-Rust fallback |
+| **`rusqlite`** (bundled) | durable state | **decided (§14)**; WAL, statically linked. `redb` = `state-redb` fallback |
 | **`croner`** + `chrono` + `chrono-tz` | cron + windows, TZ/DST | pure-Rust; alternatives `cron`/`saffron` |
 | `globset` | include/exclude globs | pure-Rust |
 | `crc32c` / `sha2` | integrity | pure-Rust |
@@ -1092,13 +1123,12 @@ file-replicator/
 
 ### Review checklist
 
-1. **§14 (F)** — SQLite (recommended) vs pure-Rust redb for durable state — your call.
-2. **§12** — cron-first + English sugar; confirm the window model (open/close/duration) fits your phrasings.
-3. **§15** — the UNS scheme `edgecommons/v1/{enterprise}/{site}/{thing}/file-replicator/{cmd|evt|state}/…` —
-   confirm the hierarchy (enterprise/site/thing depth; area/line in tags) and the retained-state approach.
-4. **§13.3** — Failed-folder default (`retainInPlace` vs `quarantine`).
-5. **§13.4** — `giveUpAfter` default (7d) + circuit-breaker for long outages.
-6. **§11.5** — ambient-creds-by-default for S3.
-7. **§21** — phase ordering (P1 local + P2 S3 = usable MVP).
+- ✅ **§14 (F)** — durable state = **SQLite** (decided).
+- ✅ **§15 (H)** — UNS = `{thing}/file-replicator/{cmd|evt|state}/…` (revised per review; confirm §15.2 reads right).
+- ⬜ **§12** — cron-first + English sugar; confirm the window model (open/close/duration) fits your phrasings.
+- ⬜ **§13.3** — Failed-folder default (`retainInPlace` vs `quarantine`).
+- ⬜ **§13.4** — `giveUpAfter` default (7d) + circuit-breaker for long outages.
+- ⬜ **§11.5** — ambient-creds-by-default for S3.
+- ⬜ **§21** — phase ordering (P1 local + P2 S3 = usable MVP).
 
 On sign-off I'll scaffold P0 and open the registry PR.
