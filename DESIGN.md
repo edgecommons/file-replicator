@@ -1,17 +1,33 @@
 # file-replicator — Requirements & Design
 
-> **Status:** DRAFT for review · **Version:** 0.1 (design) · **Date:** 2026-07-01
+> **Status:** DRAFT for review · **Version:** 0.2 (revised after review round 1) · **Date:** 2026-07-01
 > **Component:** `file-replicator` · **Full name:** `com.mbreissi.greengrass.FileReplicator`
 > **Category:** `sink` (northbound delivery) · **Language:** Rust · **Library:** `ggcommons`
 > **Platforms:** HOST · GREENGRASS · KUBERNETES
 
-This document is the single review artifact. It captures **what** the component does (requirements)
-and **how** it is built (design), grounded in the existing EdgeCommons conventions (`telemetry-processor`
-as the Rust template, the `ggcommons` library API, and the org registry/CI/docs plumbing). Nothing here
-is implemented yet — this is for your review before we scaffold code.
+This document is the single review artifact. It captures **what** the component does (requirements) and
+**how** it is built (design), grounded in EdgeCommons conventions (`telemetry-processor` as the Rust
+template, the `ggcommons` library API, and the org registry/CI/docs plumbing). Nothing is implemented yet —
+this is for review before scaffolding.
 
-Open questions you raised are answered inline and collected in **§18**. Your review decisions there drive
-the scaffold.
+### Changes since v0.1 (review round 1)
+
+| # | Your feedback | Where addressed |
+|---|---|---|
+| 1 | FR-SCH-5: configurable window-close behavior (finish-in-flight vs pause/resume, with fallback) | §12.4, FR-SCH-5 |
+| 2 | Bandwidth/network-utilization cap knob | §13.5, FR-REL-6, config §7 |
+| 3 | Instance activate/deactivate, persisted, control-plane message | §7.5, §14, §16, FR-CTL-4/5, FR-STATE |
+| 4 | Events for activate/deactivate + more | §17.1, FR-EVT |
+| 5 | S3 credentials: ambient by default, optional override | §11.5, FR-EGR-7 |
+| 6 | Mermaid diagrams instead of ASCII | throughout (§6, §8, §13) |
+| 7 | S3: Transfer Acceleration, trailing checksums, unsigned PUT, prefix parallelism | §11.2–§11.4 |
+| 8 | Cron vs custom grammar; expose cron; windows-on-cron | §12 (rewritten) |
+| 9 | Separate "Failed" folder for retry-exhausted files | §13.3, FR-CMP-6, config §7 |
+| 10 | Retry behavior across multi-hour / ~2-day disconnects | §13.4 |
+| 11 | redb vs SQLite — revisit now C compiler is resolved | §14 (now recommends SQLite) |
+| 12 | Unified, RESTful, cloud-bridge-safe topic namespace | §15 (new), §16, §17 |
+| 13 | Docs: extensive samples + deep explanation, not syntax rehash | §19 |
+| 14 | Decisions C/E/G accepted; F pending SQLite eval | §20 |
 
 ---
 
@@ -31,12 +47,14 @@ the scaffold.
 12. [Scheduling & windows](#12-scheduling--windows)
 13. [Completion, integrity & reliability](#13-completion-integrity--reliability)
 14. [Durable state](#14-durable-state)
-15. [Control-message suite](#15-control-message-suite)
-16. [Status/event publishing (realtime UI)](#16-statusevent-publishing-realtime-ui)
-17. [Observability, platform & packaging](#17-observability-platform--packaging)
-18. [Open decisions & recommendations](#18-open-decisions--recommendations)
-19. [Phased implementation plan](#19-phased-implementation-plan)
-20. [Appendix — registry entry, deps, repo scaffold](#20-appendix--registry-entry-deps-repo-scaffold)
+15. [Unified namespace (topic design)](#15-unified-namespace-topic-design)
+16. [Control-message suite](#16-control-message-suite)
+17. [Status/event publishing (realtime UI)](#17-statusevent-publishing-realtime-ui)
+18. [Observability, platform & packaging](#18-observability-platform--packaging)
+19. [Documentation strategy](#19-documentation-strategy)
+20. [Open decisions & recommendations](#20-open-decisions--recommendations)
+21. [Phased implementation plan](#21-phased-implementation-plan)
+22. [Appendix — registry entry, deps, repo scaffold](#22-appendix--registry-entry-deps-repo-scaffold)
 
 ---
 
@@ -44,57 +62,39 @@ the scaffold.
 
 `file-replicator` watches one or more local source directories and **replicates files** (copy-then-remove,
 i.e. "move") to one or more destinations — another local directory, S3, and a pluggable set of remote
-backends — either **as files arrive** (default) or **on a plain-English schedule/window**. It handles
-"on-complete" source lifecycle (delete or archive), retries on failure (resuming partial uploads where the
-backend supports it), exposes a full **control-message** surface (get-config / get-status+statistics /
-trigger-now), and publishes **granular status events** so a realtime UI can be built on top.
+backends — either **as files arrive** (default) or **on a schedule/window**. It handles on-complete source
+lifecycle (delete / archive / quarantine-on-failure), retries with resumable partial uploads, throttles
+bandwidth, can be activated/deactivated per instance from the control plane, exposes a full
+**control-message** surface, and publishes **granular status events** on a unified, cloud-bridge-safe
+namespace so a realtime UI (edge or global) can be built on top.
 
-**Where it sits.** It is a **sink / northbound-delivery** component in the EdgeCommons taxonomy
-(`adapter | processor | sink`). The registry already reserves the `sink` category and the org profile/docs
-landing pages have a "Sinks — northbound delivery" section waiting for the first one — this is it. Unlike
-the southbound adapters, it does **not** emit `SouthboundSignalUpdate`; unlike `telemetry-processor`, its
-data plane is **files on disk**, not the MQTT message bus. It still speaks the standard ggcommons control
-plane (message envelope, config schema, health, metrics, credentials vault).
+**Where it sits.** It is a **sink / northbound-delivery** component (`adapter | processor | sink`). The
+registry already reserves the `sink` category and the org profile/docs have a "Sinks — northbound delivery"
+section waiting for the first one. Its *data plane* is files on disk (not the MQTT bus); it speaks the
+standard ggcommons *control plane* (message envelope, config schema, health, metrics, credentials vault).
 
-**Sink vs processor.** You noted it could be either. It is best modelled as a **sink**: its *input* is the
-filesystem (not a ggcommons topic) and its *output* is a durable external store. It performs no payload
-transformation. If we later add content-level transforms (e.g. compress, encrypt-at-rest, format-convert
-on the way out), those are *egress filters*, not a reclassification — it stays a sink.
-
-**Design ethos.** Per the EdgeCommons "depth over simplest-case" principle, this design covers the full
-capability surface (arrays not scalars, multi-destination-ready, schedules *and* windows, resumable
-uploads, a complete control+event surface) rather than the happy path. Where that adds risk, we phase the
-*implementation* (§19) without narrowing the *design*.
+**Design ethos.** Per the EdgeCommons "depth over simplest-case" principle, this covers the full capability
+surface (arrays not scalars, multi-destination-ready, cron + windows, resumable uploads, bandwidth caps,
+activation, a complete control+event surface on a proper UNS). Where that adds risk, we phase the
+*implementation* (§21) without narrowing the *design*.
 
 ---
 
 ## 2. Language decision (Rust)
 
-**Recommendation: Rust.** Your instinct is right and it is also the ecosystem-consistent choice
-(`telemetry-processor` is Rust; the pinned-git-rev `ggcommons` Rust lib is mature and used in production).
-Concretely, this component is a near-ideal fit for Rust:
+**Rust**, confirmed — the ecosystem-consistent choice (`telemetry-processor` is Rust) and a near-ideal fit:
+resource-constrained edge (small static binary, low RSS, no GC), clean `tokio` concurrency for parallel
+multipart uploads + per-instance isolation, precise streaming I/O with backpressure, and strong typing for
+data-loss-sensitive move-then-delete logic. It reuses the `ggcommons` Rust lib directly (messaging, config,
+credentials vault, health, metrics) with no FFI and one CI lane.
 
-| Driver | Why Rust wins here |
-|---|---|
-| **Resource-constrained edge** | Small static binary, no GC pauses, low RSS — matters on Greengrass gateways. |
-| **Concurrency** | `tokio` async + bounded worker pools give clean parallel multipart uploads and per-instance isolation without a thread-per-file explosion. |
-| **I/O throughput** | Zero-copy streaming reads, backpressure, and precise control over part sizing/buffering for high-throughput S3. |
-| **Correctness / data safety** | Move-then-delete with integrity verification is data-loss-sensitive; Rust's error handling + strong typing reduce the class of bugs that silently drop files. |
-| **Ecosystem parity** | Reuses `ggcommons` Rust lib directly (messaging, config, credentials vault, health, metrics) — no FFI, one CI lane. |
+**Toolchain note (updated 2026-07-01):** the earlier "pure-Rust to avoid a C compiler on Windows" driver is
+**no longer a hard constraint** — MSVC Build Tools are installed and on PATH, so C-vendoring crates
+(bundled SQLite, mlua) build natively on Windows. This directly reopens the durable-state choice (§14). We
+still prefer pure-Rust where it's a wash, but SQLite is now on the table.
 
-**Caveats we accept and mitigate:**
-
-- **Some backend SDKs are less mature in Rust.** S3 is first-class (`aws-sdk-s3`). Azure Blob and GCS have
-  usable-but-younger crates; SFTP and HTTP are well-served. We isolate every backend behind a
-  `Destination` trait (§10) so crate maturity is contained and swappable, and we ship them behind cargo
-  features so a build only pulls what it needs.
-- **Pure-Rust bias for the toolchain.** The org notes Windows has no C compiler (Lua/librdkafka only build
-  in WSL). We deliberately choose **pure-Rust dependencies** for the new subsystems (durable state,
-  scheduling) so `cargo build`/`test` work on Windows *and* everywhere else. See §14.
-
-No other language was competitive: Python (`modbus-adapter`) and Java (`opcua-adapter`) are the adapter
-languages and would regress on binary size, concurrency ergonomics, and edge footprint for a
-high-throughput file mover.
+Backend-SDK maturity (Azure/GCS younger in Rust) is contained behind the `Destination` trait (§10) and
+cargo features so a build pulls only what it needs.
 
 ---
 
@@ -102,102 +102,115 @@ high-throughput file mover.
 
 | Term | Meaning |
 |---|---|
-| **Instance** | One watched-directory specification = one `component.instances[]` entry (the standard ggcommons instance idiom, exactly as `telemetry-processor` uses routes). An instance is the unit of config, isolation, statistics, and control. |
-| **Ingress** | The source: a local directory, optional recursion, readiness policy, include/exclude globs. |
-| **Egress** | The destination(s): an ordered **list** of delivery targets. v1 enforces exactly one; the schema and engine are multi-destination-ready (§18-B). |
-| **Schedule** | *When* replication runs: `immediate` (on arrival, default) or a plain-English recurrence, optionally bounded by a **window**. |
-| **Window** | A recurring time span (e.g. *Wednesday 02:00–04:00*) during which uploads are permitted; work outside the window waits for the next window. |
-| **Completion** | The source-file lifecycle action after **all** egress targets succeed: `delete` or `archive` (move to a processed dir). |
-| **Readiness** | The policy that decides a newly-seen file is fully written and safe to move (default: stability window). |
-| **Work item** | A single file tracked through its lifecycle: `Discovered → Ready → Queued → InProgress → Verified → Completed`, or `Failed → (retry)`. Persisted durably. |
-| **Signal / tags** | Unchanged ggcommons vocabulary. This component does not produce `signal` telemetry; it uses the standard message **envelope** (`header`/`tags`/`body`) for control + events only. |
+| **Instance** | One watched-directory specification = one `component.instances[]` entry (the standard ggcommons instance idiom, as `telemetry-processor` uses routes). Unit of config, isolation, statistics, activation, and control. |
+| **Ingress** | The source: local directory, optional recursion, readiness policy, include/exclude globs. |
+| **Egress** | Destination(s): an ordered **list** of delivery targets. v1 enforces exactly one; schema + engine are multi-destination-ready (§20-B). |
+| **Schedule** | *When* work runs: `immediate` (on arrival, default), `cron` (point trigger), or `window` (a recurring open→close span). |
+| **Window** | A recurring time span (`open`→`close`, cron-defined) during which uploads are permitted; work outside waits for the next window. |
+| **Completion** | Source-file lifecycle after **all** egress succeed: `delete` or `archive`; on retry-exhaustion, `quarantine` (Failed folder). |
+| **Readiness** | Policy deciding a newly-seen file is fully written and safe to move (default: stability window). |
+| **Activation** | Runtime on/off state of an instance, **persisted** across restarts, toggled via config or a control message. |
+| **Work item** | A single file tracked through its lifecycle; persisted durably. |
+| **UNS** | Unified Namespace — the single, RESTful, site-scoped, cloud-bridge-safe topic hierarchy for all cmd/evt/state (§15). |
 
 ---
 
 ## 4. Functional requirements
 
-IDs follow the ecosystem `FR-<AREA>-<n>` convention (cf. `FR-CRED-*`, `FR-MSG-*`). "MUST/SHOULD/MAY" per
-RFC 2119.
+IDs follow the ecosystem `FR-<AREA>-<n>` convention. RFC-2119 keywords.
 
 ### 4.1 Ingress / watching (ING)
 
 - **FR-ING-1** — MUST watch a configured local **source directory** for files.
-- **FR-ING-2** — MUST support **non-recursive** (top-level only, default) and **recursive** (whole tree) watching, per instance.
-- **FR-ING-3** — When recursive, MUST **preserve the relative subtree** at the destination and **auto-create destination subdirectories** as needed (for local/SFTP; encode as key prefix for object stores).
-- **FR-ING-4** — MUST support **include/exclude glob patterns** (e.g. include `*.csv`, exclude `*.tmp`, `.*`), evaluated against the path relative to the source root.
-- **FR-ING-5** — MUST detect files that **already exist** at startup (pre-existing spool), not only files that arrive after start.
-- **FR-ING-6** — MUST use OS filesystem notifications for low-latency arrival detection **and** a periodic **reconciliation rescan** to catch missed events (network FS, inotify overflow, files present before start). Rescan interval configurable.
+- **FR-ING-2** — MUST support **non-recursive** (default) and **recursive** (whole tree) watching per instance.
+- **FR-ING-3** — When recursive, MUST **preserve the relative subtree** at the destination and auto-create destination subdirs (local/SFTP) or encode as key prefix (object stores).
+- **FR-ING-4** — MUST support **include/exclude glob patterns** against the source-relative path.
+- **FR-ING-5** — MUST detect files that **already exist** at startup (pre-existing spool), not only new arrivals.
+- **FR-ING-6** — MUST use OS notifications for low-latency detection **and** a periodic **reconciliation rescan** (network FS, event overflow, pre-start files).
 - **FR-ING-7** — MUST decide **readiness** before queueing (§9); default = stability window.
-- **FR-ING-8** — MUST NOT act on its own **archive** directory or any configured destination that happens to live under the watch root (loop prevention).
+- **FR-ING-8** — MUST NOT act on its own archive / failed / destination directories if they live under the watch root (loop prevention).
 
 ### 4.2 Egress / destinations (EGR)
 
-- **FR-EGR-1** — MUST support destination types: **local directory** and **S3** (v1); **SFTP/FTPS**, **HTTP(S) POST/webhook**, **Azure Blob**, **GCS** (designed now, phased in — §18-A).
-- **FR-EGR-2** — MUST model egress as an **ordered list** per instance. **v1 validates exactly one** element; multi-destination fan-out is a defined future capability (§18-B) with semantics fully specified here.
-- **FR-EGR-3** (multi, future) — With N destinations, a file is **Completed only when ALL destinations succeed**; each destination retries **independently**; completion action fires once, after the last success.
-- **FR-EGR-4** — Each destination MUST support a configurable **path/prefix mapping** and preserve the recursive subtree (FR-ING-3).
-- **FR-EGR-5** — Each destination MUST report **per-file progress** (bytes transferred / total) to drive events and statistics.
-- **FR-EGR-6** — Destinations that support it MUST **resume a partially-completed transfer** rather than restarting from zero (FR-REL-3).
+- **FR-EGR-1** — Destination types: **local** + **S3** (v1); **SFTP/FTPS**, **HTTP(S)**, **Azure Blob**, **GCS** (designed, phased).
+- **FR-EGR-2** — Egress is an **ordered list** per instance; **v1 validates exactly one**; multi-destination fan-out fully specified (§20-B).
+- **FR-EGR-3** (multi, future) — File **Completed only when ALL destinations succeed**; each retries **independently**; completion fires once.
+- **FR-EGR-4** — Configurable **path/prefix mapping** per destination; preserves the recursive subtree.
+- **FR-EGR-5** — MUST report **per-file progress** (bytes / total) to drive events + statistics.
+- **FR-EGR-6** — Destinations that support it MUST **resume a partial transfer** rather than restart (§13).
+- **FR-EGR-7** — Cloud destinations MUST support **ambient credentials by default** (platform provider chain) with an **optional explicit `$secret` override** (§11.5).
 
 ### 4.3 Scheduling (SCH)
 
-- **FR-SCH-1** — MUST support **immediate** mode (replicate as files become ready) — the default.
-- **FR-SCH-2** — MUST support **plain-English schedules** (NOT cron in config): e.g. `"Every day at 5am"`, `"Every Wednesday at 2am"`, `"Every 15 minutes"`, `"Every hour"`.
-- **FR-SCH-3** — MUST support **windows**: e.g. `"Every Wednesday from 2am to 4am"`. Files ready outside the window **wait** and are attempted when the window next opens.
-- **FR-SCH-4** — MUST support **timezone** selection per instance (default: a configurable component-wide TZ; fallback UTC). Windows/recurrences evaluate in that TZ, DST-aware.
-- **FR-SCH-5** — An in-flight transfer that does not finish before a window closes MUST **pause/resume at the next window** (leaning on resumable transfers, FR-REL-3) rather than being lost; partial progress is retained.
-- **FR-SCH-6** — MUST publish **schedule-triggered** / **window-opened** / **window-closed** / **schedule-complete** events (§16).
+- **FR-SCH-1** — MUST support **immediate** mode (default).
+- **FR-SCH-2** — MUST support **cron** schedules (standard cron via a maintained tz-aware crate) as the primary expression; MAY offer plain-English **sugar** for common cases (§12).
+- **FR-SCH-3** — MUST support **windows** (`open`→`close`), incl. overnight; files ready outside the window **wait** for the next open.
+- **FR-SCH-4** — MUST be **timezone + DST aware** per instance (default component-wide TZ; fallback UTC).
+- **FR-SCH-5** — MUST offer a **configurable window-close behavior**: (a) **finish in-flight** transfers past close, or (b) **pause & resume** at the next window **if the destination supports resume** — otherwise **finish the current** transfer (never lose partial progress).
+- **FR-SCH-6** — MUST publish schedule/window lifecycle events (§17).
 
 ### 4.4 Completion & lifecycle (CMP)
 
-- **FR-CMP-1** — MUST support two on-complete behaviors: **delete** the source file, or **move to a user-defined archive/processed directory**.
-- **FR-CMP-2** — Archive MUST preserve the relative subtree under the archive root; on name collision MUST apply a configurable policy (default: suffix with a monotonic counter/timestamp; never silently overwrite).
-- **FR-CMP-3** — The completion action MUST fire **only after successful integrity verification** (§13) of **all** egress targets.
-- **FR-CMP-4** — Completion MUST be **crash-safe**: a crash between "destination succeeded" and "source removed" MUST NOT lose or silently double-deliver the file (idempotent re-verify on restart; §14).
-- **FR-CMP-5** — The `completion` policy is a **separate instance section**, not part of `egress` (rationale in §18-C).
+- **FR-CMP-1** — Two on-success behaviors: **delete** source, or **move to archive dir**.
+- **FR-CMP-2** — Archive/quarantine MUST preserve the relative subtree; on name collision apply a configurable policy (default: suffix; never silently overwrite).
+- **FR-CMP-3** — Completion action MUST fire **only after successful integrity verification** of **all** egress targets.
+- **FR-CMP-4** — Completion MUST be **crash-safe** (no loss, no silent double-delivery; idempotent re-verify on restart; §14).
+- **FR-CMP-5** — `completion` is a **separate instance section**, not part of `egress` (§20-C, accepted).
+- **FR-CMP-6** — On retry-exhaustion, MUST support **quarantine to a Failed dir** (with an error sidecar) or **retain-in-place** (configurable; §13.3).
 
-### 4.5 Reliability / retry / resume (REL)
+### 4.5 Reliability / retry / resume / limits (REL)
 
-- **FR-REL-1** — On any error, the file MUST **remain in the queue** and be retried (never dropped).
-- **FR-REL-2** — Retries MUST use **bounded exponential backoff with jitter**, configurable (`maxAttempts`, base/max delay). Exhausted items move to a `Failed` state (visible via statistics), retained for manual/triggered retry — **not** deleted.
-- **FR-REL-3** — Where the backend supports it, a retry MUST **resume from the last successful part/offset** (S3 multipart parts; SFTP `APPE`/offset; HTTP range where supported), not restart. Resume state is persisted (§14).
-- **FR-REL-4** — MUST be safe against **duplicate delivery**: re-delivering after a crash MUST be idempotent (stable object keys, overwrite-same-key for object stores; verify-before-complete for filesystems).
-- **FR-REL-5** — MUST apply **backpressure**: a bounded number of concurrent in-flight files per instance and globally, so a large spool cannot exhaust memory or file handles.
+- **FR-REL-1** — On error, the file MUST **remain queued** and be retried (never dropped).
+- **FR-REL-2** — Retries MUST use **bounded exponential backoff with jitter**; give-up governed by **time** (`giveUpAfter`) and/or an optional attempt cap (§13.4).
+- **FR-REL-3** — Where supported, a retry MUST **resume from the last successful part/offset** (persisted; §14).
+- **FR-REL-4** — MUST be **idempotent** on re-delivery (stable keys; verify-before-complete).
+- **FR-REL-5** — MUST apply **concurrency backpressure**: bounded in-flight files per instance and globally.
+- **FR-REL-6** — MUST support a **bandwidth cap** (bytes/sec) per instance **and** a global aggregate cap (§13.5).
+- **FR-REL-7** — MUST **tolerate long disconnections** (hours to ~2 days): keep retrying within `giveUpAfter`, resume in-flight uploads, and avoid reconnect thundering-herd via a disconnection circuit-breaker (§13.4).
 
-### 4.6 Configuration (CFG)
+### 4.6 Activation & state (STATE)
 
-- **FR-CFG-1** — Config MUST live under `component.global` / `component.instances[]` per the ggcommons schema; the component parses its own subtree (no change to the canonical schema). See §7.
-- **FR-CFG-2** — MUST support `component.global.defaults` overlaid per instance (instance wins), mirroring `telemetry-processor`.
-- **FR-CFG-3** — MUST tolerate **Greengrass numeric doubles** (lenient int-or-float deserialization) for all numeric fields.
-- **FR-CFG-4** — A malformed **instance** MUST be logged and skipped; startup fails only if **zero** instances build (mirrors `telemetry-processor`).
-- **FR-CFG-5** — MUST resolve secrets via **`$secret` refs** from the credentials vault (§13) so credentials never appear in the logged config snapshot.
-- **FR-CFG-6** — Config hot-reload (via the ggcommons config watcher) SHOULD apply changes to instances without dropping in-flight transfers where possible; at minimum it MUST be safe (drain-and-restart per changed instance).
+- **FR-STATE-1** — Each instance has a runtime **active/inactive** state; default from config `enabled` (default `true`).
+- **FR-STATE-2** — Activation state MUST be **persisted** and survive component restart; the **persisted runtime state wins** over config `enabled` (control plane is the live authority), with a documented reset path.
+- **FR-STATE-3** — A **control message** MUST activate/deactivate an instance (optionally non-persistently).
+- **FR-STATE-4** — Deactivate MUST stop discovery + admit no new transfers; queued items **remain** and resume on reactivation; in-flight transfers follow the same finish/pause policy as window-close (FR-SCH-5).
 
-### 4.7 Control surface (CTL) — see §15
+### 4.7 Configuration (CFG)
 
-- **FR-CTL-1** — MUST answer **GetConfiguration** (reuse the core `GetConfiguration` v1.0 contract; return the effective config).
-- **FR-CTL-2** — MUST answer **GetStatus** returning per-instance statistics: files awaiting replication (name/size/age), files replicated (count + recent), files failed (count + last error), files in-progress (name + **% complete**), current schedule/window state.
-- **FR-CTL-3** — MUST accept **TriggerReplication** to force a scan+replication now (all instances or a named instance/window override).
-- **FR-CTL-4** — Control replies MUST use the standard request/reply pattern (`reply_to` / `messaging.reply`).
+- **FR-CFG-1** — Config under `component.global` / `component.instances[]`; component parses its own subtree (no canonical-schema change).
+- **FR-CFG-2** — `component.global.defaults` overlaid per instance (instance wins).
+- **FR-CFG-3** — Tolerate **Greengrass numeric doubles** (lenient int-or-float) on all numeric fields.
+- **FR-CFG-4** — A malformed instance is **logged and skipped**; startup fails only if **zero** instances build.
+- **FR-CFG-5** — Resolve secrets via **`$secret` refs** so credentials never appear in the logged config.
+- **FR-CFG-6** — Config hot-reload SHOULD apply per-instance changes without dropping in-flight transfers where possible (drain-and-restart the changed instance at minimum).
 
-### 4.8 Events (EVT) — see §16
+### 4.8 Control surface (CTL) — §16
 
-- **FR-EVT-1** — MUST publish lifecycle events on configurable topics with intelligent defaults: file-discovered, file-ready, upload-started, upload-progress (throttled), upload-completed, upload-failed, file-archived/deleted, schedule-triggered, window-opened/closed, scan-complete.
-- **FR-EVT-2** — Progress events MUST be **throttled** (by percent delta and/or time) to avoid flooding the bus.
-- **FR-EVT-3** — Events MUST carry enough context (instance id, relative path, size, bytes-done, destination, attempt) to drive a UI without extra lookups.
+- **FR-CTL-1** — Answer **get-config** (reuse core `GetConfiguration` contract; §16, §20-E).
+- **FR-CTL-2** — Answer **get-status** with per-instance statistics (awaiting incl. names/sizes/ages, replicated, failed incl. last error, in-progress incl. **% complete**, schedule/window state, active state).
+- **FR-CTL-3** — Accept **trigger** (force scan+replication now; per-instance or all; optional ignore-window).
+- **FR-CTL-4** — Accept **set-activation** (activate/deactivate an instance; persistent by default).
+- **FR-CTL-5** — All control replies use request/reply (`reply_to` / `messaging.reply`) on the UNS (§15).
+
+### 4.9 Events (EVT) — §17
+
+- **FR-EVT-1** — Publish lifecycle events on the UNS with intelligent defaults: file discovered/ready, upload started/progress(throttled)/completed/failed, file archived/deleted/quarantined, retries-exhausted, schedule-triggered, window-opened/closed, scan-complete, **instance-activated/deactivated**, component-ready.
+- **FR-EVT-2** — Progress events MUST be **throttled** (percent delta and/or time).
+- **FR-EVT-3** — Events MUST carry enough context (instance, relative path, size, bytes-done, destination, attempt) to drive a UI without extra lookups.
+- **FR-EVT-4** — Current per-instance/component **state** MUST be published **retained** so a fresh subscriber (edge UI or cloud) gets the latest snapshot on connect (§15, §17).
 
 ---
 
 ## 5. Non-functional requirements
 
-- **NFR-1 (Platforms)** — MUST run standalone (**HOST**), on **GREENGRASS** (IPC), and on **KUBERNETES** (ConfigMap), using the ggcommons platform/transport resolver — **no platform branching in component code** (mirror `telemetry-processor`).
-- **NFR-2 (Coverage)** — MUST meet the org **90% line-coverage gate** on the CI-testable surface (`cargo llvm-cov --fail-under-lines 90`); live-infra paths (real S3/GG IPC/network backends) excluded via trait seams + fakes.
-- **NFR-3 (Footprint)** — Idle RSS target < 25 MiB; bounded memory under a 100k-file spool (streaming reads, no whole-file buffering; state on disk not in RAM).
-- **NFR-4 (Throughput)** — Saturate available uplink for large files via parallel multipart; handle high-count small-file spools via bounded concurrency.
-- **NFR-5 (Durability)** — No acknowledged-ready file is lost across process crash, host reboot, or window boundary.
-- **NFR-6 (Portability)** — All *new* subsystem dependencies pure-Rust (build on Windows without a C toolchain). Native-toolchain features (if any) held OFF by default, matching the `greengrass`/`streaming-kafka` pattern.
-- **NFR-7 (Security)** — Credentials only via the vault / `$secret`; TLS on by default for network backends; least-privilege IAM guidance in docs.
-- **NFR-8 (Observability)** — Metrics via `gg.metrics()`; health via the library HTTP endpoints on k8s; structured JSON logs on k8s.
+- **NFR-1 (Platforms)** — HOST / GREENGRASS / KUBERNETES via the ggcommons resolver; no platform branching in engine code.
+- **NFR-2 (Coverage)** — Org **90% line-coverage gate** (`cargo llvm-cov --fail-under-lines 90`); live-infra paths excluded via trait seams + fakes.
+- **NFR-3 (Footprint)** — Idle RSS < 25 MiB; bounded memory under a 100k-file spool (streaming reads, state on disk).
+- **NFR-4 (Throughput)** — Saturate uplink for large files (parallel multipart, acceleration); handle high-count small-file spools via bounded concurrency + prefix parallelism.
+- **NFR-5 (Durability)** — No acknowledged-ready file lost across crash, reboot, window boundary, deactivation, or a ~2-day outage.
+- **NFR-6 (Portability)** — Builds on Windows/Linux/WSL. C-toolchain now available on all dev targets (§2); a C-compile step is acceptable if it buys real value (§14).
+- **NFR-7 (Security)** — Credentials via ambient chain or vault/`$secret`; TLS-by-default for network backends; least-privilege IAM guidance in docs.
+- **NFR-8 (Observability)** — Metrics via `gg.metrics()`; health via library HTTP endpoints on k8s; structured JSON logs on k8s; retained UNS state.
 
 ---
 
@@ -205,7 +218,7 @@ RFC 2119.
 
 ### 6.1 Runtime shape (mirrors `telemetry-processor`)
 
-`main.rs` is ~40 lines: build the runtime, hand off to the app, await shutdown.
+`main.rs` is ~40 lines — build the runtime, hand off to the app, await shutdown:
 
 ```rust
 use ggcommons::prelude::*;
@@ -213,154 +226,169 @@ const COMPONENT_NAME: &str = "com.mbreissi.greengrass.FileReplicator";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let gg = GgCommonsBuilder::new(COMPONENT_NAME)
-        .args(std::env::args_os())   // -c/--platform/--transport/-t
-        .build().await?;             // platform+transport resolve, config load+validate, logging/metrics/health
+    let gg = GgCommonsBuilder::new(COMPONENT_NAME).args(std::env::args_os()).build().await?;
     let app = app::ReplicatorApp::start(&gg).await?;
-    app.run(&gg).await?;             // runs until gg.shutdown_signal()
+    app.run(&gg).await?;   // runs until gg.shutdown_signal()
     Ok(())
 }
 ```
 
-The library owns platform detection, config source, logging, metrics, heartbeat, health server, SIGTERM,
-and hot-reload. Teardown is RAII on `GgCommons` drop.
+The library owns platform detection, config source, logging, metrics, heartbeat, health, SIGTERM, and
+hot-reload. Teardown is RAII on `GgCommons` drop.
 
 ### 6.2 Module layout
 
 ```
 src/
-  main.rs            entry point (canonical bootstrap)
-  app.rs             ReplicatorApp: builds one Instance per component.instances[]; wires control + shutdown
-  config.rs          serde config model (Ingress/Egress/Schedule/Completion/Retry) + lenient numbers + parsing
+  main.rs            canonical bootstrap
+  app.rs             ReplicatorApp: one Instance per component.instances[]; wires control + shutdown
+  config.rs          serde config model + lenient numbers + validation
   instance/
-    mod.rs           Instance runtime: owns watcher + scheduler + queue + workers for one watched dir
-    watcher.rs       notify-based watcher + periodic reconciliation rescan + readiness gate
-    queue.rs         durable work-queue (redb-backed) + state machine + backpressure
-    worker.rs        per-file transfer driver: read → egress fan-out → verify → complete
+    mod.rs           Instance runtime (watcher + scheduler + queue + workers + activation) for one dir
+    watcher.rs       notify watcher + reconciliation rescan + readiness gate
+    queue.rs         durable work-queue + state machine + backpressure + bandwidth governor
+    worker.rs        per-file driver: read → egress → verify → complete
   schedule/
-    mod.rs           Schedule + Window model; next-fire / window-open computation (chrono + chrono-tz)
-    parse.rs         plain-English grammar parser ("Every Wednesday from 2am to 4am")
+    mod.rs           Schedule/Window model; next-fire / window-state (cron via croner + chrono-tz)
+    sugar.rs         optional plain-English → cron sugar
   dest/
-    mod.rs           Destination trait + factory (dispatch by egress type)
-    local.rs         local-directory destination
-    s3.rs            S3 destination (size-adaptive: PutObject vs resumable multipart)   [feature: dest-s3]
-    sftp.rs          SFTP/FTPS destination                                              [feature: dest-sftp]
-    http.rs          HTTP(S) POST/PUT/webhook destination                               [feature: dest-http]
-    azure.rs         Azure Blob destination                                             [feature: dest-azure]
-    gcs.rs           GCS destination                                                    [feature: dest-gcs]
-  control.rs         control-message dispatcher (GetConfiguration / GetStatus / TriggerReplication)
-  events.rs          event publisher (envelope builder + topic templating + progress throttle)
-  integrity.rs       hashing + verification helpers (streaming CRC32C/SHA-256)
-  state.rs           durable-state store wrapper (redb): work items, resume checkpoints, offsets
-  metricsx.rs        metric definitions + emission helpers
+    mod.rs           Destination trait + factory
+    local.rs s3.rs sftp.rs http.rs azure.rs gcs.rs      (feature-gated)
+  control.rs         control dispatcher (get-config / get-status / trigger / set-activation)
+  events.rs          event + retained-state publisher (UNS topic builder + progress throttle)
+  integrity.rs       streaming CRC32C / SHA-256 + verification
+  state.rs           durable store (work items, resume checkpoints, activation, stats)
+  ratelimit.rs       token-bucket bandwidth governor (per-instance + global)
+  metricsx.rs        metric definitions + emission
 ```
 
-### 6.3 Concurrency model
+### 6.3 Concurrency & governors
 
-- **One `Instance` task per watched directory.** Instances are independent (own watcher, scheduler, queue,
-  worker pool, statistics) so a slow/failed destination on one instance never stalls another.
-- **Bounded worker pool per instance** (`maxConcurrentFiles`, default e.g. 4) + a **global** semaphore
-  (`component.global.maxConcurrentFiles`) so total in-flight is capped (FR-REL-5).
-- **Within a file**, S3 multipart uses its own bounded part-concurrency (`maxConcurrentParts`).
-- The watcher feeds the durable queue; workers pull `Ready` items when the schedule/window permits.
-- Shutdown: `gg.shutdown_signal()` → stop accepting new work, checkpoint in-flight resume state, drain or
-  cleanly pause workers, flush events/metrics, drop.
+```mermaid
+flowchart LR
+  subgraph Instance["Instance (one per watched dir)"]
+    W[notify watcher +<br/>reconciliation rescan] --> RG{readiness<br/>gate}
+    RG -->|ready| Q[(durable queue)]
+    SCH[scheduler<br/>cron/window/activation] -. gates .-> POOL
+    Q --> POOL[bounded worker pool]
+  end
+  POOL --> GS{{global slots<br/>semaphore}}
+  POOL --> BW{{bandwidth governor<br/>per-instance + global}}
+  GS --> DST[Destination.deliver]
+  BW --> DST
+  DST --> V[verify] --> C[completion] --> EV[events + retained state]
+```
+
+- **One `Instance` task per watched dir** — independent watcher/scheduler/queue/workers/stats/activation, so
+  a slow or failed destination on one instance never stalls another.
+- **Bounded worker pool per instance** + a **global** semaphore cap total in-flight (FR-REL-5).
+- **Bandwidth governor**: token buckets, one per-instance and one global, throttle the transfer byte-stream
+  (FR-REL-6, §13.5).
+- **Scheduler** gates whether `Ready` work may start (immediate=always; cron/window per §12) and whether the
+  instance is **active** (§7.5).
+- Shutdown: `gg.shutdown_signal()` → stop new work, checkpoint resume state, drain/pause, flush, drop.
 
 ### 6.4 Data-flow (single file, immediate mode)
 
-```
-notify/rescan ─▶ readiness gate ─▶ [Ready] enqueue(durable) ─▶ worker acquires slot
-   ─▶ open source (streaming) ─▶ egress.upload(stream, progress_cb)   (resumable)
-   ─▶ integrity verify (checksum vs destination)
-   ─▶ mark all-destinations-complete (durable)
-   ─▶ completion action (delete | archive)  ◀── crash-safe ordering (§14)
-   ─▶ emit Completed event + metrics
+```mermaid
+flowchart TD
+  A[notify / rescan] --> B{readiness ok?}
+  B -->|no| A
+  B -->|yes| C[enqueue Ready<br/>durable]
+  C --> D[worker acquires<br/>global slot + bandwidth]
+  D --> E[open source<br/>streaming read + hash]
+  E --> F[egress.deliver<br/>resumable]
+  F --> G{verify checksum<br/>vs destination}
+  G -->|mismatch| R[error → retry]
+  G -->|ok| H[persist Verified<br/>write-ahead]
+  H --> I[completion:<br/>delete | archive]
+  I --> J[persist Completed<br/>emit event + retained state]
+  R --> C
 ```
 
 ---
 
 ## 7. Configuration model
 
-Config is one JSON document from the platform's config source (FILE on HOST, CONFIGMAP on k8s, GG_CONFIG
-on Greengrass). The component owns `component.*`; all sibling sections (`messaging`, `credentials`,
-`logging`, `heartbeat`, `metricEmission`, `health`, `tags`) are standard ggcommons sections.
+Config is one JSON document from the platform's source (FILE/CONFIGMAP/GG_CONFIG). The component owns
+`component.*`; sibling sections (`messaging`, `credentials`, `logging`, `heartbeat`, `metricEmission`,
+`health`, `tags`) are standard ggcommons sections.
 
 ### 7.1 Instance sections
 
-Per your suggested structure, an instance has **`ingress` / `egress` / `schedule` / `completion`**, plus a
-small **`retry`** section. Rationale for `completion` being its own section (not inside `egress`) is in
-§18-C. Readiness lives under `ingress` (it's a source-side concern); integrity policy lives under
-`completion` (it gates the source lifecycle).
+`ingress` / `egress` / `schedule` / `completion` / `retry` / `limits`, plus `enabled` and an optional
+`topics` override. Readiness lives under `ingress`; integrity + failed-folder under `completion`; bandwidth
+under `limits`. `completion` is its own section (§20-C, accepted).
 
-### 7.2 Annotated example — S3, immediate, archive-on-complete
+### 7.2 Annotated example — S3, immediate, archive-on-success, quarantine-on-fail
 
 ```jsonc
 {
   "component": {
     "global": {
       "defaults": {
-        "retry": { "maxAttempts": 10, "baseDelayMs": 1000, "maxDelayMs": 300000 },
+        "retry": { "baseDelayMs": 1000, "maxDelayMs": 900000, "giveUpAfter": "7d" },
         "timezone": "America/Chicago"
       },
-      "maxConcurrentFiles": 8          // global cap across all instances
+      "limits": { "maxConcurrentFiles": 8, "maxBandwidth": "50MB/s" },   // aggregate caps
+      "topics": { "prefix": "edgecommons/v1/{enterprise}/{site}/{thing}/file-replicator" }  // UNS root (defaulted)
     },
     "instances": [
       {
         "id": "plant-csv-to-s3",
+        "enabled": true,                         // initial activation (runtime state may override, §7.5)
 
         "ingress": {
           "path": "/data/outbound/csv",
           "recursive": true,
           "include": ["**/*.csv"],
           "exclude": ["**/*.tmp", "**/.*"],
-          "rescanSecs": 30,            // reconciliation scan interval (belt-and-suspenders)
-          "readiness": {
-            "strategy": "stability",   // stability | marker | rename | glob   (default: stability)
-            "quietSecs": 5             // size+mtime unchanged for 5s => ready
-          }
+          "rescanSecs": 30,
+          "readiness": { "strategy": "stability", "quietSecs": 5 }   // stability|marker|rename|glob
         },
 
-        "egress": [                    // LIST — v1 requires exactly one element
+        "egress": [                              // LIST — v1 requires exactly one element
           {
             "type": "s3",
             "bucket": "acme-plant-telemetry",
-            "prefix": "site42/csv/",   // subtree preserved beneath this prefix
+            "prefix": "site42/csv/",
             "region": "us-east-1",
+            // credentials OPTIONAL — omit to inherit the platform's ambient chain (§11.5)
             "storageClass": "INTELLIGENT_TIERING",
             "sse": "aws:kms",
-            "credentials": { "$secret": "aws/plant-uploader" },  // typed AwsCredentials view
-            "multipart": {
-              "thresholdBytes": 16777216,   // >16 MiB => multipart, else PutObject
-              "partSizeBytes": 16777216,    // auto-scales up to stay <10000 parts
-              "maxConcurrentParts": 4
-            },
-            "checksumAlgorithm": "CRC32C"    // end-to-end integrity (S3-native)
+            "accelerate": true,                  // S3 Transfer Acceleration endpoint
+            "unsignedPayload": true,             // skip payload signing pass on simple PUTs (TLS)
+            "checksumAlgorithm": "CRC32C",       // flexible/trailing checksum, single-pass
+            "multipart": { "thresholdBytes": 16777216, "partSizeBytes": 16777216, "maxConcurrentParts": 4 }
           }
         ],
 
         "schedule": { "mode": "immediate" },
 
         "completion": {
-          "onSuccess": "archive",      // archive | delete
+          "onSuccess": "archive",                // archive | delete
           "archiveDir": "/data/processed/csv",
-          "onCollision": "suffix",     // suffix | overwrite | fail
-          "verify": "checksum"         // checksum | size | none   (default: checksum)
+          "onExhausted": "quarantine",           // quarantine | retainInPlace
+          "failedDir": "/data/failed/csv",
+          "onCollision": "suffix",               // suffix | overwrite | fail
+          "verify": "checksum"                   // checksum | size | none
         },
 
-        "maxConcurrentFiles": 4,       // per-instance worker cap
-        "events": { "enabled": true }  // topics defaulted; see §16
+        "retry":  { "baseDelayMs": 1000, "maxDelayMs": 900000, "giveUpAfter": "7d", "maxAttempts": null },
+        "limits": { "maxConcurrentFiles": 4, "maxBandwidth": "20MB/s" }
       }
     ]
   },
 
   "credentials": { "vault": { "path": "/data/vault.json" }, "keyProvider": { "type": "file" } },
   "messaging":   { /* platform-appropriate broker block */ },
+  "tags":        { "enterprise": "acme", "site": "site42" },   // feed the UNS + envelope
   "logging":     { "level": "INFO" },
   "metricEmission": { "namespace": "filereplicator" }
 }
 ```
 
-### 7.3 Annotated example — scheduled window to another edge/local dir
+### 7.3 Annotated example — nightly window to a NAS, bandwidth-capped
 
 ```jsonc
 {
@@ -369,40 +397,55 @@ small **`retry`** section. Rationale for `completion` being its own section (not
                "readiness": { "strategy": "rename" } },
   "egress":  [ { "type": "local", "path": "/mnt/nas/ingest/images", "fsync": true } ],
   "schedule": {
-    "mode": "scheduled",
-    "expression": "Every Wednesday from 2am to 4am",   // recurrence + window (plain English)
+    "mode": "window",
+    "open":  "0 2 * * WED",                 // cron: Wed 02:00
+    "close": "0 4 * * WED",                 // cron: Wed 04:00   (or "durationMins": 120)
     "timezone": "America/Chicago",
-    "onWindowClose": "pause"        // pause | finishCurrent  (default: pause & resume next window)
+    "onWindowClose": "pauseResume"          // pauseResume | finishCurrent  (FR-SCH-5)
   },
-  "completion": { "onSuccess": "delete", "verify": "checksum" },
-  "retry": { "maxAttempts": 20, "baseDelayMs": 2000, "maxDelayMs": 600000 }
+  "completion": { "onSuccess": "delete", "onExhausted": "retainInPlace", "verify": "checksum" },
+  "limits": { "maxBandwidth": "5MB/s" }
 }
 ```
 
 ### 7.4 Config structs (sketch)
 
-All `#[serde(rename_all = "camelCase")]`, numeric fields via a lenient int-or-float deserializer (GG
-doubles). Parsed per-instance with skip-on-error; startup fails only if zero instances build.
+`#[serde(rename_all = "camelCase")]`; lenient int-or-float numbers; per-instance skip-on-error; startup
+fails only if zero instances build.
 
 ```rust
-struct GlobalDefaults { retry: Option<RetryCfg>, timezone: Option<String>, /* ... */ }
 struct InstanceCfg {
     id: String,
+    enabled: Option<bool>,               // default true
     ingress: IngressCfg,
-    egress: Vec<EgressCfg>,          // v1: validated len == 1
-    schedule: ScheduleCfg,           // default { mode: Immediate }
+    egress: Vec<EgressCfg>,              // v1 validated len == 1
+    schedule: ScheduleCfg,              // default Immediate
     completion: CompletionCfg,
     retry: Option<RetryCfg>,
-    max_concurrent_files: Option<usize>,
-    events: Option<EventsCfg>,
+    limits: Option<LimitsCfg>,          // maxConcurrentFiles, maxBandwidth
+    topics: Option<TopicsCfg>,          // per-instance UNS override
 }
-struct IngressCfg { path: PathBuf, recursive: bool, include: Vec<String>, exclude: Vec<String>,
-                    rescan_secs: Option<u64>, readiness: ReadinessCfg }
-enum ReadinessCfg { Stability{quiet_secs:u64}, Marker{suffix:String}, Rename, Glob{ready:Vec<String>} }
-enum EgressCfg { Local(LocalCfg), S3(S3Cfg), Sftp(SftpCfg), Http(HttpCfg), Azure(AzureCfg), Gcs(GcsCfg) } // serde tag = "type"
-enum ScheduleCfg { Immediate, Scheduled{ expression:String, timezone:Option<String>, on_window_close:WindowClose } }
-struct CompletionCfg { on_success: OnSuccess, archive_dir: Option<PathBuf>, on_collision: Collision, verify: Verify }
+enum ScheduleCfg {
+    Immediate,
+    Cron  { expression: String, timezone: Option<String> },
+    Window{ open: String, close: Option<String>, duration_mins: Option<u64>,
+            timezone: Option<String>, on_window_close: WindowClose },   // open/close are cron
+}
+enum WindowClose { PauseResume, FinishCurrent }
+struct CompletionCfg { on_success: OnSuccess, archive_dir: Option<PathBuf>,
+                       on_exhausted: OnExhausted, failed_dir: Option<PathBuf>,
+                       on_collision: Collision, verify: Verify }
+struct RetryCfg { base_delay_ms: u64, max_delay_ms: u64, give_up_after: Option<Duration>, max_attempts: Option<u32> }
+struct LimitsCfg { max_concurrent_files: Option<usize>, max_bandwidth: Option<ByteRate> }  // "20MB/s"
 ```
+
+### 7.5 Activation precedence (FR-STATE)
+
+`enabled` in config is the **initial/default**. The **persisted runtime activation state** (set by a
+control message, §16) **wins** on startup so an operator's deactivate survives restarts and config reloads.
+Precedence: *persisted runtime state* ▸ *config `enabled`* ▸ *default `true`*. Reset path: a
+`set-activation` command with `reset: true` clears the persisted override, reverting to config. `get-status`
+returns both the configured and effective states.
 
 ---
 
@@ -410,61 +453,56 @@ struct CompletionCfg { on_success: OnSuccess, archive_dir: Option<PathBuf>, on_c
 
 ### 8.1 Work-item state machine
 
-```
-Discovered ──readiness ok──▶ Ready ──schedule/window open + slot──▶ InProgress
-     │                                                                  │
-     │                                            per-destination upload + progress
-     ▼                                                                  ▼
-  (ignored: excluded / not ready yet)                        all destinations ok?
-                                                             │              │
-                                                        yes  ▼         no   ▼
-                                                        Verified        Failed(attempt++)
-                                                             │              │
-                                                     completion action   backoff, requeue
-                                                     (delete|archive)     (or exhausted→Failed-terminal)
-                                                             ▼
-                                                        Completed  ──▶ emit event, drop from queue
+```mermaid
+stateDiagram-v2
+  [*] --> Discovered
+  Discovered --> Ready: readiness ok
+  Discovered --> [*]: excluded / not ready
+  Ready --> InProgress: active + schedule/window open + slot + bandwidth
+  InProgress --> Verified: all destinations ok + checksum verified
+  InProgress --> Failed: error (attempt++)
+  Failed --> Ready: backoff elapsed, within giveUpAfter
+  Failed --> Exhausted: giveUpAfter exceeded / maxAttempts hit
+  Verified --> Completed: completion action (delete|archive)
+  Exhausted --> Quarantined: onExhausted=quarantine (move to failedDir)
+  Exhausted --> Retained: onExhausted=retainInPlace
+  Completed --> [*]
+  Quarantined --> [*]
+  Retained --> [*]: (retriable via trigger)
 ```
 
-Every transition is written to the durable store **before** the side effect it authorizes (write-ahead),
-so restart re-derives the exact position (§14).
+Every transition is written to the durable store **before** the side effect it authorizes (write-ahead), so
+restart re-derives the exact position (§14).
 
 ### 8.2 Per-instance loop
 
-1. **Watcher** (`notify`) + **reconciliation rescan** (every `rescanSecs`) discover candidate paths.
-2. **Readiness gate** (§9) promotes `Discovered → Ready`.
-3. **Scheduler** (§12) gates whether `Ready` work may start now (immediate = always; scheduled = only in
-   window). It also wakes workers at window open and issues `ScheduleTriggered`.
-4. **Workers** (bounded) pull `Ready` items, acquire a global slot, run the transfer, verify, complete.
-5. **Retry manager** requeues `Failed` items with backoff until `maxAttempts`.
+1. **Watcher** + **rescan** discover candidates.
+2. **Readiness gate** promotes `Discovered → Ready`.
+3. **Scheduler + activation** gate whether `Ready` work may start now (immediate=always if active; cron/window
+   per §12).
+4. **Workers** (bounded) pull `Ready`, acquire a global slot + bandwidth tokens, transfer, verify, complete.
+5. **Retry manager** requeues `Failed` with backoff until `Exhausted` (time/attempt), then quarantine/retain.
 
 ### 8.3 Backpressure & fairness
 
-- Global + per-instance concurrency semaphores (FR-REL-5).
-- Fair scan ordering: oldest-ready-first by default (configurable `order: fifo|lifo|smallest-first` to let
-  small files drain quickly ahead of a huge one if desired).
-- The queue is disk-backed, so a 100k-file spool costs disk, not RAM (NFR-3).
+Global + per-instance concurrency semaphores; oldest-ready-first by default (`order: fifo|lifo|smallest-first`);
+disk-backed queue so a 100k-file spool costs disk, not RAM.
 
 ---
 
 ## 9. Readiness detection
 
-A newly-observed file may still be mid-write. **Default strategy: stability window** (your choice). All
-strategies are config-selectable and composable:
+Default **stability window** (accepted). All strategies config-selectable:
 
 | Strategy | Behavior | Producer cooperation |
 |---|---|---|
 | **`stability`** (default) | Ready when `size`+`mtime` unchanged for `quietSecs` (default 5s). | none |
-| `marker` | Ready when a companion marker appears (e.g. `FILE.done`); marker removed on completion. | producer writes marker |
-| `rename` | Only react to files **renamed/moved into** the watch dir; ignore in-progress temp names. | producer write-then-rename |
-| `glob` | Treat everything not matching `exclude`/temp globs as ready immediately (e.g. ignore `*.part`). | naming convention |
+| `marker` | Ready when a companion marker appears (e.g. `FILE.done`); removed on completion. | producer writes marker |
+| `rename` | React only to files **renamed into** the watch dir; ignore temp names. | write-then-rename |
+| `glob` | Everything not matching temp/exclude globs is ready immediately. | naming convention |
 
-Notes:
-- `stability` also guards against open write handles by re-stat polling; on Linux we *may* additionally
-  check for writers via `/proc` when available (best-effort, not required).
-- `rename` is the most robust for cooperative producers; docs will recommend it where the producer can be
-  changed, with `stability` as the zero-cooperation default.
-- Readiness is evaluated lazily and cheaply; only `Ready` items enter the durable queue.
+Docs recommend `rename` where producers cooperate, `stability` as the zero-cooperation default. Only `Ready`
+items enter the durable queue.
 
 ---
 
@@ -472,285 +510,412 @@ Notes:
 
 ### 10.1 The `Destination` trait
 
-Every backend implements one seam; the engine is backend-agnostic. This is the single most important
-abstraction — it contains SDK-maturity risk, enables the 90% coverage gate (fakes in tests), and makes
-multi-destination fan-out uniform.
-
 ```rust
 #[async_trait]
 trait Destination: Send + Sync {
-    /// Human id for logs/events/stats.
     fn kind(&self) -> &'static str;
-
-    /// Begin or RESUME delivering `item` (relative path, size, source reader factory).
-    /// Reports progress via `progress`. Returns a completion token carrying the
-    /// destination-side checksum/etag for verification.
     async fn deliver(&self, item: &WorkItem, resume: Option<ResumeState>,
-                     progress: &ProgressSink) -> Result<Delivered>;
-
-    /// Verify the delivered object matches the source (checksum/size), per policy.
+                     progress: &ProgressSink, bw: &Bandwidth) -> Result<Delivered>;
     async fn verify(&self, item: &WorkItem, delivered: &Delivered, policy: Verify) -> Result<()>;
-
-    /// Optional: clean up abandoned partial state (e.g. AbortMultipartUpload) on give-up.
     async fn abort(&self, item: &WorkItem, resume: &ResumeState) -> Result<()>;
 }
 ```
 
-`ResumeState` is persisted (§14) so `deliver` can pick up mid-transfer after a crash/window close.
+`deliver` streams through the **bandwidth governor**, reports progress, and can **resume** from persisted
+`ResumeState`. The trait contains SDK-maturity risk, enables the coverage gate (fakes), and makes
+multi-destination fan-out uniform.
 
 ### 10.2 Backend matrix
 
-| Type | v1? | Resume support | Parallelism | Checksum/verify | Crate (candidate) | Feature |
+| Type | v1? | Resume | Parallelism | Verify | Crate (candidate) | Feature |
 |---|---|---|---|---|---|---|
-| **local** | ✅ ship | temp-file + atomic rename; offset-append optional | n/a (single stream) | re-hash file | std/`tokio::fs` | always on |
-| **s3** | ✅ ship | multipart parts persisted; resume remaining | parallel parts | S3-native CRC32C/SHA-256 + ETag | `aws-sdk-s3` | `dest-s3` (default) |
-| **sftp / ftps** | design→phase | `APPE`/offset resume where server allows | single stream | size + optional hash | `russh`/`russh-sftp` (pure-Rust) | `dest-sftp` |
-| **http(s)** | design→phase | `Content-Range`/resumable-PUT where server allows; else restart | single (or presigned-multipart) | server 2xx + optional `Content-MD5` | `reqwest` | `dest-http` |
-| **azure blob** | design→phase | staged blocks persisted; resume uncommitted blocks | parallel blocks | MD5/CRC64 | `azure_storage_blobs` | `dest-azure` |
-| **gcs** | design→phase | resumable-upload session URI persisted; resume by offset | single session (chunked) | CRC32C/MD5 | `google-cloud-storage` | `dest-gcs` |
+| **local** | ✅ ship | temp + atomic rename; offset-append | single stream | re-hash | std/`tokio::fs` | always |
+| **s3** | ✅ ship | multipart parts persisted | parallel parts + prefix | S3 flexible checksum + ETag | `aws-sdk-s3` | `dest-s3` (default) |
+| **sftp/ftps** | phase | `APPE`/offset | single | size + hash | `russh`/`russh-sftp` | `dest-sftp` |
+| **http(s)** | phase | `Content-Range`/resumable PUT | single/presigned | 2xx + `Content-MD5` | `reqwest` | `dest-http` |
+| **azure blob** | phase | staged blocks | parallel blocks | MD5/CRC64 | `azure_storage_blobs` | `dest-azure` (off) |
+| **gcs** | phase | resumable session URI | chunked | CRC32C/MD5 | `google-cloud-storage` | `dest-gcs` (off) |
 
-Backends are cargo-feature-gated (batteries-included default = `local` + `dest-s3`), matching the
-`telemetry-processor` feature philosophy. Immature crates stay off the default build.
+Batteries-included default = `local` + `dest-s3`; immature crates off default (the `telemetry-processor`
+pattern).
 
 ### 10.3 Additional destination suggestions
 
-Beyond what you selected, worth noting as future trait impls (cheap once the seam exists):
-
-- **ggcommons durable stream / northbound MQTT** — hand the *file* (or a manifest/pointer) to the existing
-  `gg.streams()` sink or publish an "arrived" notification northbound. Useful for "notify, don't move."
-- **Another edge node** — an SFTP/HTTP peer is the pragmatic edge-to-edge hop; a dedicated
-  `file-replicator`-to-`file-replicator` protocol is possible but SFTP/HTTP covers it.
-- **NFS/SMB mount** — handled by the `local` destination pointing at a mounted share (no new code).
-- **MinIO / S3-compatible** — the `s3` destination with a custom `endpointUrl` (no new code).
+- **ggcommons durable stream / northbound MQTT** — publish an "arrived/replicated" notification or hand a
+  manifest to `gg.streams()` ("notify, don't move").
+- **Another edge node** — via SFTP/HTTP peer (no bespoke protocol needed).
+- **NFS/SMB mount** / **MinIO / S3-compatible** — the `local` dest on a mount, or the `s3` dest with a
+  custom `endpointUrl` (no new code).
 
 ---
 
 ## 11. S3 destination — high-performance design
 
-Directly addresses your S3 requirements (bucket+prefix, best-practice performance, vary by size, parallel,
-resumable).
+### 11.1 Size-adaptive strategy
 
-### 11.1 Size-adaptive upload strategy
+- **Small files** (`≤ multipart.thresholdBytes`, default 16 MiB): single **`PutObject`** with a flexible
+  trailing checksum.
+- **Large files**: **multipart** with **parallel parts** — `partSizeBytes` (default 16 MiB) auto-scaled so
+  `ceil(size/partSize) ≤ 10000` (S3 limit; ≥5 MiB min); `maxConcurrentParts` (default 4) streamed from
+  source (no whole-file buffer).
 
-- **Small files** (`size ≤ multipart.thresholdBytes`, default 16 MiB): single **`PutObject`** with a
-  trailing checksum (`ChecksumAlgorithm=CRC32C`). One request, lowest overhead.
-- **Large files** (`size > threshold`): **multipart upload** with **parallel part uploads**:
-  - `partSizeBytes` default 16 MiB, **auto-scaled up** so `ceil(size/partSize) ≤ 10000` (S3 hard limit);
-    respects the 5 MiB min part size.
-  - `maxConcurrentParts` (default 4) parts in flight, each streamed from the source (no whole-file buffer).
-  - Per-part checksums + a full-object checksum → S3 verifies integrity server-side; we compare on
-    `CompleteMultipartUpload`.
+### 11.2 Performance features (your list)
 
-### 11.2 Resumable multipart (FR-REL-3, FR-SCH-5)
+- **Transfer Acceleration** — `accelerate: true` routes via the `…s3-accelerate.amazonaws.com` endpoint
+  (edge→S3 over the AWS backbone); `endpointUrl` remains configurable for MinIO/S3-compat/govcloud.
+- **Trailing / flexible checksums** — compute the checksum **while streaming** and send it as a trailer
+  (`x-amz-trailer`), so we never pre-read the file to checksum before sending. Per-part + full-object
+  checksums let S3 verify server-side; we compare on complete. This *is* the integrity mechanism (§13.1) —
+  one pass, no second read.
+- **Unsigned payload** — `unsignedPayload: true` uses `UNSIGNED-PAYLOAD` for the SigV4 signature on simple
+  PUTs over TLS, skipping the payload-hashing pass (TLS still protects the bytes; the trailing checksum still
+  guarantees integrity). Off for multipart (parts are already streamed).
+- **Prefix-level parallelism** — S3 scales per key-prefix. The engine already parallelizes across files, and
+  because we preserve the source subtree the work naturally spreads across prefixes. For pathological
+  single-prefix high-rate spools, an optional `keyShardBits` inserts a short hash shard segment into the key
+  to spread request load (documented trade-off: changes the object key layout).
 
-- On `CreateMultipartUpload`, persist `{uploadId, key, partSize, completedParts:[{n, etag, checksum}]}` in
-  the durable store keyed by the work item.
-- On resume (retry or next window), **skip already-completed parts**, upload only the missing ones, then
-  `CompleteMultipartUpload`. No re-transfer of good parts.
-- On give-up (exhausted attempts) or config removal, `AbortMultipartUpload` to avoid orphaned part storage
-  (and document an S3 lifecycle rule to sweep abandoned MPUs as defense-in-depth).
+### 11.3 Resumable multipart (FR-REL-3, FR-SCH-5, §13.4)
 
-### 11.3 Integrity (matches "checksum verify always")
+Persist `{uploadId, key, partSize, completedParts:[{n, etag, checksum}]}` on `CreateMultipartUpload`; on
+resume, upload only missing parts then `CompleteMultipartUpload`. On give-up/removal, `AbortMultipartUpload`
+(and document an S3 lifecycle rule to sweep abandoned MPUs — coordinate its age with `giveUpAfter`, §13.4).
 
-- Compute the checksum **on read** (streaming, single pass) and let S3 compute/verify the same algorithm;
-  compare the returned checksum/ETag before marking the destination complete.
-- Only after verification does the completion action (delete/archive) run (FR-CMP-3). This gives
-  end-to-end, native, cheap integrity without a second read of the object.
+### 11.4 Integrity
 
-### 11.4 Credentials & config
+Flexible checksum computed on read (CRC32C default; SHA-256 optional), verified against S3's returned
+checksum/ETag **before** completion (§13.1). One streaming pass; native, cheap, end-to-end.
 
-- Region, `endpointUrl` (for MinIO/S3-compat), `storageClass`, `sse` (`AES256`/`aws:kms` + `kmsKeyId`),
-  optional object `tagging`/`metadata`.
-- Credentials resolution order: explicit `{"$secret": ...}` (vault → `AwsCredentials` typed view) →
-  Greengrass **TokenExchangeService** device role (on GG) → default provider chain / IRSA (on k8s/EC2).
-  Reuses `aws-config` already in the dependency graph.
-- **New direct dependency:** `aws-sdk-s3` (the ecosystem currently pulls `aws-sdk-kinesis`/`secretsmanager`
-  /`kms`/`ssm` but **not** s3). Flagged in §20; it shares the pinned AWS SDK `1.x` line already in the lock.
+### 11.5 Credentials — ambient by default, explicit optional (FR-EGR-7)
+
+Aligns with how the ecosystem gets AWS creds (e.g. `telemetry-processor` uses the Greengrass device role for
+Kinesis). Resolution order:
+
+```mermaid
+flowchart LR
+  A["egress.credentials<br/>($secret ref)?"] -->|present| V[vault → AwsCredentials view]
+  A -->|absent| B[ambient default provider chain]
+  B --> GG[GREENGRASS:<br/>TokenExchangeService device role]
+  B --> K8[KUBERNETES:<br/>IRSA / env / node role]
+  B --> H[HOST:<br/>env / shared profile / instance role]
+```
+
+**Default = ambient** (no `credentials` block). On Greengrass this means the recipe declares
+`aws.greengrass.TokenExchangeService` and the device role carries the S3 permissions — no secret to manage.
+Explicit `{"$secret": "..."}` is available for HOST/multi-account cases and is resolved from the vault so it
+never enters the logged config. Docs will include least-privilege IAM (scoped to `bucket/prefix/*`, the
+needed `PutObject`/multipart actions, and KMS if SSE-KMS).
 
 ---
 
 ## 12. Scheduling & windows
 
-There is **no cron/calendar precedent** in the ecosystem, so this is net-new. We deliberately do **not**
-expose cron and do **not** use a general NLP library. Instead we define a **small, closed, testable
-grammar** and parse it into an internal schedule model.
+### 12.1 How much of cron did the v0.1 English grammar expose? (your question)
 
-### 12.1 Grammar (v1)
+Very little. The v0.1 grammar covered only: *daily*, *specific weekday*, *hourly*, *every-N minutes/seconds*,
+with a single optional time-of-day and a single optional window. It could **not** express day-of-month,
+month, ranges/lists/steps, multiple times per day, nth/last weekday, etc. — a small corner of cron, and a
+custom parser we'd have to grow and test forever.
 
+### 12.2 Decision — cron-first (your steer)
+
+Adopt **standard cron as the primary schedule expression**, evaluated by a maintained **tz + DST-aware**
+crate. Rationale: full expressiveness, portable/standard, trivial to author (incl. via an LLM), and far less
+bespoke parser surface to test to the 90% gate. Plain-English becomes **optional thin sugar** for the top few
+cases, compiled to the same internal model (`schedule/sugar.rs`); it is explicitly secondary and documented
+as convenience.
+
+- **Crate (candidate): `croner`** — pure-Rust, `chrono-tz` integration, supports seconds + ranges/lists/steps
+  and `L`/`#`. Alternatives: `cron`, `saffron`. Finalized at scaffold; all pure-Rust (Windows-clean).
+- **Modes:** `immediate` (default) · `cron` (point trigger: release all `Ready` work at each fire) · `window`
+  (continuous flow, gated to an open→close span).
+
+### 12.3 How hard is "windows on cron"? (your question) — Easy
+
+Cron expresses **instants**, not spans, so a window is a **pair**: `open` (cron) + either `close` (cron) or
+`durationMins`. The engine tracks state by comparing `now` to the most-recent `open` fire and the next
+`close`:
+
+```mermaid
+flowchart LR
+  subgraph Eval["window_state(now)"]
+    O[last open fire] --> S{now within<br/>open..close?}
+    S -->|yes| OPEN["Open until close"]
+    S -->|no| CLOSED["Closed — opens at next open"]
+  end
 ```
-schedule   := "Every" spec ("at" time | "from" time "to" time)?
-spec       := "day" | weekday | "hour" | "minute" | number ("minutes"|"hours"|"seconds")
-weekday    := Monday..Sunday
-time       := "2am" | "2:30am" | "14:00" | "5 AM" ...
-```
 
-Examples that MUST parse:
-`"Every day at 5am"`, `"Every Wednesday at 2am"`, `"Every Wednesday from 2am to 4am"`,
-`"Every hour"`, `"Every 15 minutes"`, `"Every day from 22:00 to 06:00"` (overnight window).
+Overnight windows (e.g. open `0 22 * * *`, close `0 6 * * *`) work because the next `close` fire lands after
+`open`. `durationMins` is sugar for a fixed-length window (`close = open + duration`). Irregular windows
+(different open/close cadence) are naturally expressible with two crons.
 
-### 12.2 Internal model & evaluation
+### 12.4 Window-close behavior (FR-SCH-5)
 
-```rust
-enum Recurrence { EveryDay, EveryWeekday(Weekday), EveryHour, EveryMinute, EveryN(Duration) }
-struct Schedule { recur: Recurrence, at: Option<TimeOfDay>, window: Option<(TimeOfDay, TimeOfDay)>, tz: Tz }
-impl Schedule {
-    fn next_fire(&self, now: DateTime<Tz>) -> DateTime<Tz>;      // point trigger
-    fn window_state(&self, now: DateTime<Tz>) -> WindowState;    // Open{until} | Closed{opens_at}
-}
-```
+`onWindowClose`:
+- **`finishCurrent`** — let in-flight transfers complete past the close time; admit no new files until next
+  open.
+- **`pauseResume`** (default) — checkpoint in-flight resume state and pause at close, resuming at next open —
+  **if the destination supports resume**; otherwise **fall back to `finishCurrent`** for that transfer (never
+  discard partial progress). This is the bandwidth-conservation use case (uploads pause during operating
+  hours). Emits `WindowOpened` / `WindowClosed` / `ScheduleComplete`.
 
-- **Timezone/DST-aware** via `chrono` + `chrono-tz` (pure-Rust). Overnight windows (start > end) handled.
-- **Immediate mode** bypasses all of this (`ScheduleCfg::Immediate`).
-- **Window semantics (FR-SCH-3/5):** while closed, `Ready` items wait; on open, the scheduler releases work
-  and emits `WindowOpened`; if the window closes mid-transfer, `onWindowClose` decides `pause` (default —
-  checkpoint resume state, resume next window) or `finishCurrent` (let the active file complete, admit no
-  new files). Emits `WindowClosed` + `ScheduleComplete`.
-- We reuse the **`SyncEngine` interval pattern** from ggcommons credentials (sleep in ≤1s steps so shutdown
-  is honored promptly) for the scheduler tick rather than a long single sleep.
-
-### 12.3 Why not cron-under-the-hood
-
-We could translate English→cron→evaluator, but a purpose-built parser over a closed grammar is (a) exactly
-the surface we advertise (no surprising cron semantics leak), (b) trivially unit-testable to the 90% gate,
-(c) able to express **windows** (cron can't natively), and (d) dependency-light. If we ever need arbitrary
-expressions, we can add an escape-hatch `"cron": "..."` field later — not now.
+We reuse the ggcommons credentials `SyncEngine` interval pattern (sleep in ≤1s steps so shutdown/reload are
+honored promptly) for the scheduler tick rather than one long sleep.
 
 ---
 
 ## 13. Completion, integrity & reliability
 
-### 13.1 Integrity (default: checksum-verify-always — your choice)
+### 13.1 Integrity (default: checksum-verify-always — accepted)
 
-- Single-pass streaming hash on read (CRC32C for object stores that support it natively; SHA-256 where a
-  strong hash is wanted). Compared against the destination's reported checksum/ETag (S3), server response
-  (HTTP), or a re-hash (local/SFTP) **before** completion.
-- `completion.verify`: `checksum` (default) | `size` | `none`. Docs will strongly steer toward `checksum`
-  given move+delete semantics.
+Single-pass streaming hash on read, compared against the destination's reported checksum/ETag (S3 flexible
+checksum), server response (HTTP), or re-hash (local/SFTP) **before** completion. `completion.verify`:
+`checksum` (default) | `size` | `none`.
 
 ### 13.2 Crash-safe completion (FR-CMP-4)
 
-Ordering with write-ahead state (§14):
-
+```mermaid
+sequenceDiagram
+  participant W as Worker
+  participant D as Destination
+  participant S as Durable store
+  participant F as Filesystem
+  W->>D: deliver() (resumable)
+  D-->>W: delivered (+checksum)
+  W->>D: verify()
+  D-->>W: ok
+  W->>S: persist Verified (write-ahead)
+  W->>F: completion (delete | move to archive)
+  W->>S: persist Completed
+  Note over W,S: Crash between Verified and Completed →<br/>on restart re-verify idempotently, then finish completion.<br/>Never re-upload; never lose the source.
 ```
-1. destination.deliver() succeeds
-2. destination.verify() succeeds
-3. persist item state = Verified(dest checksums)     ← write-ahead
-4. completion action (delete source | move to archive)
-5. persist item state = Completed; remove from active set
-```
 
-Recovery on restart:
-- `InProgress` with resume state → resume the transfer.
-- `Verified` but not `Completed` → **re-verify idempotently** (object already there & matches) then run the
-  completion action. Never re-upload; never lose the source.
-- Object stores use **stable keys** (deterministic from relative path + prefix) so re-delivery overwrites
-  identically (idempotent), avoiding duplicates (FR-REL-4).
+Object stores use **stable, deterministic keys** (relpath + prefix) so re-delivery overwrites identically
+(idempotent), avoiding duplicates (FR-REL-4).
 
-### 13.3 Retry (FR-REL-1/2)
+### 13.3 Failure handling & the Failed folder (FR-CMP-6 — your question #9)
 
-- Bounded exponential backoff + jitter; `maxAttempts` then terminal `Failed` (retained, visible in
-  statistics, retriable via `TriggerReplication`).
-- Partial-success resume (FR-REL-3) means a retry continues, not restarts, wherever the backend supports it.
+Yes — a dead-letter/quarantine folder, symmetric with `archive`. On retry-exhaustion (`Exhausted`):
+- **`quarantine`** — move the source to `failedDir` (subtree preserved) **plus a sidecar** `FILE.error.json`
+  `{ lastError, attempts, firstSeen, lastTry, destination, bytesDone }`. Keeps the watch dir clean and gives
+  operators the file + diagnosis. Emits `RetriesExhausted` + `FileQuarantined`.
+- **`retainInPlace`** (default) — leave the file where it is, mark `Failed` (visible in `get-status`),
+  retriable via a `trigger` command. No surprise moves.
+
+Retry-exhausted items never block other files and never silently vanish.
+
+### 13.4 Long-disconnect resilience (FR-REL-7 — your question #10)
+
+The retry model is built for hours-to-~2-days offline:
+
+- **Time-governed give-up, not attempt-count.** Backoff caps at `maxDelayMs` (default 15 min) and keeps
+  retrying until `giveUpAfter` (default **7 days**) — so a 2-day outage stays well inside the budget.
+  `maxAttempts` is optional (default `null`); with pure exponential-until-cap, a naïve attempt cap would
+  expire mid-outage — hence time-based is the default.
+- **Transient vs permanent classification.** Connectivity/timeouts/5xx/throttling = transient (back off,
+  keep trying). Auth-denied / no-such-bucket / object-too-large / precondition = permanent (fail fast to
+  `Exhausted` without burning days). Documented per backend.
+- **Disconnection circuit-breaker.** On sustained failures the instance enters a `Disconnected` state and
+  probes on the `maxDelay` cadence instead of hammering every file — avoiding a thundering herd when the link
+  returns; on first success it re-opens and drains the queue (oldest-first). Emits `Disconnected` /
+  `Reconnected` events.
+- **Resume, not restart.** In-flight uploads resume from persisted checkpoints after the outage (and across
+  any reboots during it, thanks to durable state, §14).
+- **MPU lifecycle interplay.** S3 incomplete-multipart-upload lifecycle-abort age must exceed `giveUpAfter`
+  (else a resume finds its `uploadId` gone). Docs will state: set the bucket's abort-incomplete-MPU rule >
+  `giveUpAfter`, or the replicator re-initiates the upload (still correct, just re-sends).
+
+### 13.5 Bandwidth cap (FR-REL-6 — your requirement #2)
+
+A **token-bucket rate limiter** on the transfer byte-stream:
+- **Per-instance** `limits.maxBandwidth` (e.g. `"20MB/s"`) and a **global** `component.global.limits.maxBandwidth`
+  aggregate; a transfer must pass both.
+- Human-friendly units (`KB/s`, `MB/s`, `Mbps`, `Gbps`); shared fairly across an instance's parallel
+  files/parts and globally across instances.
+- Primary use: cap uplink during operating hours (immediate mode); complements windows (which gate transfer
+  entirely). Bursting and a `minChunk` avoid pathological tiny writes. (Future: per-schedule bandwidth, e.g.
+  faster inside a maintenance window — noted, not in v1.)
+
+### 13.6 Retry (FR-REL-1/2)
+
+Bounded exponential backoff + jitter within `giveUpAfter`; resume where supported (§13.4); `Exhausted` →
+quarantine/retain (§13.3).
 
 ---
 
 ## 14. Durable state
 
-The queue and resume checkpoints **must** survive crashes/reboots (NFR-5). Design:
+The queue, resume checkpoints, **activation state**, and statistics must survive crashes/reboots/outages
+(NFR-5) — via **write-ahead** transitions (state persisted before the side effect it authorizes, §13.2).
 
-- **Embedded, pure-Rust store: `redb`** (ACID, single-file, no C toolchain → builds on Windows and
-  everywhere; aligns with NFR-6). Alternative considered: SQLite via `rusqlite` (bundled) — rejected as
-  default because it needs a C compiler, which the org notes Windows lacks. (`sled` also considered; `redb`
-  chosen for maturity + crash-safety guarantees.)
-- **Per-instance state** under a component data dir (`/data/...` on k8s PVC; component work dir on
-  HOST/GG). Tables:
-  - `work_items`: key = `(instance, relpath)`, value = `{state, size, discovered_at, attempts, last_error}`.
-  - `resume`: key = work item, value = destination `ResumeState` (S3 uploadId+completed parts, GCS session
-    URI, SFTP offset, ...).
-  - `stats`: per-instance counters (replicated, failed, bytes) for fast `GetStatus`.
-- **Write-ahead discipline:** state transition persisted before the authorized side effect (§13.2).
-- Mirrors the *spirit* of the ggstreamlog durable buffer (disk-backed, crash-safe, fsync policy) but is
-  file-oriented rather than record-oriented, so it's a purpose-built store, not a reuse of ggstreamlog.
+### 14.1 Engine decision — revisited (your #11 / #14-F)
+
+With the C-toolchain constraint resolved (§2), I re-evaluated redb vs SQLite against our actual needs.
+**Both are ACID and crash-safe** (SQLite in WAL mode; redb via MVCC + durable commit), so the "if SQLite
+isn't crash-safe, use redb" test resolves in SQLite's favor — SQLite *is* crash-safe. On functional fit:
+
+| Need | `redb` (pure-Rust) | **SQLite** (`rusqlite`, bundled, WAL) |
+|---|---|---|
+| Crash safety / ACID | ✅ | ✅ (WAL) |
+| Work-queue + resume blobs | ✅ (typed tables) | ✅ |
+| **`get-status` queries** (filter/sort/aggregate awaiting·in-progress·failed by instance/age) | manual scans + hand-rolled secondary indexes | ✅ **SQL + indexes** — natural fit |
+| **Operational introspection** (open the DB, see what's stuck) | limited tooling | ✅ ubiquitous tooling |
+| Stats counters/rollups | manual | ✅ `SUM`/`COUNT`/`GROUP BY` |
+| Build cost | none | one C amalgamation compile (Linux builders + Windows both have the toolchain now) |
+| Binary/runtime | slightly smaller | statically linked, no runtime dep |
+
+**Recommendation: switch to SQLite** (`rusqlite` with the `bundled` feature, WAL mode). The status/statistics
+surface (FR-CTL-2) and per-file diagnostics map directly onto SQL, and an on-disk SQLite file an operator can
+inspect is a real advantage for a data-moving component. The only cost — a C compile at build time — is now
+negligible (all build targets have the toolchain; the runtime binary is statically linked with no external
+dep). **`redb` remains the fallback** if you'd rather keep the build 100% pure-Rust; the `state.rs` API is
+written against an internal trait so the backend is swappable and does not leak into the engine. Per your
+#14-F, since SQLite *is* crash-safe and the better functional fit, this flips to SQLite unless you prefer the
+pure-Rust build.
+
+### 14.2 Schema (SQLite)
+
+```sql
+-- one DB per component data dir; instances share it, keyed by instance id
+CREATE TABLE work_items(
+  instance TEXT, relpath TEXT, state TEXT, size INTEGER, discovered_at INTEGER,
+  attempts INTEGER, last_error TEXT, bytes_done INTEGER, updated_at INTEGER,
+  PRIMARY KEY(instance, relpath));
+CREATE INDEX ix_ready  ON work_items(instance, state, discovered_at);   -- oldest-ready-first scan
+CREATE TABLE resume(instance TEXT, relpath TEXT, dest TEXT, blob BLOB,  -- MPU parts / session URI / offset
+  PRIMARY KEY(instance, relpath, dest));
+CREATE TABLE activation(instance TEXT PRIMARY KEY, active INTEGER, source TEXT, updated_at INTEGER);
+CREATE TABLE stats(instance TEXT PRIMARY KEY, replicated INTEGER, failed INTEGER, bytes INTEGER, ...);
+```
+
+Located under the component data dir (`/data/...` on a k8s PVC; component work dir on HOST/GG).
 
 ---
 
-## 15. Control-message suite
+## 15. Unified namespace (topic design)
 
-Uses the ggcommons request/reply primitive (`MessagingService::request`/`reply`, `reply_to` header). There
-is **no generic control framework in core today** — each component wires its own `subscribe` handlers — so
-we build a small local **control dispatcher** (message-name → handler), designed to be liftable into core.
+**Your #12 — the most important structural change.** v0.1 mixed two roots (`ggcommons/…` inherited from
+core's `GetConfiguration`, and `edgecommons/filereplicator/…`), placed identity inconsistently, had no
+enterprise/site dimension, and would collide when many edges bridge to one cloud broker. We replace it with a
+single **RESTful, site-scoped, cloud-bridge-safe** UNS.
 
-### 15.1 Commands
+### 15.1 The scheme
 
-| Command (`header.name`) | Topic (default) | Body | Reply |
+```
+edgecommons/{ver}/{enterprise}/{site}/{thing}/{component}/{class}/{resource…}
+```
+
+- **single root** `edgecommons`; **`{ver}`** (`v1`) for evolution.
+- **`{enterprise}/{site}/{thing}`** = ISA-95-style location + edge identity → **globally unique across all
+  sites**, so an edge→cloud bridge forwarding `edgecommons/v1/#` never collides. `enterprise`/`site` come from
+  `tags`; `thing` from ggcommons identity. (Area/line stay in the message `tags`/body to bound topic depth;
+  the prefix is a configurable template if a deeper hierarchy is wanted.)
+- **`{component}`** = `file-replicator`.
+- **`{class}`** — clean separation of interaction kinds:
+  - **`cmd`** — inbound commands (component subscribes). RESTful resource paths.
+  - **`evt`** — outbound event stream (non-retained).
+  - **`state`** — outbound **retained** current state (snapshot-on-connect for UI/cloud).
+
+### 15.2 Topic map
+
+| Purpose | Class | Topic (under the identity prefix `…/file-replicator`) | Retained |
 |---|---|---|---|
-| **`GetConfiguration`** v1.0 | `ggcommons/{ThingName}/config/get/{ComponentName}` (core contract) | `{}` | effective config document |
-| **`GetStatus`** v1.0 | `edgecommons/filereplicator/{ThingName}/control` | `{ "instance": "?" }` (optional filter) | per-instance statistics (below) |
-| **`TriggerReplication`** v1.0 | same control topic | `{ "instance": "?", "ignoreWindow": bool }` | accepted + counts scheduled |
+| Get config | cmd | `/cmd/config` (request/reply) | — |
+| Get status | cmd | `/cmd/status` or `/cmd/instances/{instance}/status` | — |
+| Trigger now | cmd | `/cmd/trigger` or `/cmd/instances/{instance}/trigger` | — |
+| Activate/deactivate | cmd | `/cmd/instances/{instance}/activation`  body `{active,persist,reset}` | — |
+| Event stream | evt | `/evt/instances/{instance}/{event}` (e.g. `…/replication-progress`) | no |
+| Component events | evt | `/evt/{event}` (e.g. `component-ready`) | no |
+| Instance current state | state | `/state/instances/{instance}` | **yes** |
+| Component current state | state | `/state` | **yes** |
 
-`GetStatus` reply body (per instance):
+Replies use the request's `reply_to` (ephemeral topic) via `messaging.reply` — no fixed reply topics to
+collide.
+
+### 15.3 Why this bridges to the cloud (RESTful + wildcard-friendly)
+
+```mermaid
+flowchart LR
+  subgraph Edge A - site42
+    A1[gw-01/file-replicator]
+  end
+  subgraph Edge B - site7
+    B1[gw-09/file-replicator]
+  end
+  A1 -->|edgecommons/v1/#| BR[MQTT bridge]
+  B1 -->|edgecommons/v1/#| BR
+  BR --> CLOUD[(Cloud broker /<br/>global UI)]
+  CLOUD -.->|"sub edgecommons/v1/+/site42/+/file-replicator/evt/#"| UI1[Site view]
+  CLOUD -.->|"sub edgecommons/v1/+/+/+/file-replicator/state/#"| UI2[Global fleet state]
+```
+
+Because identity is *in the topic* (`enterprise/site/thing`), every edge's messages stay distinct after
+bridging, and consumers select by any level with wildcards (one site, one thing, one instance, all state,
+etc.). Retained `state/…` gives a global dashboard the latest snapshot immediately on connect.
+
+### 15.4 Reconciling with ggcommons core (the "why two roots" answer)
+
+The mixing came from **core**: `GetConfiguration` and heartbeat/metrics publish under `ggcommons/…`. We
+shouldn't perpetuate it. Plan:
+1. **file-replicator** uses the unified `edgecommons/v1/…` for all its cmd/evt/state now.
+2. **Compat alias (optional):** also answer the legacy core `ggcommons/{thing}/config/get/{component}` for
+   `GetConfiguration` so existing config-source clients keep working (`legacyConfigTopic: true`).
+3. **Core proposal (separate):** migrate ggcommons core control/heartbeat/metric topics into the same
+   `edgecommons/v1/…` UNS (four-language parity), so the whole ecosystem is one bridge-safe namespace. This is
+   the proper home for the "promote to core" idea (§16, §20-E) — a UNS + control-surface standard, not just a
+   single message.
+
+All topics are configurable via `component.global.topics.prefix` (+ per-instance override); the values above
+are the intelligent defaults.
+
+---
+
+## 16. Control-message suite
+
+Uses the ggcommons request/reply primitive (`request`/`reply`, `reply_to`). Core has **no generic control
+framework** — each component wires its own handlers — so we build a small local **control dispatcher**
+(resource/verb → handler), structured to be liftable into core alongside the UNS proposal (§15.4, §20-E).
+
+| Command | Topic (UNS) | Body | Reply |
+|---|---|---|---|
+| **get-config** | `…/cmd/config` (+ legacy alias) | `{}` | effective config document |
+| **get-status** | `…/cmd/status` or `…/cmd/instances/{id}/status` | `{ }` / instance filter | statistics (below) |
+| **trigger** | `…/cmd/trigger` or `…/cmd/instances/{id}/trigger` | `{ ignoreWindow?: bool }` | accepted + counts |
+| **set-activation** | `…/cmd/instances/{id}/activation` | `{ active: bool, persist?: bool=true, reset?: bool }` | new effective state |
+
+`get-status` reply (per instance):
 
 ```jsonc
 {
   "instance": "plant-csv-to-s3",
-  "schedule": { "mode": "scheduled", "window": "Open", "windowClosesAt": "..." },
+  "active": true, "configuredEnabled": true,
+  "schedule": { "mode": "window", "window": "Open", "windowClosesAt": "..." },
+  "link": "Connected",                       // or "Disconnected" (circuit-breaker, §13.4)
   "awaiting":  { "count": 12, "bytes": 48210233,
                  "files": [ { "path": "a/b.csv", "size": 40211, "ageSecs": 91 } ] },
   "inProgress":[ { "path": "big.parquet", "size": 734003200, "bytesDone": 220200960, "percent": 30.0,
                    "destination": "s3", "attempt": 1 } ],
   "replicated":{ "count": 4310, "bytes": 90230411223, "last": { "path": "...", "at": "..." } },
-  "failed":    { "count": 2, "items": [ { "path": "x.csv", "attempts": 10, "lastError": "..." } ] }
+  "failed":    { "count": 2, "items": [ { "path": "x.csv", "attempts": 24, "lastError": "...",
+                                          "quarantinedAt": "..." } ] }
 }
 ```
 
-### 15.2 "Promote GetConfiguration to core?" — recommendation
-
-**Short answer: partially, and not as a blocker.**
-
-- Core **already defines** the `GetConfiguration` v1.0 *requester* (it's a config *source* — topic + message
-  name are fixed and cross-language). It does **not** ship a **responder** or any generic control framework.
-- **Recommendation (this component):** implement the **responder** side locally now, answering the existing
-  `GetConfiguration` contract — zero new core surface, immediately useful, and consistent with the standard
-  topic/name.
-- **Recommendation (ggcommons core, separate proposal):** promote a small, opt-in **control-surface helper**
-  into core with:
-  1. a built-in `GetConfiguration` responder (every component benefits — returns the effective config), and
-  2. a `GetStatus`/health responder returning a standard liveness/summary, and
-  3. a message-name→handler **registry** components extend with their own commands (like our
-     `TriggerReplication`).
-
-  This is genuinely reusable (it's not file-replicator-specific), but it's **net-new infrastructure that all
-  four languages must mirror** (the four-way-parity rule). So: build it in `file-replicator` first as the
-  proving ground, extract to core once the shape is validated. I've left `control.rs` structured so the
-  dispatcher + `GetConfiguration`/`GetStatus` handlers are the extractable part.
-
-I'll file this as a ggcommons issue proposal for your sign-off rather than changing core under this repo.
-
 ---
 
-## 16. Status/event publishing (realtime UI)
+## 17. Status/event publishing (realtime UI)
 
-One-way events on user-configurable topics with intelligent defaults, so a UI can subscribe and render
-live. Envelope = standard ggcommons `Message`; `header.name = "FileReplicatorEvent"`, `version = "1.0"`;
-`body.event` discriminates.
+One-way events on the UNS `evt/…` (non-retained) + **retained** `state/…` snapshots. Envelope = standard
+ggcommons `Message`; `header.name = "FileReplicatorEvent"`, `version = "1.0"`; `body.event` discriminates.
 
-### 16.1 Event types
+### 17.1 Event types (FR-EVT-1)
 
 `FileDiscovered`, `FileReady`, `ReplicationStarted`, `ReplicationProgress`, `ReplicationCompleted`,
-`ReplicationFailed`, `FileArchived`, `FileDeleted`, `ScheduleTriggered`, `WindowOpened`, `WindowClosed`,
-`ScanComplete`.
+`ReplicationFailed`, `FileArchived`, `FileDeleted`, `FileQuarantined`, `RetriesExhausted`,
+`ScheduleTriggered`, `WindowOpened`, `WindowClosed`, `ScanComplete`, `Disconnected`, `Reconnected`,
+**`InstanceActivated`**, **`InstanceDeactivated`**, `ComponentReady`.
 
-### 16.2 Topics (defaults, all overridable)
-
-```
-edgecommons/filereplicator/{ThingName}/{instance}/events        (all events, default)
-edgecommons/filereplicator/{ThingName}/{instance}/progress      (progress only, higher volume)
-```
-
-Config allows either a single events topic or per-event-type topic templates (`{ThingName}`, `{instance}`,
-`{event}` tokens resolved via the ggcommons template resolver).
-
-### 16.3 Event body (example — progress)
+### 17.2 Example — progress event
 
 ```jsonc
 { "event": "ReplicationProgress", "instance": "plant-csv-to-s3",
@@ -758,112 +923,110 @@ Config allows either a single events topic or per-event-type topic templates (`{
   "destination": "s3", "attempt": 1, "ts": "2026-07-01T09:15:22Z" }
 ```
 
-- **Throttling (FR-EVT-2):** progress emitted on ≥`progressPercentStep` (default 10%) **or** every
-  `progressIntervalSecs` (default 5s), whichever first; `0%`/`100%` always emitted.
-- QoS default `AtMostOnce` for progress (lossy-ok), `AtLeastOnce` for lifecycle transitions.
+- **Throttling (FR-EVT-2):** progress on ≥`progressPercentStep` (default 10%) **or** every
+  `progressIntervalSecs` (default 5s); `0%`/`100%` always. QoS `AtMostOnce` for progress, `AtLeastOnce` for
+  lifecycle transitions.
+- **Retained state (FR-EVT-4):** after each transition the component republishes the compact per-instance
+  state to `state/instances/{id}` (retained), so a late UI/cloud subscriber renders correctly on connect.
 
 ---
 
-## 17. Observability, platform & packaging
+## 18. Observability, platform & packaging
 
-### 17.1 Metrics (`gg.metrics()`)
-
-`files_discovered`, `files_replicated`, `files_failed`, `bytes_replicated`, `in_progress`, `queue_depth`,
-`retry_count`, `upload_duration_ms` (histogram-ish via measures), `window_open` (gauge). Target resolves per
-platform (prometheus on k8s, log elsewhere) — no component-side branching.
-
-### 17.2 Platform support
-
-- Platform/transport entirely via the ggcommons resolver (HOST→FILE/MQTT, GG→GG_CONFIG/IPC,
-  K8S→CONFIGMAP/MQTT). No `#[cfg(platform)]` in engine code; only cargo features gate backends + the
-  Linux-only `greengrass` (IPC) feature (held OFF by default like `telemetry-processor`).
-- Health (`/livez` `/readyz` `/startupz`) and structured JSON logging come from the library on k8s.
-- `gg.set_ready(false)` until each instance's watcher+queue is initialized; `true` when replicating.
-- SIGTERM → `gg.shutdown_signal()` → checkpoint resume state, pause/drain, flush, drop.
-
-### 17.3 Deploy artifacts (three, kept in sync on the full name)
-
-- **`recipe.yaml`** + **`build.sh`** + **`gdk-config.json`** — Greengrass (declares TokenExchangeService for
-  device-role S3 creds; pubsub/mqttproxy access control; `Run: ... --platform GREENGRASS -c GG_CONFIG`).
-- **`Dockerfile`** + **`k8s/{configmap,deployment}.yaml`** — Kubernetes (needs a **PVC** for the durable
-  state + archive/spool; ConfigMap mounted as a whole volume for hot-reload; Downward-API identity;
-  health/metrics ports).
-- **`test-configs/`** — HOST samples (config + dual-MQTT messaging block).
-
-### 17.4 CI
-
-One caller workflow → `edgecommons/.github/.github/workflows/component-ci.yml@main` with
-`language: RUST`, `rust-features: "dest-s3,dest-sftp,dest-http"` (compile+test the shippable backends),
-`secrets: inherit` (private-git PAT). We **add the 90% coverage gate** in-repo
-(`cargo llvm-cov --fail-under-lines 90`) since the reusable workflow doesn't enforce it.
-
-### 17.5 Docs (post-approval, Diátaxis, no frontmatter — synced to Starlight)
-
-```
-docs/README.md · tutorial.md · how-to-guides.md · sample-configurations.md · explanation.md
-docs/reference/configuration.md · reference/messaging-interface.md · reference/destinations.md
-```
-
-`configuration.md` becomes the canonical config spec (there is no per-component JSON schema in the
-ecosystem; the reference doc is the source of truth, matching `telemetry-processor`).
+- **Metrics** (`gg.metrics()`): `files_discovered`, `files_replicated`, `files_failed`, `files_quarantined`,
+  `bytes_replicated`, `in_progress`, `queue_depth`, `retry_count`, `bandwidth_bytes_per_sec`,
+  `link_connected` (gauge), `instance_active` (gauge), `upload_duration_ms`. Target resolves per platform
+  (prometheus on k8s, log elsewhere).
+- **Platform** entirely via the ggcommons resolver (HOST→FILE/MQTT, GG→GG_CONFIG/IPC, K8S→CONFIGMAP/MQTT);
+  no `#[cfg(platform)]` in engine code; cargo features gate backends + the Linux-only `greengrass` (IPC)
+  feature (OFF by default). Health `/livez` `/readyz` `/startupz` + JSON logging from the library on k8s.
+  `gg.set_ready(false)` until instances initialize.
+- **Deploy artifacts** (three, synced on the full name): `recipe.yaml`+`build.sh`+`gdk-config.json`
+  (Greengrass — declares TokenExchangeService for ambient S3 creds; pubsub/mqttproxy access control);
+  `Dockerfile`+`k8s/{configmap,deployment}.yaml` (k8s — **PVC** for the SQLite DB + archive/failed dirs;
+  ConfigMap whole-volume mount for hot-reload; Downward-API identity; health/metrics ports); `test-configs/`
+  (HOST).
+- **CI:** one caller → `edgecommons/.github/.github/workflows/component-ci.yml@main`
+  (`language: RUST`, `rust-features: "dest-s3,dest-sftp,dest-http"`, `secrets: inherit`) + in-repo 90% gate
+  (`cargo llvm-cov --fail-under-lines 90`).
 
 ---
 
-## 18. Open decisions & recommendations
+## 19. Documentation strategy
 
-Your explicit questions, answered. **Items A–D reflect your selections; E–G are my recommendations for
-your sign-off.**
+**Your #13 — carry forward the docs lessons** (from the ggcommons docs audit + "depth over simplest-case"):
+the docs must **teach**, with **extensive real configuration samples and deep explanation**, not a syntax
+rehash of the config keys.
 
-- **A. Additional destinations — DECIDED (you):** design for **SFTP/FTPS, HTTP(S), Azure Blob, GCS** (plus
-  local + S3). All behind the `Destination` trait + cargo features; **ship `local` + `s3` first**, others
-  phased (§19). ✔
-- **B. Multiple destinations (fan-out) — DECIDED (you):** **design multi, ship single first.** `egress` is a
-  list; v1 validates `len == 1`; fan-out semantics fully specified (FR-EGR-3: done-when-all-succeed,
-  independent per-destination retry, single completion). ✔
-- **C. On-complete placement — RECOMMEND: separate `completion` section (not inside `egress`).** Rationale:
-  with fan-out, completion is a **source-file lifecycle** decision spanning *all* destinations, so it can't
-  belong to a single egress entry; it's conceptually distinct (source cleanup vs delivery) and keeps the
-  schema clean. Adopted in §7. ✔ (your call to confirm)
-- **D. Readiness default — DECIDED (you):** **stability window** default; `marker`/`rename`/`glob` selectable
-  (§9). Integrity: **checksum-verify-always** default (§13). ✔
-- **E. GetConfiguration → core — RECOMMEND: implement responder locally now; propose a core control-surface
-  helper separately** (§15.2). Not a blocker; core change is a distinct four-language proposal.
-- **F. Durable state engine — RECOMMEND: `redb` (pure-Rust)** over SQLite/sled for Windows-buildability and
-  crash-safety (§14). Confirm if you'd prefer SQLite (then Windows dev builds need WSL, like Lua).
-- **G. Category — RECOMMEND: `sink`** in the registry (§1, §20). Confirm vs `processor`.
-
-**Additional decisions I made with defaults (flag if you disagree):**
-- Idempotent re-delivery via **stable, deterministic object keys** (FR-REL-4).
-- Progress throttle defaults: **10% or 5s**.
-- Global + per-instance **concurrency caps** (defaults 8 / 4).
-- Scheduling via a **closed English grammar**, not cron-under-the-hood, with a possible future `cron:`
-  escape hatch (§12.3).
+- **Validate against the source of truth, not other docs.** The config-parsing code (`config.rs`) is
+  canonical; every documented field/default is checked against it (the audit's root-cause lesson).
+- **Diátaxis set** (plain `.md`, no frontmatter, synced to Starlight; `.mdx` only where `<Tabs>` needed):
+  - `tutorial.md` — first replication end-to-end (HOST → local, then → S3).
+  - `how-to-guides.md` — task recipes (schedule a nightly window; cap bandwidth; quarantine failures;
+    deactivate an instance from the control plane; wire a realtime UI to the UNS; resume across a 2-day outage).
+  - **`sample-configurations.md`** — a **large** annotated library: immediate→S3, cron→SFTP, overnight
+    bandwidth-limited window→NAS, multi-readiness, recursive subtree→prefix, ambient vs `$secret` creds,
+    quarantine + sidecar, per-platform (HOST/GG/k8s) variants. Each fully annotated with the *why*.
+  - `explanation.md` — deep concepts: the work-item state machine, crash-safe write-ahead completion,
+    resumable multipart, cron-vs-window semantics, the disconnection circuit-breaker, the UNS rationale and
+    cloud-bridging.
+  - `reference/configuration.md` — canonical field reference (there's no per-component JSON schema in the
+    ecosystem; this doc is the source of truth, matching `telemetry-processor`).
+  - `reference/messaging-interface.md` — the full **UNS** topic map, envelope shapes, event catalog,
+    control commands, retained-state contract.
+  - `reference/destinations.md` — per-backend capabilities, resume support, creds, IAM least-privilege.
+- **Mermaid diagrams** for every flow/state/sequence (this doc already does; the site needs a mermaid
+  integration — note for the website: add `rehype-mermaid`/an Astro mermaid plugin to Starlight).
 
 ---
 
-## 19. Phased implementation plan
+## 20. Open decisions & recommendations
 
-Design stays whole; implementation lands in reviewable slices, each green on the 90% gate + all 3 platforms.
+- **A. Additional destinations — DECIDED:** SFTP/FTPS, HTTP(S), Azure, GCS behind the `Destination` trait +
+  features; ship `local`+`s3` first. ✔
+- **B. Fan-out — DECIDED:** design multi (egress list), ship single (v1 `len==1`); semantics specified. ✔
+- **C. On-complete placement — ACCEPTED:** separate `completion` section. ✔
+- **D. Readiness default — DECIDED:** stability window; checksum-verify-always. ✔
+- **E. GetConfiguration → core — ACCEPTED:** implement responder locally now against the core contract;
+  propose the reusable core **control-surface + UNS** standard separately (§15.4). ✔
+- **F. Durable state — CHANGED RECOMMENDATION → SQLite** (`rusqlite` bundled, WAL): crash-safe *and* the
+  better functional fit for the status/statistics surface + operational introspection, now that the C
+  toolchain is available (§14). `redb` remains the pure-Rust fallback behind the same internal trait —
+  **your call** (§14.1 lays out the trade-off; per your #14-F, SQLite is crash-safe so it wins on fit unless
+  you want a pure-Rust build).
+- **G. Category — ACCEPTED:** registry `category: "sink"`. ✔
+
+**New decisions in this revision (flag if you disagree):**
+- Cron-first scheduling (`croner`), English as optional sugar; windows = open+close/duration crons (§12).
+- Ambient S3 creds by default, `$secret` optional (§11.5).
+- Failed folder default = `retainInPlace` (opt into `quarantine`) (§13.3).
+- Time-based `giveUpAfter` (default 7d) over attempt caps; circuit-breaker for long outages (§13.4).
+- Bandwidth caps per-instance + global (§13.5).
+- Activation: persisted runtime state wins over config `enabled` (§7.5).
+- UNS: `edgecommons/v1/{enterprise}/{site}/{thing}/file-replicator/{cmd|evt|state}/…`, retained state (§15).
+
+---
+
+## 21. Phased implementation plan
 
 | Phase | Scope | Exit criteria |
 |---|---|---|
-| **P0 — Scaffold** | Repo skeleton from the Rust template, config model, module stubs, CI caller, docs shell, registry entry PR. | `cargo build/test/clippy` green; empty engine runs on HOST. |
-| **P1 — Core engine (local dest)** | Watcher + readiness(stability) + durable queue(redb) + worker + completion(delete/archive) + integrity(checksum) + retry, **local destination**, immediate mode. | Move files local→local, crash-safe, verified, on all 3 platforms; ≥90% cov. |
-| **P2 — S3 destination** | Size-adaptive PutObject/multipart, parallel parts, resumable, S3-native checksums, vault/`$secret` + GG TES + IRSA creds. | Validated vs floci (local AWS emulator) + a real bucket; resume-after-kill proven. |
-| **P3 — Control + events** | Control dispatcher (GetConfiguration/GetStatus/TriggerReplication) + event publisher (all event types, throttling) + metrics. | Live status via control msg; UI-ready event stream verified. |
-| **P4 — Scheduling & windows** | English grammar parser + schedule/window engine + window-boundary pause/resume. | Windowed uploads validated incl. overnight + DST; mid-window resume proven. |
-| **P5 — Additional destinations** | SFTP/FTPS, HTTP(S), then Azure/GCS (feature-gated). | Each backend validated + resume where supported; features off default until stable. |
-| **P6 — Multi-destination fan-out** | Lift the `len==1` egress constraint; parallel fan-out + aggregate completion. | N-destination delivery, per-dest retry, single completion, verified. |
-| **P7 — Core promotion (optional)** | Extract control-surface helper → ggcommons (4-lang), if approved. | Parity + gates in all four langs. |
+| **P0 — Scaffold** | Repo from the Rust template; config model; module stubs; CI caller + gate; docs shell; registry PR. | build/test/clippy green; empty engine runs on HOST. |
+| **P1 — Core engine (local)** | Watcher + readiness(stability) + durable store(**SQLite**) + worker + completion(delete/archive/**quarantine**) + integrity(checksum) + retry + **bandwidth cap** + **activation**, local dest, immediate mode. | Move files local→local, crash-safe, verified, bandwidth-limited, activate/deactivate persists; 3 platforms; ≥90% cov. |
+| **P2 — S3 destination** | Size-adaptive PutObject/multipart, parallel parts, **acceleration/trailing-checksum/unsigned-PUT**, resumable, **ambient creds**+`$secret`. | Validated vs floci + a real bucket; resume-after-kill + 2-day-outage sim proven. |
+| **P3 — Control + events + UNS** | UNS topic layer; control dispatcher (get-config/get-status/trigger/set-activation); event publisher + retained state; metrics. | Live status + activation via control msg; UI-ready UNS stream + retained snapshots; cloud-bridge wildcard test. |
+| **P4 — Scheduling & windows** | `croner` cron + window(open/close/duration) + `onWindowClose` pause/resume; English sugar. | Windowed uploads incl. overnight/DST; mid-window pause/resume proven. |
+| **P5 — More destinations** | SFTP/FTPS, HTTP(S), then Azure/GCS (features off default until stable). | Each validated + resume where supported. |
+| **P6 — Multi-destination fan-out** | Lift `len==1`; parallel fan-out + aggregate completion. | N-dest delivery, per-dest retry, single completion. |
+| **P7 — Core promotion (optional)** | Extract UNS + control-surface helper → ggcommons (4-lang). | Parity + gates in all four langs. |
 
-Validation uses the standard matrix: HOST→Windows + EMQX/floci; GREENGRASS→lab-5950x; k8s→kind + lab-k3s;
-Rust `greengrass`/native builds→WSL.
+Validation: HOST→Windows + EMQX/floci; GREENGRASS→lab-5950x; k8s→kind + lab-k3s; Rust `greengrass` build→WSL.
 
 ---
 
-## 20. Appendix — registry entry, deps, repo scaffold
+## 22. Appendix — registry entry, deps, repo scaffold
 
-### 20.1 Proposed `registry/components.json` entry (PR to `edgecommons/registry`)
+### 22.1 Proposed `registry/components.json` entry
 
 ```json
 {
@@ -871,7 +1034,7 @@ Rust `greengrass`/native builds→WSL.
   "repo": "edgecommons/file-replicator",
   "language": "RUST",
   "category": "sink",
-  "description": "Rust reference sink: watches directories and replicates files to S3, local, SFTP/FTPS, HTTP, Azure Blob and GCS — on arrival or on plain-English schedules/windows — with resumable uploads, integrity verification, and a full control/event surface.",
+  "description": "Rust reference sink: watches directories and replicates files to S3, local, SFTP/FTPS, HTTP, Azure Blob and GCS — on arrival or on cron schedules/windows — with resumable uploads, integrity verification, bandwidth caps, per-instance activation, and a full control/event surface on a unified namespace.",
   "status": "experimental",
   "platforms": ["GREENGRASS", "HOST", "KUBERNETES"],
   "library": "ggcommons",
@@ -879,26 +1042,24 @@ Rust `greengrass`/native builds→WSL.
 }
 ```
 
-GitHub repo topics mirror `topics`. (Note: the registry has a strict JSON schema — validate with
-`check-jsonschema` before the PR.)
-
-### 20.2 New / notable dependencies (all pure-Rust unless noted)
+### 22.2 Notable dependencies
 
 | Crate | Purpose | Notes |
 |---|---|---|
 | `ggcommons` | the library | pinned by git rev; local sibling via `.cargo/config.toml` (gitignored) |
-| `tokio` | async runtime | features `rt-multi-thread,macros,signal,time,sync,fs` |
-| `notify` | filesystem watch | already used by ggcommons config watcher (proven) |
-| `redb` | durable state | pure-Rust, ACID, single-file |
-| `chrono` + `chrono-tz` | schedule/window TZ+DST | pure-Rust |
+| `tokio` | async runtime | `rt-multi-thread,macros,signal,time,sync,fs` |
+| `notify` | filesystem watch | already used by the ggcommons config watcher |
+| **`rusqlite`** (bundled) | durable state | **recommended (§14)**; C compile OK now. `redb` = pure-Rust fallback |
+| **`croner`** + `chrono` + `chrono-tz` | cron + windows, TZ/DST | pure-Rust; alternatives `cron`/`saffron` |
 | `globset` | include/exclude globs | pure-Rust |
-| `crc32c` / `sha2` | integrity hashing | pure-Rust |
-| `aws-sdk-s3` + `aws-config` | S3 | **new** to the ecosystem (kinesis/sm/kms/ssm exist; s3 does not); same `1.x` line |
-| `reqwest` | HTTP dest | rustls TLS |
-| `russh` / `russh-sftp` | SFTP/FTPS | pure-Rust; `dest-sftp` (off default) |
-| `azure_storage_blobs` / `google-cloud-storage` | Azure/GCS | younger crates; features off default |
+| `crc32c` / `sha2` | integrity | pure-Rust |
+| `governor` (or hand-rolled) | token-bucket bandwidth cap | pure-Rust |
+| `aws-sdk-s3` + `aws-config` | S3 | **new** to the ecosystem (kinesis/sm/kms/ssm exist; s3 did not); same `1.x` line |
+| `reqwest` | HTTP dest | rustls |
+| `russh` / `russh-sftp` | SFTP/FTPS | pure-Rust; off default |
+| `azure_storage_blobs` / `google-cloud-storage` | Azure/GCS | off default (crate maturity) |
 
-Cargo features (batteries-included default, native/immature held off — the `telemetry-processor` pattern):
+Cargo features (batteries-included default; native/immature off — the `telemetry-processor` pattern):
 
 ```toml
 default    = ["standalone", "dest-s3"]
@@ -908,39 +1069,36 @@ cloudwatch = ["ggcommons/cloudwatch"]
 dest-s3    = ["dep:aws-sdk-s3", "dep:aws-config"]
 dest-sftp  = ["dep:russh", "dep:russh-sftp"]
 dest-http  = ["dep:reqwest"]
-dest-azure = ["dep:azure_storage_blobs"]      # OFF by default (crate maturity)
-dest-gcs   = ["dep:google-cloud-storage"]     # OFF by default (crate maturity)
+dest-azure = ["dep:azure_storage_blobs"]      # OFF (maturity)
+dest-gcs   = ["dep:google-cloud-storage"]     # OFF (maturity)
+state-redb = ["dep:redb"]                     # pure-Rust durable-state alternative to bundled SQLite
 ```
 
-### 20.3 Repo scaffold (created after design approval)
+### 22.3 Repo scaffold (created after approval)
 
 ```
 file-replicator/
-  DESIGN.md            ← this document
-  README.md            (created)
-  LICENSE              Apache-2.0 (created — fills the org-wide LICENSE gap)
-  CLAUDE.md            component notes (created)
-  .gitignore           (created)
+  DESIGN.md README.md LICENSE CLAUDE.md .gitignore   (created)
   Cargo.toml Cargo.lock
   src/…                (§6.2)
   recipe.yaml build.sh gdk-config.json
   Dockerfile k8s/{configmap,deployment}.yaml
   test-configs/{config.json,standalone-messaging.json}
-  docs/…               (§17.5, Diátaxis)
-  .github/workflows/ci.yml   (calls the org reusable CI + coverage gate)
+  docs/…               (§19, Diátaxis)
+  .github/workflows/ci.yml
 ```
 
 ---
 
-### Review checklist for you
+### Review checklist
 
-1. **§18-C** — confirm `completion` as its own section (vs folding into `egress`).
-2. **§18-E** — confirm approach to `GetConfiguration` (local responder now, core proposal later).
-3. **§18-F** — confirm `redb` for durable state (vs SQLite).
-4. **§18-G** — confirm registry `category: "sink"`.
-5. **§12.1** — confirm the schedule grammar covers your real phrasings (add examples if not).
-6. **§10.3 / §16.2 / §15.1** — confirm default topics + whether the ggcommons-stream "notify" destination is wanted.
-7. **§19** — confirm the phase ordering / MVP cut (P1+P2 = usable local+S3 mover).
+1. **§14 (F)** — SQLite (recommended) vs pure-Rust redb for durable state — your call.
+2. **§12** — cron-first + English sugar; confirm the window model (open/close/duration) fits your phrasings.
+3. **§15** — the UNS scheme `edgecommons/v1/{enterprise}/{site}/{thing}/file-replicator/{cmd|evt|state}/…` —
+   confirm the hierarchy (enterprise/site/thing depth; area/line in tags) and the retained-state approach.
+4. **§13.3** — Failed-folder default (`retainInPlace` vs `quarantine`).
+5. **§13.4** — `giveUpAfter` default (7d) + circuit-breaker for long outages.
+6. **§11.5** — ambient-creds-by-default for S3.
+7. **§21** — phase ordering (P1 local + P2 S3 = usable MVP).
 
-On your sign-off I'll scaffold P0 (repo from the Rust template, config model, CI, docs shell) and open the
-registry PR.
+On sign-off I'll scaffold P0 and open the registry PR.

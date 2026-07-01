@@ -25,14 +25,30 @@ follows the phase plan (DESIGN §19) after sign-off. Do not write engine code be
   `rust-features`, `secrets: inherit`) + in-repo 90% gate (`cargo llvm-cov --fail-under-lines 90`).
 - Docs: Diátaxis `.md` (+`.mdx` only where Starlight `<Tabs>` needed), **no frontmatter**; synced to the site.
 
-## Key design choices (see DESIGN.md for rationale)
-- **Pure-Rust deps** for new subsystems so it builds on Windows (no C toolchain): `redb` (durable state),
-  `chrono`+`chrono-tz` (schedule), `globset`, `notify`, `crc32c`/`sha2`.
+## Key design choices (see DESIGN.md v0.2 for rationale)
+- **Durable state = SQLite** (`rusqlite` bundled, WAL) — recommended over redb now that the Windows C
+  toolchain exists ([[windows-msvc-build-toolchain]]): crash-safe AND better fit for the get-status/stats
+  query surface + operational introspection. `redb` kept as a pure-Rust fallback behind the same
+  `state.rs` trait (feature `state-redb`). **Pending user's final call (DESIGN §14/§20-F).**
 - **New ecosystem dep:** `aws-sdk-s3` (kinesis/sm/kms/ssm exist in ggcommons; s3 did not).
-- Backends behind a `Destination` trait + cargo features; batteries-included default = `local` + `dest-s3`;
-  immature crates (azure/gcs) OFF by default (the `greengrass`/`streaming-kafka` pattern).
-- Scheduling is a **closed English grammar**, not cron.
-- Durable, write-ahead state → crash-safe move+delete with checksum-verify-before-complete.
+- Backends behind a `Destination` trait + cargo features; default = `local` + `dest-s3`; immature crates
+  (azure/gcs) OFF by default (the `greengrass`/`streaming-kafka` pattern).
+- **Scheduling = cron-first** (`croner`, tz/DST-aware); plain-English is optional sugar → cron. Windows =
+  `open`+`close` (or `open`+`durationMins`) crons; `onWindowClose` = pauseResume (resume if dest supports,
+  else finishCurrent) | finishCurrent.
+- **Unified namespace** for all cmd/evt/state: `edgecommons/v1/{enterprise}/{site}/{thing}/file-replicator/
+  {cmd|evt|state}/…` — RESTful, site-scoped, cloud-bridge-safe; retained `state/…` snapshots. Replaces the
+  v0.1 mixed ggcommons/+edgecommons/ roots. Core `ggcommons/…` control topics = separate migration proposal.
+- Durable **write-ahead** state → crash-safe move+delete with checksum-verify-before-complete.
+- **Long-outage tolerant** (hours–~2d): time-based `giveUpAfter` (default 7d, not attempt caps), resume
+  in-flight, disconnection circuit-breaker.
+- **Bandwidth caps** (per-instance + global token bucket); **per-instance activation** persisted across
+  restarts (runtime state wins over config `enabled`), toggled via control message; **Failed folder**
+  quarantine (opt-in) with `.error.json` sidecar.
+- **S3 creds ambient by default** (GG TES / k8s IRSA / HOST env), `$secret` optional; S3 perf =
+  Transfer Acceleration + trailing checksums + unsigned-PUT + prefix parallelism, size-adaptive multipart.
+- **Docs**: extensive annotated config samples + deep teaching explanation, validated against `config.rs`
+  (not other docs) — NOT a syntax rehash. Mermaid diagrams globally.
 
 ## Registry
 Add to `../registry/components.json` as `category: "sink"` (entry drafted in DESIGN §20.1); validate with
