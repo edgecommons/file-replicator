@@ -5,23 +5,71 @@
 //! `heartbeat`, `metricEmission`, `health`, `tags`) are parsed by the library, not here.
 //!
 //! Conventions (mirrors `telemetry-processor`): `camelCase` field names; per-instance parse is
-//! skip-on-error ([`load_instances`]); startup tolerates zero instances at P0. The full field
-//! reference is `DESIGN.md` §7 (and, once authored, `docs/reference/configuration.md` — the
-//! canonical spec validated against THIS module).
+//! skip-on-error ([`load_instances`]); the component starts as long as **at least one** instance
+//! builds (the app fails fast only when zero instances start — FR-CFG-4). The full field reference is
+//! `DESIGN.md` §7 (and, once authored, `docs/reference/configuration.md` — the canonical spec
+//! validated against THIS module).
 //!
-//! Scope note: this is the P0 model. `local` and `s3` egress are fully typed; `sftp`/`http`/`azure`/
-//! `gcs` are recognized but their fields are not yet modeled (P5). A lenient int-or-float
-//! deserializer for Greengrass doubles (FR-CFG-3) and human byte-rate parsing for `maxBandwidth`
-//! (FR-REL-6) land in P1 — for now numeric fields take JSON integers and `maxBandwidth` is a string.
-
-// P0 scaffold: many config fields parse now but are only consumed once the engine lands (P1+). Allow
-// dead_code for this module until then, rather than sprinkling per-field attributes that we'd remove.
-#![allow(dead_code)]
+//! Scope note: `local` and `s3` egress are fully typed; `sftp`/`http`/`azure`/`gcs` are recognized
+//! but their fields are not yet modeled (P5). Every numeric field accepts a JSON integer **or** an
+//! integer-valued float via [`lenient_u64`] / [`lenient_opt_u64`] etc., because Greengrass delivers
+//! config numbers as doubles (FR-CFG-3); human byte-rate parsing for `maxBandwidth` (FR-REL-6) lives
+//! in [`ratelimit::parse_byte_rate`](crate::ratelimit::parse_byte_rate).
+//!
+//! The P0 module-level `allow(dead_code)` is gone now the P1 engine consumes the P1 field set
+//! (ingress/egress-local/completion/retry/limits/schedule-immediate/activation). What remains
+//! unconsumed is genuinely future scope, so the few types it covers carry a **narrow, reason-tagged**
+//! `allow(dead_code)`: the S3 egress model (`S3Egress`/`MultipartCfg`, P2), the cron/window schedule
+//! payloads (`CronSchedule`/`WindowSchedule`/`WindowClose`, P4), and the UNS topic override
+//! (`TopicsCfg` + `InstanceCfg::topics`, P3). They are removed as each phase wires them in.
 
 use std::path::PathBuf;
 
 use ggcommons::prelude::Config;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
+// ---- lenient numeric deserializers (FR-CFG-3: Greengrass delivers config numbers as doubles) -----
+//
+// Every numeric config field routes through these so `"maxConcurrentFiles": 4` and
+// `"maxConcurrentFiles": 4.0` both parse. Without this a single float-valued number fails the whole
+// instance parse, and `load_instances` then skips it — so a Greengrass deployment (a platform P1 must
+// support) could silently skip every instance.
+
+/// Accept a JSON integer or an integer-valued float for a required `u64` field.
+fn lenient_u64<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    use serde::de::Error;
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_f64().map(|f| f as u64))
+            .ok_or_else(|| Error::custom("expected a non-negative integer")),
+        other => Err(Error::custom(format!("expected a number, got {other}"))),
+    }
+}
+
+/// Accept a JSON integer or an integer-valued float (or null/absent → `None`) for `Option<u64>`.
+fn lenient_opt_u64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    use serde::de::Error;
+    match Option::<serde_json::Value>::deserialize(d)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .or_else(|| n.as_f64().map(|f| f as u64))
+            .map(Some)
+            .ok_or_else(|| Error::custom("expected a non-negative integer")),
+        Some(other) => Err(Error::custom(format!("expected a number, got {other}"))),
+    }
+}
+
+/// As [`lenient_opt_u64`], narrowed to `Option<u32>`.
+fn lenient_opt_u32<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    Ok(lenient_opt_u64(d)?.map(|v| v as u32))
+}
+
+/// As [`lenient_opt_u64`], narrowed to `Option<usize>`.
+fn lenient_opt_usize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<usize>, D::Error> {
+    Ok(lenient_opt_u64(d)?.map(|v| v as usize))
+}
 
 /// One watched-directory instance = one `component.instances[]` entry.
 #[derive(Debug, Clone, Deserialize)]
@@ -48,6 +96,8 @@ pub struct InstanceCfg {
     /// Concurrency + bandwidth caps (per-instance; global caps live under `component.global`).
     pub limits: Option<LimitsCfg>,
     /// Per-instance UNS topic override (default is `component.global.topics.prefix`).
+    // P3 (control/events on the unified namespace): consumed by the topic builder, not the engine.
+    #[allow(dead_code)]
     pub topics: Option<TopicsCfg>,
 }
 
@@ -63,6 +113,7 @@ pub struct IngressCfg {
     #[serde(default)]
     pub exclude: Vec<String>,
     /// Reconciliation rescan interval (seconds); belt-and-suspenders alongside OS notifications.
+    #[serde(default, deserialize_with = "lenient_opt_u64")]
     pub rescan_secs: Option<u64>,
     #[serde(default)]
     pub readiness: ReadinessCfg,
@@ -93,7 +144,7 @@ impl Default for ReadinessCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StabilityReadiness {
-    #[serde(default = "default_quiet_secs")]
+    #[serde(default = "default_quiet_secs", deserialize_with = "lenient_u64")]
     pub quiet_secs: u64,
 }
 
@@ -118,6 +169,9 @@ pub struct GlobReadiness {
 pub enum EgressCfg {
     Local(LocalEgress),
     // Boxed: S3Egress is much larger than the other variants (clippy::large_enum_variant).
+    // P2 (S3 destination): the factory matches this variant but does not read its payload until the
+    // `dest-s3` backend lands.
+    #[allow(dead_code)]
     S3(Box<S3Egress>),
     /// Recognized future backends (DESIGN §10.2, phase P5). Their fields are ignored at P0.
     Sftp,
@@ -136,6 +190,9 @@ pub struct LocalEgress {
     pub fsync: bool,
 }
 
+// P2 (S3 destination): the whole S3 egress model is parsed at P0 but only read once the `dest-s3`
+// backend lands. Narrow, reason-tagged allow (replaces the removed module-level P0 allow).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct S3Egress {
@@ -163,12 +220,17 @@ pub struct S3Egress {
     pub multipart: MultipartCfg,
 }
 
+// P2 (S3 destination): multipart tuning, read by the S3 backend only.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MultipartCfg {
     /// Files larger than this use multipart; smaller use a single PutObject.
+    #[serde(default, deserialize_with = "lenient_opt_u64")]
     pub threshold_bytes: Option<u64>,
+    #[serde(default, deserialize_with = "lenient_opt_u64")]
     pub part_size_bytes: Option<u64>,
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
     pub max_concurrent_parts: Option<usize>,
 }
 
@@ -180,11 +242,19 @@ pub enum ScheduleCfg {
     #[default]
     Immediate,
     /// Point trigger: release all ready work at each cron fire.
+    // P4 (scheduling): the P1 engine matches only the discriminant (immediate vs not); the cron
+    // payload is read once the scheduler lands.
+    #[allow(dead_code)]
     Cron(CronSchedule),
     /// Continuous flow gated to an `open`→`close` window.
+    // P4 (scheduling): see `Cron` — payload read only once the window scheduler lands.
+    #[allow(dead_code)]
     Window(WindowSchedule),
 }
 
+// P4 (scheduling & windows): cron payload; the P1 engine treats any non-immediate schedule as
+// immediate (with a TODO), so these fields are only read once the cron scheduler lands.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CronSchedule {
@@ -193,6 +263,8 @@ pub struct CronSchedule {
     pub timezone: Option<String>,
 }
 
+// P4 (scheduling & windows): window payload; see [`CronSchedule`] — unread until the scheduler lands.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WindowSchedule {
@@ -206,6 +278,8 @@ pub struct WindowSchedule {
     pub on_window_close: WindowClose,
 }
 
+// P4 (scheduling & windows): window-close behavior, read by the window scheduler only.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum WindowClose {
@@ -274,11 +348,14 @@ pub enum Collision {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetryCfg {
+    #[serde(default, deserialize_with = "lenient_opt_u64")]
     pub base_delay_ms: Option<u64>,
+    #[serde(default, deserialize_with = "lenient_opt_u64")]
     pub max_delay_ms: Option<u64>,
     /// Time budget before giving up (e.g. `"7d"`) — governs long-outage tolerance (FR-REL-7).
     pub give_up_after: Option<String>,
     /// Optional hard attempt cap (default: none — time-governed).
+    #[serde(default, deserialize_with = "lenient_opt_u32")]
     pub max_attempts: Option<u32>,
 }
 
@@ -286,17 +363,59 @@ pub struct RetryCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LimitsCfg {
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
     pub max_concurrent_files: Option<usize>,
     /// Human byte-rate, e.g. `"20MB/s"` (parsed in P1; FR-REL-6).
     pub max_bandwidth: Option<String>,
 }
 
 /// UNS topic override (DESIGN §15).
+// P3 (control/events on the unified namespace): read by the topic builder, not the engine.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TopicsCfg {
     /// Topic prefix template (default `{ThingName}/file-replicator`).
     pub prefix: Option<String>,
+}
+
+/// Component-global config subtree (`component.global`, DESIGN §7.2): aggregate concurrency +
+/// bandwidth caps and cross-instance defaults. Every field is optional; an absent `component.global`
+/// yields all-defaults.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalCfg {
+    /// Aggregate caps across all instances (`maxConcurrentFiles` = global slot semaphore size;
+    /// `maxBandwidth` = the global token bucket every transfer also passes).
+    pub limits: Option<LimitsCfg>,
+    /// Cross-instance defaults (currently the fallback retry policy).
+    pub defaults: Option<GlobalDefaults>,
+    /// Global UNS topic prefix. P3 (control/events): consumed by the topic builder, not the engine.
+    #[allow(dead_code)]
+    pub topics: Option<TopicsCfg>,
+}
+
+/// `component.global.defaults` — values an instance inherits when it does not set its own.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalDefaults {
+    /// Fallback retry policy (an instance's own `retry` wins field-by-field).
+    pub retry: Option<RetryCfg>,
+    /// Default schedule timezone. P4 (scheduling): read by the cron/window scheduler only.
+    #[allow(dead_code)]
+    pub timezone: Option<String>,
+}
+
+/// Parse the `component.global` subtree, tolerating a malformed/absent block by falling back to
+/// all-defaults (a bad global section must not stop the component from starting; FR-CFG-4).
+pub fn load_global(config: &Config) -> GlobalCfg {
+    match serde_json::from_value::<GlobalCfg>(config.global().clone()) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(error = %e, "malformed component.global; using defaults");
+            GlobalCfg::default()
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -310,7 +429,8 @@ fn default_marker_suffix() -> String {
 }
 
 /// Parse every `component.instances[]` entry into an [`InstanceCfg`], logging and skipping any
-/// malformed instance (FR-CFG-4). Returns the successfully-parsed instances (possibly empty at P0).
+/// malformed instance (FR-CFG-4). Returns the successfully-parsed instances; the caller
+/// ([`App::run`](crate::app::App::run)) fails fast if that set is empty (the fail-only-if-zero rule).
 pub fn load_instances(config: &Config) -> Vec<InstanceCfg> {
     let mut out = Vec::new();
     for id in config.instance_ids() {
@@ -399,11 +519,131 @@ mod tests {
     }
 
     #[test]
+    fn global_parses_limits_and_defaults() {
+        let cfg = Config::from_value(
+            "com.test",
+            "thing",
+            serde_json::json!({
+                "component": {
+                    "global": {
+                        "limits": { "maxConcurrentFiles": 8, "maxBandwidth": "50MB/s" },
+                        "defaults": { "retry": { "baseDelayMs": 1000, "giveUpAfter": "7d" } }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let g = load_global(&cfg);
+        let limits = g.limits.expect("limits present");
+        assert_eq!(limits.max_concurrent_files, Some(8));
+        assert_eq!(limits.max_bandwidth.as_deref(), Some("50MB/s"));
+        let retry = g.defaults.and_then(|d| d.retry).expect("retry default present");
+        assert_eq!(retry.base_delay_ms, Some(1000));
+        assert_eq!(retry.give_up_after.as_deref(), Some("7d"));
+    }
+
+    #[test]
+    fn global_absent_is_all_defaults() {
+        let cfg = Config::from_value("com.test", "thing", serde_json::json!({ "component": {} }))
+            .unwrap();
+        let g = load_global(&cfg);
+        assert!(g.limits.is_none());
+        assert!(g.defaults.is_none());
+    }
+
+    #[test]
     fn malformed_instance_is_none() {
         // Missing required `ingress` → deserialization fails (caught + skipped by load_instances).
         let bad: Result<InstanceCfg, _> =
             serde_json::from_value(serde_json::json!({ "id": "bad" }));
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn lenient_numbers_accept_greengrass_doubles() {
+        // FR-CFG-3: Greengrass delivers config numbers as doubles. Every numeric field must accept an
+        // integer-valued float, or a whole instance would fail to parse and be silently skipped.
+        let inst = parse(serde_json::json!({
+            "id": "gg",
+            "ingress": {
+                "path": "/in",
+                "rescanSecs": 30.0,
+                "readiness": { "strategy": "stability", "quietSecs": 5.0 }
+            },
+            "egress": [ { "type": "local", "path": "/out" } ],
+            "retry": { "baseDelayMs": 1000.0, "maxDelayMs": 900000.0, "maxAttempts": 5.0 },
+            "limits": { "maxConcurrentFiles": 8.0, "maxBandwidth": "20MB/s" }
+        }));
+        assert_eq!(inst.ingress.rescan_secs, Some(30));
+        assert!(matches!(inst.ingress.readiness, ReadinessCfg::Stability(s) if s.quiet_secs == 5));
+        let retry = inst.retry.expect("retry present");
+        assert_eq!(retry.base_delay_ms, Some(1000));
+        assert_eq!(retry.max_delay_ms, Some(900000));
+        assert_eq!(retry.max_attempts, Some(5));
+        let limits = inst.limits.expect("limits present");
+        assert_eq!(limits.max_concurrent_files, Some(8));
+    }
+
+    #[test]
+    fn lenient_numbers_still_accept_plain_integers() {
+        // The lenient path must not regress the ordinary integer form.
+        let inst = parse(serde_json::json!({
+            "id": "int",
+            "ingress": { "path": "/in", "rescanSecs": 15 },
+            "egress": [ { "type": "local", "path": "/out" } ],
+            "limits": { "maxConcurrentFiles": 4 }
+        }));
+        assert_eq!(inst.ingress.rescan_secs, Some(15));
+        assert_eq!(inst.limits.unwrap().max_concurrent_files, Some(4));
+    }
+
+    #[test]
+    fn load_instances_skips_only_the_malformed_ones() {
+        // FR-CFG-4: a malformed instance is skipped; the valid siblings survive (not all-or-nothing).
+        let cfg = Config::from_value(
+            "com.test",
+            "thing",
+            serde_json::json!({
+                "component": {
+                    "instances": [
+                        { "id": "good1", "ingress": { "path": "/a" },
+                          "egress": [ { "type": "local", "path": "/o1" } ] },
+                        { "id": "bad", "egress": [ { "type": "local", "path": "/o" } ] }, // no ingress
+                        { "id": "good2", "ingress": { "path": "/b" },
+                          "egress": [ { "type": "local", "path": "/o2" } ] }
+                    ]
+                }
+            }),
+        )
+        .unwrap();
+        let mut ids: Vec<String> = load_instances(&cfg).into_iter().map(|i| i.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["good1".to_string(), "good2".to_string()], "bad skipped, good kept");
+    }
+
+    #[test]
+    fn load_instances_survives_a_float_numeric_from_greengrass() {
+        // A float-valued numeric (GG double) must NOT cause the instance to be skipped.
+        let cfg = Config::from_value(
+            "com.test",
+            "thing",
+            serde_json::json!({
+                "component": {
+                    "instances": [
+                        {
+                            "id": "gg",
+                            "ingress": { "path": "/a", "rescanSecs": 30.0 },
+                            "egress": [ { "type": "local", "path": "/o" } ],
+                            "limits": { "maxConcurrentFiles": 8.0 }
+                        }
+                    ]
+                }
+            }),
+        )
+        .unwrap();
+        let insts = load_instances(&cfg);
+        assert_eq!(insts.len(), 1, "float numerics must not get the instance skipped");
+        assert_eq!(insts[0].ingress.rescan_secs, Some(30));
     }
 
     // Helper so the default-readiness assertion reads cleanly in the test above.

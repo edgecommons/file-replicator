@@ -2,10 +2,12 @@
 //!
 //! An EdgeCommons **sink** component (AWS IoT Greengrass v2 / HOST / Kubernetes) built on the
 //! `ggcommons` Rust library. It watches local directories and replicates files to configured
-//! destinations. This is the P0 scaffold: it initializes the runtime from the standard CLI contract
+//! destinations. It initializes the runtime from the standard CLI contract
 //! (`-c`/`--platform`/`--transport`/`-t`), loads + parses the instance configuration, then hands
-//! control to [`app::App`], which currently runs an empty engine until shutdown. The replication
-//! engine lands in P1+ (see `DESIGN.md` §21).
+//! control to [`app::App`], which builds one replication [`instance::Instance`] per
+//! `component.instances[]` and runs the P1 engine (watch → durable queue → deliver → verify →
+//! complete, local destination, immediate mode) until shutdown. S3 egress, control/events, and
+//! cron/window scheduling land in later phases (see `DESIGN.md` §21).
 //!
 //! ## Running locally (HOST platform, MQTT transport, against a local MQTT broker)
 //! ```bash
@@ -15,9 +17,7 @@
 //!   -t my-thing
 //! ```
 
-mod app;
-mod config;
-
+use file_replicator::app;
 use ggcommons::prelude::*;
 
 /// The component's full name (matches `recipe.yaml` / `gdk-config.json`).

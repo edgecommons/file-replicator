@@ -32,9 +32,36 @@ cloudwatch = ["ggcommons/cloudwatch"]
 # For local development against the sibling checkout, the gitignored .cargo/config.toml `paths` override
 # points cargo at ../ggcommons/libs/rust (Windows + WSL) — no Cargo.toml edit needed.
 ggcommons = { git = "https://github.com/edgecommons/ggcommons.git", rev = "cc037a92c1780c3d88cc98885cfdefec0403a898", default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 anyhow = "1"
 async-trait = "0.1"
+
+# --- P1 core deps (non-optional; DESIGN §13/§14 + blueprint) -----------------------------------
+# Durable state: SQLite in WAL mode, statically bundled (the Windows/Linux C toolchain is present).
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Live filesystem watch (engine); the deterministic scan()/readiness path uses globset directly.
+notify = "6"
+# Glob include/exclude + readiness matching.
+globset = "0.4"
+# Streaming integrity checksums (CRC32C default, SHA-256 optional).
+crc32c = "0.6"
+sha2 = "0.10"
+# Component-internal typed errors with transient/permanent classification.
+thiserror = "1"
+# Full-jitter backoff (retry) with an injectable RNG.
+rand = "0.8"
+# CancellationToken for cooperative task shutdown.
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+tempfile = "3"
+# `test-util` enables paused-time tests (deterministic bandwidth-throttle assertions, no real sleeps).
+tokio = { version = "1", features = ["test-util", "macros", "rt"] }
+# Integration tests (`tests/`) implement a fake/failing `Destination` (async-trait), read the
+# quarantine `.error.json` sidecar (serde_json), and drive `Instance::run` (CancellationToken).
+async-trait = "0.1"
+serde_json = "1"
+tokio-util = { version = "0.7", features = ["rt"] }
