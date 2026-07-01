@@ -29,7 +29,7 @@ use rand::{Rng, SeedableRng};
 
 use crate::config::{Collision, CompletionCfg, OnExhausted, OnSuccess, RetryCfg, Verify};
 use crate::dest::SharedDestination;
-use crate::domain::{Checksum, Delivered, ItemState, ProgressSink, WorkItem};
+use crate::domain::{Checksum, Delivered, ItemState, ProgressSink, ResumeState, WorkItem};
 use crate::error::{ReplError, Result};
 use crate::ratelimit::Bandwidth;
 use crate::state::{StatsDelta, StateStore};
@@ -268,22 +268,74 @@ impl Worker {
             self.dest
                 .verify(item, &delivered, self.completion.verify)
                 .await?;
-            Ok::<u64, ReplError>(delivered.bytes)
+            Ok::<Delivered, ReplError>(delivered)
         }
         .await;
 
         match outcome {
-            Ok(bytes) => {
-                // Write-ahead: persist Verified BEFORE touching the source (crash-safe).
+            Ok(delivered) => {
+                // Write-ahead the FULL expected result at the Verified point (DESIGN §13.2): persist
+                // the delivered checksum + handle as the resume checkpoint BEFORE marking Verified and
+                // BEFORE the source side effect, so crash recovery re-verifies the destination by
+                // re-hash (not just size) before deleting/archiving the source. This overwrites any
+                // mid-transfer resume token (e.g. an S3 uploadId) — the transfer is complete.
+                self.save_verified_checkpoint(item, &delivered);
                 self.store
                     .set_state(&self.instance, &item.relpath, ItemState::Verified, now)?;
-                let _ = self
-                    .store
-                    .clear_resume(&self.instance, &item.relpath, self.dest.kind());
-                self.complete_verified(item, bytes, now).await
+                self.complete_verified(item, delivered.bytes, now).await
             }
             Err(e) => self.handle_failure(item, e, now).await,
         }
+    }
+
+    /// Persist the delivered result as the `Verified` write-ahead checkpoint (DESIGN §13.2). The
+    /// whole [`Delivered`] rides in [`ResumeState::token`] under `"verified"`, reusing the resume row
+    /// (single blob per `(instance, relpath, dest)`) across lifecycle phases — no schema change.
+    /// Best-effort: a store fault here only costs recovery its checksum-precision (it falls back to a
+    /// size check), so it must not fail the transfer that already succeeded.
+    fn save_verified_checkpoint(&self, item: &WorkItem, delivered: &Delivered) {
+        let token = match serde_json::to_value(delivered) {
+            Ok(v) => serde_json::json!({ "verified": v }),
+            Err(e) => {
+                tracing::warn!(relpath = %item.relpath, error = %e, "serialize verified checkpoint failed");
+                return;
+            }
+        };
+        let checkpoint = ResumeState {
+            bytes_committed: delivered.bytes,
+            token,
+        };
+        if let Err(e) =
+            self.store
+                .save_resume(&self.instance, &item.relpath, self.dest.kind(), &checkpoint)
+        {
+            tracing::warn!(relpath = %item.relpath, error = %e, "persist verified checkpoint failed");
+        }
+    }
+
+    /// On give-up (terminal), abort any in-flight partial transfer (S3 → `AbortMultipartUpload`;
+    /// local → temp cleanup) so no orphaned upload lingers, then drop the resume checkpoint. The
+    /// resume is deliberately **kept** on the retry path (so the next attempt resumes) and cleared
+    /// only here at terminal give-up (DESIGN §11.3/§13.4). Idempotent + best-effort.
+    async fn abort_and_clear_resume(&self, item: &WorkItem) {
+        match self
+            .store
+            .load_resume(&self.instance, &item.relpath, self.dest.kind())
+        {
+            Ok(Some(resume)) => {
+                if let Err(e) = self.dest.abort(item, &resume).await {
+                    tracing::warn!(
+                        relpath = %item.relpath, error = %e,
+                        "aborting partial transfer on give-up failed"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(relpath = %item.relpath, error = %e, "load resume for give-up abort failed"),
+        }
+        let _ = self
+            .store
+            .clear_resume(&self.instance, &item.relpath, self.dest.kind());
     }
 
     /// Run the success completion action (`delete` | `archive`) on the source, then persist
@@ -312,6 +364,11 @@ impl Worker {
         }
         self.store
             .set_state(&self.instance, &item.relpath, ItemState::Completed, now)?;
+        // Clear the resume checkpoint only AFTER Completed is durable, so the expected-checksum
+        // checkpoint survives a crash in the Verified→Completed gap and recovery can still re-verify.
+        let _ = self
+            .store
+            .clear_resume(&self.instance, &item.relpath, self.dest.kind());
         self.store.bump_stats(
             &self.instance,
             StatsDelta {
@@ -367,6 +424,8 @@ impl Worker {
                         bytes: 0,
                     },
                 )?;
+                // Terminal give-up: release any in-flight partial upload + drop its resume checkpoint.
+                self.abort_and_clear_resume(item).await;
                 let attempts = item.attempts.saturating_add(1);
                 tracing::error!(
                     instance = %self.instance, relpath = %item.relpath, attempts, error = %err_str,
@@ -450,21 +509,42 @@ impl Worker {
     /// Recover one `Verified` item (DESIGN §13.2). The write-ahead `Verified` marker was persisted
     /// *before* the source delete/archive, so on restart the object should already be live at its
     /// stable key — but the destination could have been lost/corrupted during the downtime (a wiped
-    /// NAS mount, a bucket-lifecycle deletion). Completing (deleting/archiving the source) without
-    /// checking would destroy the only copy. So **re-verify the destination first**: a size check
-    /// against the persisted expected size (the original streaming checksum is no longer held). If it
-    /// still matches, complete; if it is missing/truncated, requeue to `Ready` for idempotent
-    /// re-delivery rather than risk data loss (FR-CMP-3).
+    /// NAS mount, a bucket-lifecycle deletion, a truncated/tampered object). Completing (deleting/
+    /// archiving the source) without checking would destroy the only copy. So **re-verify the
+    /// destination first**, using the persisted expected result:
+    ///
+    /// - if the `Verified` checkpoint holds the full [`Delivered`] (this build), re-verify by
+    ///   **checksum** (local re-hashes the object; S3 compares the stored object checksum) — this
+    ///   catches silent corruption a size check would miss;
+    /// - for a legacy row written before the checkpoint refinement, fall back to a **size** check.
+    ///
+    /// On success, complete (delete/archive the source); on failure, requeue to `Ready` for
+    /// idempotent re-delivery and clear the stale checkpoint — never delete the only copy (FR-CMP-3).
     async fn recover_verified(&self, it: &WorkItem, now: i64) -> Result<()> {
-        let expected = Delivered {
-            bytes: it.size,
-            checksum: Checksum::None,
-            handle: serde_json::Value::Null,
+        let resume = self
+            .store
+            .load_resume(&self.instance, &it.relpath, self.dest.kind())?;
+        let persisted: Option<Delivered> = resume
+            .as_ref()
+            .and_then(|r| r.token.get("verified").cloned())
+            .and_then(|v| serde_json::from_value(v).ok());
+
+        let (expected, policy) = match persisted {
+            Some(d) => (d, Verify::Checksum),
+            None => (
+                Delivered {
+                    bytes: it.size,
+                    checksum: Checksum::None,
+                    handle: serde_json::Value::Null,
+                },
+                Verify::Size,
+            ),
         };
-        match self.dest.verify(it, &expected, Verify::Size).await {
+
+        match self.dest.verify(it, &expected, policy).await {
             Ok(()) => {
                 tracing::info!(instance = %self.instance, relpath = %it.relpath, "recovering Verified → re-verified, completing");
-                let _ = self.complete_verified(it, it.size, now).await?;
+                let _ = self.complete_verified(it, expected.bytes, now).await?;
             }
             Err(e) => {
                 tracing::warn!(
@@ -473,6 +553,9 @@ impl Worker {
                 );
                 self.store
                     .set_state(&self.instance, &it.relpath, ItemState::Ready, now)?;
+                let _ = self
+                    .store
+                    .clear_resume(&self.instance, &it.relpath, self.dest.kind());
             }
         }
         Ok(())
@@ -733,7 +816,7 @@ fn suffixed(path: &Path, n: u32) -> PathBuf {
 mod tests {
     use super::*;
     use crate::config::{LocalEgress, Verify};
-    use crate::dest::LocalDest;
+    use crate::dest::{Destination, LocalDest};
     use crate::domain::ItemState;
     use crate::error::Result as ReplResult;
     use crate::integrity::Algorithm;
@@ -1202,6 +1285,255 @@ mod tests {
         );
         assert!(src.path().join("v.txt").exists(), "source preserved — no data loss");
         assert_eq!(store.stats(INST).unwrap().replicated, 0, "not counted as replicated");
+    }
+
+    #[tokio::test]
+    async fn recover_verified_with_checkpoint_completes_via_checksum() {
+        // §13.2 refinement: a Verified item with the full Delivered checkpoint persisted re-verifies
+        // by CHECKSUM (not just size) and, on a match, completes.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store = store();
+        std::fs::write(src.path().join("v.bin"), b"checkpoint payload").unwrap();
+
+        // Deliver once via a local dest to capture the real Delivered (checksum + handle).
+        let dest = LocalDest::new(
+            &LocalEgress {
+                path: dst.path().to_path_buf(),
+                fsync: false,
+            },
+            Algorithm::Crc32c,
+        );
+        let mut item = WorkItem {
+            instance: INST.into(),
+            relpath: "v.bin".into(),
+            abs_source: src.path().join("v.bin"),
+            state: ItemState::InProgress,
+            size: 18,
+            discovered_at: 0,
+            attempts: 0,
+            next_attempt_at: 0,
+            last_error: None,
+            bytes_done: 0,
+            updated_at: 0,
+        };
+        let delivered = dest
+            .deliver(&item, None, &ProgressSink::noop(), &Bandwidth::unlimited())
+            .await
+            .unwrap();
+        item.abs_source = src.path().join("v.bin"); // (unchanged; kept explicit)
+
+        // Seed the store as a crashed-at-Verified item WITH the checkpoint (dest key = "local").
+        store.upsert_ready(INST, "v.bin", 18, 0, 1).unwrap();
+        store.set_state(INST, "v.bin", ItemState::Verified, 2).unwrap();
+        store
+            .save_resume(
+                INST,
+                "v.bin",
+                "local",
+                &crate::domain::ResumeState {
+                    bytes_committed: delivered.bytes,
+                    token: serde_json::json!({ "verified": serde_json::to_value(&delivered).unwrap() }),
+                },
+            )
+            .unwrap();
+
+        let worker = local_worker(store.clone(), src.path(), dst.path(), completion(OnSuccess::Delete), RetryPolicy::default());
+        worker.recover(100).await.unwrap();
+
+        assert_eq!(store.get(INST, "v.bin").unwrap().unwrap().state, ItemState::Completed);
+        assert!(!src.path().join("v.bin").exists(), "checksum-verified recovery deletes the source");
+        // Resume checkpoint cleared after Completed.
+        assert!(store.load_resume(INST, "v.bin", "local").unwrap().is_none());
+        assert_eq!(store.stats(INST).unwrap().replicated, 1);
+    }
+
+    #[tokio::test]
+    async fn recover_verified_requeues_on_corruption_checksum_catches_it() {
+        // The whole point of persisting the checksum: a destination object that was CORRUPTED (not
+        // just deleted) during downtime — same size, different bytes — must be caught by the re-hash
+        // and requeued, where the old size-only check would have silently completed + deleted the src.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store = store();
+        std::fs::write(src.path().join("c.bin"), b"the true bytes!!").unwrap();
+
+        let dest = LocalDest::new(
+            &LocalEgress {
+                path: dst.path().to_path_buf(),
+                fsync: false,
+            },
+            Algorithm::Crc32c,
+        );
+        let item = WorkItem {
+            instance: INST.into(),
+            relpath: "c.bin".into(),
+            abs_source: src.path().join("c.bin"),
+            state: ItemState::InProgress,
+            size: 16,
+            discovered_at: 0,
+            attempts: 0,
+            next_attempt_at: 0,
+            last_error: None,
+            bytes_done: 0,
+            updated_at: 0,
+        };
+        let delivered = dest
+            .deliver(&item, None, &ProgressSink::noop(), &Bandwidth::unlimited())
+            .await
+            .unwrap();
+
+        // Corrupt the delivered object in place: SAME length, different content (a size check passes).
+        std::fs::write(dst.path().join("c.bin"), b"CORRUPTED bytes!").unwrap();
+        assert_eq!(std::fs::metadata(dst.path().join("c.bin")).unwrap().len(), 16);
+
+        store.upsert_ready(INST, "c.bin", 16, 0, 1).unwrap();
+        store.set_state(INST, "c.bin", ItemState::Verified, 2).unwrap();
+        store
+            .save_resume(
+                INST,
+                "c.bin",
+                "local",
+                &crate::domain::ResumeState {
+                    bytes_committed: delivered.bytes,
+                    token: serde_json::json!({ "verified": serde_json::to_value(&delivered).unwrap() }),
+                },
+            )
+            .unwrap();
+
+        let worker = local_worker(store.clone(), src.path(), dst.path(), completion(OnSuccess::Delete), RetryPolicy::default());
+        worker.recover(100).await.unwrap();
+
+        assert_eq!(
+            store.get(INST, "c.bin").unwrap().unwrap().state,
+            ItemState::Ready,
+            "corruption caught by checksum → requeue"
+        );
+        assert!(src.path().join("c.bin").exists(), "source preserved — no data loss");
+        assert!(store.load_resume(INST, "c.bin", "local").unwrap().is_none(), "stale checkpoint cleared");
+        assert_eq!(store.stats(INST).unwrap().replicated, 0);
+    }
+
+    #[tokio::test]
+    async fn give_up_aborts_partial_transfer_and_clears_resume() {
+        // A resumable destination that fails delivery permanently and records abort() calls. On
+        // give-up the worker must abort the in-flight partial (the S3 MPU lifecycle) and clear resume.
+        struct RecordingDest {
+            aborts: Arc<AtomicU32>,
+        }
+        #[async_trait]
+        impl crate::dest::Destination for RecordingDest {
+            fn kind(&self) -> &'static str {
+                "recording"
+            }
+            fn supports_resume(&self) -> bool {
+                true
+            }
+            async fn deliver(
+                &self,
+                _i: &WorkItem,
+                _r: Option<crate::domain::ResumeState>,
+                _p: &ProgressSink,
+                _b: &Bandwidth,
+            ) -> ReplResult<crate::domain::Delivered> {
+                Err(ReplError::Permanent("nope".into()))
+            }
+            async fn verify(
+                &self,
+                _i: &WorkItem,
+                _d: &crate::domain::Delivered,
+                _p: Verify,
+            ) -> ReplResult<()> {
+                Ok(())
+            }
+            async fn abort(
+                &self,
+                _i: &WorkItem,
+                _r: &crate::domain::ResumeState,
+            ) -> ReplResult<()> {
+                self.aborts.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let src = tempfile::tempdir().unwrap();
+        let store = store();
+        std::fs::write(src.path().join("m.bin"), b"partial").unwrap();
+        store.upsert_ready(INST, "m.bin", 7, 0, 1).unwrap();
+        // Seed a mid-transfer resume checkpoint under the dest's key.
+        store
+            .save_resume(
+                INST,
+                "m.bin",
+                "recording",
+                &crate::domain::ResumeState {
+                    bytes_committed: 3,
+                    token: serde_json::json!({ "s3": { "uploadId": "UP", "key": "m.bin", "partSize": 5242880, "completed": [] } }),
+                },
+            )
+            .unwrap();
+
+        let aborts = Arc::new(AtomicU32::new(0));
+        let dest: SharedDestination = Arc::new(RecordingDest {
+            aborts: aborts.clone(),
+        });
+        let worker = Worker::new(
+            INST.into(),
+            store.clone(),
+            dest,
+            completion(OnSuccess::Delete), // retainInPlace on_exhausted
+            src.path().to_path_buf(),
+            Bandwidth::unlimited(),
+            RetryPolicy::default(),
+            None,
+        );
+        let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
+        assert_eq!(worker.process_item(&item, 100).await, ItemState::Retained);
+        assert_eq!(aborts.load(AtomicOrdering::SeqCst), 1, "give-up aborts the partial upload once");
+        assert!(
+            store.load_resume(INST, "m.bin", "recording").unwrap().is_none(),
+            "resume checkpoint cleared on give-up"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_retry_keeps_resume_for_next_attempt() {
+        // On the RETRY path (not give-up) the resume checkpoint must be PRESERVED so the next attempt
+        // resumes rather than restarting.
+        let src = tempfile::tempdir().unwrap();
+        let store = store();
+        std::fs::write(src.path().join("r.bin"), b"data").unwrap();
+        store.upsert_ready(INST, "r.bin", 4, 0, 1).unwrap();
+        store
+            .save_resume(
+                INST,
+                "r.bin",
+                "failing",
+                &crate::domain::ResumeState {
+                    bytes_committed: 2,
+                    token: serde_json::json!({ "s3": { "uploadId": "UP2", "key": "r.bin", "partSize": 5242880, "completed": [] } }),
+                },
+            )
+            .unwrap();
+        let dest: SharedDestination = Arc::new(FailingDest {
+            err: || ReplError::Transient("flaky".into()),
+        });
+        let worker = Worker::new(
+            INST.into(),
+            store.clone(),
+            dest,
+            completion(OnSuccess::Delete),
+            src.path().to_path_buf(),
+            Bandwidth::unlimited(),
+            RetryPolicy::default(),
+            None,
+        );
+        let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
+        assert_eq!(worker.process_item(&item, 100).await, ItemState::Failed);
+        assert!(
+            store.load_resume(INST, "r.bin", "failing").unwrap().is_some(),
+            "retry preserves the resume checkpoint"
+        );
     }
 
     #[tokio::test]

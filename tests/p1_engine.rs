@@ -29,7 +29,7 @@ use file_replicator::config::{
     CompletionCfg, EgressCfg, GlobReadiness, GlobalCfg, IngressCfg, InstanceCfg, LimitsCfg,
     LocalEgress, OnExhausted, OnSuccess, ReadinessCfg, RetryCfg, ScheduleCfg, Verify,
 };
-use file_replicator::dest::{Destination, SharedDestination};
+use file_replicator::dest::{DestDeps, Destination, SharedDestination};
 use file_replicator::domain::{Delivered, ItemState, ProgressSink, ResumeState, WorkItem};
 use file_replicator::error::{ReplError, Result as ReplResult};
 use file_replicator::instance::Instance;
@@ -83,6 +83,7 @@ fn build(cfg: InstanceCfg, store: Arc<dyn StateStore>) -> Instance {
         Arc::new(Semaphore::new(16)),
         Arc::new(TokenBucket::unlimited()),
         None,
+        &DestDeps::default(),
     )
     .expect("instance builds")
 }
@@ -615,6 +616,7 @@ async fn global_bandwidth_cap_is_shared_across_instances() {
             global_sem.clone(),
             global_bw.clone(),
             None,
+            &DestDeps::default(),
         )
         .expect("instance builds with shared global bucket");
         (inst, src, dst)

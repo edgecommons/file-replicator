@@ -17,6 +17,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{self, InstanceCfg};
+use crate::dest::DestDeps;
 use crate::instance::Instance;
 use crate::ratelimit::{parse_byte_rate, SystemClock, TokenBucket};
 use crate::state::{SqliteStore, StateStore};
@@ -126,6 +127,13 @@ impl App {
             tracing::error!(instance = %id, "duplicate instance id; skipping (ids must be unique)");
         }
 
+        // Cross-cutting backend deps (DESIGN §11.5): the credential service (for a `{"$secret":"…"}`
+        // egress) rides in here; each instance threads its own store in `Instance::build`. Building it
+        // once and cloning per instance keeps a single shared credential handle.
+        let deps = DestDeps::default();
+        #[cfg(feature = "dest-s3")]
+        let deps = deps.with_credentials(gg.credentials());
+
         // Build + spawn each instance under a shared cancellation token.
         let cancel = CancellationToken::new();
         let mut handles = Vec::new();
@@ -138,6 +146,7 @@ impl App {
                 global_sem.clone(),
                 global_bw.clone(),
                 Some(self.metrics.clone()),
+                &deps,
             ) {
                 Ok(inst) => {
                     tracing::info!(instance = %id, active = inst.is_active(), "instance started");

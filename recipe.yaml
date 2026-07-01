@@ -4,11 +4,14 @@ ComponentName: "com.mbreissi.greengrass.FileReplicator"
 ComponentVersion: "1.0.0"
 ComponentDescription: "EdgeCommons file-replicator: watches directories and replicates files to local/S3 destinations on arrival or on cron schedules/windows."
 ComponentPublisher: "EdgeCommons"
-# S3 device-role credentials (ambient, DESIGN §11.5) land with the S3 destination in P2 — add then:
-#   ComponentDependencies:
-#     aws.greengrass.TokenExchangeService:
-#       VersionRequirement: ">=2.0.0 <3.0.0"
-#       DependencyType: HARD
+# S3 device-role credentials are ambient by default (DESIGN §11.5): the TokenExchangeService supplies
+# the Greengrass device role to the aws-config default provider chain, so an `s3` egress needs no
+# `credentials` block on-device. The device role must carry the least-privilege S3 permissions
+# (PutObject + multipart actions scoped to bucket/prefix/*, and KMS if SSE-KMS).
+ComponentDependencies:
+  aws.greengrass.TokenExchangeService:
+    VersionRequirement: ">=2.0.0 <3.0.0"
+    DependencyType: HARD
 ComponentConfiguration:
   DefaultConfiguration:
     ComponentConfig:

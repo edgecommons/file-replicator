@@ -111,8 +111,12 @@ pub struct ResumeState {
 
 /// Result of a successful [`Destination::deliver`](crate::dest::Destination::deliver): the byte
 /// count, the single-pass [`Checksum`], and a backend finalize handle (local: the final path;
-/// S3: ETag / parts) carried opaquely for `verify` + completion accounting.
-#[derive(Debug, Clone)]
+/// S3: object key + object-level checksum) carried opaquely for `verify` + completion accounting.
+///
+/// `Serialize`/`Deserialize` let the worker persist the whole `Delivered` as the `Verified`
+/// write-ahead checkpoint (DESIGN §13.2), so crash recovery re-verifies against the exact expected
+/// result (full checksum re-hash, not just size) before touching the source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Delivered {
     pub bytes: u64,
     pub checksum: Checksum,
@@ -120,7 +124,7 @@ pub struct Delivered {
 }
 
 /// A content checksum computed in the single streaming pass (DESIGN §13.1).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Checksum {
     Crc32c(u32),
     Sha256([u8; 32]),

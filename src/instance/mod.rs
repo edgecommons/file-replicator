@@ -33,7 +33,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{EgressCfg, GlobalCfg, InstanceCfg, ScheduleCfg};
-use crate::dest::{build_destination, SharedDestination};
+use crate::dest::{build_destination, DestDeps, SharedDestination};
 use crate::error::Result;
 use crate::ratelimit::{parse_byte_rate, Bandwidth, Clock, SystemClock, TokenBucket};
 use crate::readiness::RealProbe;
@@ -80,6 +80,7 @@ pub struct Instance {
 impl Instance {
     /// Assemble an instance from its config plus the process-wide shared governors (the global
     /// concurrency semaphore and the global bandwidth bucket) and the shared durable store.
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         cfg: InstanceCfg,
         global: &GlobalCfg,
@@ -87,13 +88,17 @@ impl Instance {
         global_sem: Arc<Semaphore>,
         global_bw: Arc<TokenBucket>,
         metrics: Option<Arc<dyn MetricService>>,
+        deps: &DestDeps,
     ) -> anyhow::Result<Instance> {
         anyhow::ensure!(
             cfg.egress.len() == 1,
             "instance '{}': exactly one egress destination is required (v1)",
             cfg.id
         );
-        let dest = build_destination(&cfg.egress[0])
+        // The backend may need the shared store (S3 resume checkpoints); always thread THIS instance's
+        // store in (the credential handle rides in from `App::run`).
+        let deps = deps.clone().with_store(store.clone());
+        let dest = build_destination(&cfg.egress[0], &deps)
             .map_err(|e| anyhow::anyhow!("instance '{}': {e}", cfg.id))?;
         Self::build_with_dest(cfg, global, store, global_sem, global_bw, metrics, dest)
     }
@@ -416,6 +421,7 @@ mod tests {
             Arc::new(Semaphore::new(8)),
             Arc::new(TokenBucket::unlimited()),
             None,
+            &DestDeps::default(),
         )
         .expect("instance builds")
     }
@@ -579,7 +585,8 @@ mod tests {
             store,
             Arc::new(Semaphore::new(8)),
             Arc::new(TokenBucket::unlimited()),
-            None
+            None,
+            &DestDeps::default(),
         )
         .is_err());
     }

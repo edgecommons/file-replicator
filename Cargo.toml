@@ -20,10 +20,15 @@ path = "src/main.rs"
 #   and `state-redb` (pure-Rust durable-state fallback to the default bundled SQLite). They are added to
 #   this block as each phase lands, so the P0 build stays light and toolchain-free.
 [features]
-default = ["standalone"]
+default = ["standalone", "dest-s3"]
 standalone = ["ggcommons/standalone"]
 greengrass = ["ggcommons/greengrass"]
 cloudwatch = ["ggcommons/cloudwatch"]
+# P2 — S3 destination (DESIGN §11, §22.2). Pulls the pure-Rust (rustls) AWS SDK + the ggcommons
+# credentials subsystem (base `credentials` feature — pure local vault; NOT `credentials-aws`) so an
+# egress `{"$secret":"..."}` resolves through `gg.credentials()` → `get_aws_credentials`. Joins the
+# default feature set per DESIGN §22.2 (batteries-included; immature backends stay off).
+dest-s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:base64", "ggcommons/credentials"]
 
 [dependencies]
 # ggcommons Rust library, pinned to a commit on edgecommons/ggcommons (private). Building standalone needs
@@ -55,6 +60,13 @@ thiserror = "1"
 rand = "0.8"
 # CancellationToken for cooperative task shutdown.
 tokio-util = { version = "0.7", features = ["rt"] }
+
+# --- P2 S3 destination deps (optional; gated by `dest-s3`, DESIGN §22.2) ------------------------
+# Same 1.x line ggcommons uses for kinesis/cloudwatch; pure-Rust (rustls) — no extra toolchain.
+aws-config = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", optional = true }
+# S3 flexible-checksum header codec (4-byte-BE CRC32C / 32-byte SHA-256 → base64).
+base64 = { version = "0.22", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

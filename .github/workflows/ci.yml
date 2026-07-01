@@ -17,8 +17,38 @@ jobs:
     uses: edgecommons/.github/.github/workflows/component-ci.yml@main
     with:
       language: RUST
-      # Compile + test the shippable destination backends as they land (P2+: dest-s3, dest-sftp,
-      # dest-http). Empty at P0 (default features only). The 90% coverage gate (cargo llvm-cov
-      # --fail-under-lines 90) is enforced in-repo; the reusable workflow runs build+test+clippy.
-      rust-features: ""
+      # Compile + test the shippable destination backends as they land. `dest-s3` (P2) is also in the
+      # crate default set, but naming it here keeps CI explicit as `dest-sftp`/`dest-http` (P5) are
+      # added.
+      rust-features: "dest-s3"
     secrets: inherit
+
+  coverage:
+    # The 90% line-coverage gate (NFR-2 / DESIGN §18 / CLAUDE.md), actually RUN here (the reusable
+    # component-ci only does build/test/clippy). `dest/s3/client.rs` is the live-infra S3 SDK-call seam
+    # — excluded like ggcommons excludes `testutil.rs` — so the floci S3 integration tests (which
+    # self-skip when floci is down, keeping CI green) never contribute to the gate; the unit tests must
+    # meet the floor on their own.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Authenticate to the private ggcommons git dependency
+        env:
+          # Same org read token the reusable workflow uses (secrets: inherit); the repo must be on that
+          # secret's allow-list. Rewrites the https git URL so cargo can fetch the private dep.
+          EDGECOMMONS_READ_TOKEN: ${{ secrets.EDGECOMMONS_READ_TOKEN }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
+      - name: Coverage gate (90% lines; S3 SDK-call seam excluded)
+        run: >
+          cargo llvm-cov --features dest-s3
+          --ignore-filename-regex '(testutil|dest.s3.client)\.rs'
+          --fail-under-lines 90

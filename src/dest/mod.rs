@@ -20,10 +20,48 @@ use crate::domain::{Delivered, ProgressSink, ResumeState, WorkItem};
 use crate::error::{ReplError, Result};
 use crate::integrity::Algorithm;
 use crate::ratelimit::Bandwidth;
+use crate::state::StateStore;
 
 pub mod local;
+#[cfg(feature = "dest-s3")]
+pub mod s3;
 
 pub use local::LocalDest;
+#[cfg(feature = "dest-s3")]
+pub use s3::S3Dest;
+
+/// Process-wide handles a backend may need beyond its own egress config (DESIGN §11.5):
+/// the ggcommons credential service (for a `{"$secret":"…"}` egress reference) and the shared durable
+/// [`StateStore`] (so the S3 backend can persist its multipart resume checkpoint — the [`Destination`]
+/// trait carries no store handle). Both are optional; the `local` backend ignores them. Feature-gated
+/// so a `--no-default-features` build without `dest-s3` neither references the credentials type nor
+/// pulls the subsystem.
+#[derive(Clone, Default)]
+pub struct DestDeps {
+    /// Credential service for resolving `{"$secret":"…"}` egress credentials (S3 only).
+    #[cfg(feature = "dest-s3")]
+    pub credentials: Option<Arc<dyn ggcommons::credentials::CredentialService>>,
+    /// Shared durable store, threaded to backends that checkpoint resume state mid-transfer (S3).
+    pub store: Option<Arc<dyn StateStore>>,
+}
+
+impl DestDeps {
+    /// Attach the shared durable store.
+    pub fn with_store(mut self, store: Arc<dyn StateStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Attach the credential service (S3 `$secret` resolution).
+    #[cfg(feature = "dest-s3")]
+    pub fn with_credentials(
+        mut self,
+        credentials: Option<Arc<dyn ggcommons::credentials::CredentialService>>,
+    ) -> Self {
+        self.credentials = credentials;
+        self
+    }
+}
 
 /// A replication target. `Send + Sync` so the worker pool can share one `Arc<dyn Destination>`.
 #[async_trait]
@@ -62,16 +100,22 @@ pub type SharedDestination = Arc<dyn Destination>;
 
 /// Build the concrete [`Destination`] for an egress config entry (DESIGN §10.2).
 ///
-/// P1 ships the `local` backend only. `s3` is P2; `sftp`/`ftps`/`http`/`azure`/`gcs` are P5 (§22.2).
-/// Any not-yet-implemented backend is a **permanent** configuration error (it will never succeed by
-/// retrying), so the retry engine fails the instance fast rather than burning the `giveUpAfter` budget.
-pub fn build_destination(cfg: &EgressCfg) -> Result<SharedDestination> {
+/// Ships the `local` (P1) and `s3` (P2, feature `dest-s3`) backends; `sftp`/`ftps`/`http`/`azure`/
+/// `gcs` are P5 (§22.2). Any not-yet-implemented (or not-compiled-in) backend is a **permanent**
+/// configuration error (it will never succeed by retrying), so the retry engine fails the instance
+/// fast rather than burning the `giveUpAfter` budget. `deps` supplies cross-cutting handles
+/// (credentials + store); the `local` backend ignores it.
+pub fn build_destination(cfg: &EgressCfg, deps: &DestDeps) -> Result<SharedDestination> {
+    let _ = deps; // used only by feature-gated backends
     match cfg {
         // Local re-hash verification uses CRC32C (the default transfer-integrity hash, §13.1); the
         // local egress config carries no algorithm selector (that is an S3 flexible-checksum concern).
         EgressCfg::Local(local) => Ok(Arc::new(LocalDest::new(local, Algorithm::Crc32c))),
+        #[cfg(feature = "dest-s3")]
+        EgressCfg::S3(s3cfg) => Ok(Arc::new(S3Dest::build(s3cfg, deps)?)),
+        #[cfg(not(feature = "dest-s3"))]
         EgressCfg::S3(_) => Err(ReplError::Permanent(
-            "s3 destination is not available in this build (P2; feature dest-s3)".to_string(),
+            "s3 destination is not available in this build (enable feature dest-s3)".to_string(),
         )),
         EgressCfg::Sftp | EgressCfg::Ftps | EgressCfg::Http | EgressCfg::Azure | EgressCfg::Gcs => {
             Err(ReplError::Permanent(format!(
@@ -107,7 +151,7 @@ mod tests {
             path: PathBuf::from("/out"),
             fsync: false,
         });
-        let d = build_destination(&cfg).expect("local builds");
+        let d = build_destination(&cfg, &DestDeps::default()).expect("local builds");
         assert_eq!(d.kind(), "local");
         assert!(d.supports_resume());
     }
@@ -121,17 +165,20 @@ mod tests {
             EgressCfg::Azure,
             EgressCfg::Gcs,
         ] {
-            let err = build_destination(&cfg).err().expect("must reject");
+            let err = build_destination(&cfg, &DestDeps::default())
+                .err()
+                .expect("must reject");
             assert!(err.is_permanent(), "{cfg:?} → {err:?}");
         }
     }
 
+    #[cfg(feature = "dest-s3")]
     #[test]
-    fn factory_rejects_s3_until_p2() {
+    fn factory_builds_s3() {
         let cfg = EgressCfg::S3(Box::new(crate::config::S3Egress {
             bucket: "b".into(),
-            prefix: String::new(),
-            region: None,
+            prefix: "p/".into(),
+            region: Some("us-east-1".into()),
             endpoint_url: None,
             credentials: None,
             storage_class: None,
@@ -142,10 +189,9 @@ mod tests {
             checksum_algorithm: None,
             multipart: Default::default(),
         }));
-        assert!(build_destination(&cfg)
-            .err()
-            .expect("s3 rejected")
-            .is_permanent());
+        let d = build_destination(&cfg, &DestDeps::default()).expect("s3 builds");
+        assert_eq!(d.kind(), "s3");
+        assert!(d.supports_resume());
     }
 
     #[test]
