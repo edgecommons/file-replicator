@@ -1,0 +1,40 @@
+[package]
+name = "file-replicator"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "EdgeCommons file-replicator: watches directories and replicates files to local/S3 (and, phased, SFTP/HTTP/Azure/GCS) on arrival or on cron schedules/windows, with resumable uploads, integrity verification, bandwidth caps, per-instance activation, and a full control/event surface. See DESIGN.md."
+publish = false
+
+[[bin]]
+name = "file-replicator"
+path = "src/main.rs"
+
+# Runtime selection mirrors the ggcommons library (and telemetry-processor):
+#   - `standalone` (default): dual-broker MQTT — HOST/containers, no C-FFI IPC. Use for `cargo run`/`cargo test`.
+#   - `greengrass`: Greengrass IPC — the on-device build. Linux-only (C-FFI SDK); `build.sh` opts in.
+#
+# NOTE: this is the P0 scaffold feature set. Per DESIGN §22.2, later phases add:
+#   dest-s3 (P2, joins `default`), dest-sftp/dest-http (P5), dest-azure/dest-gcs (P5, off by default),
+#   and `state-redb` (pure-Rust durable-state fallback to the default bundled SQLite). They are added to
+#   this block as each phase lands, so the P0 build stays light and toolchain-free.
+[features]
+default = ["standalone"]
+standalone = ["ggcommons/standalone"]
+greengrass = ["ggcommons/greengrass"]
+cloudwatch = ["ggcommons/cloudwatch"]
+
+[dependencies]
+# ggcommons Rust library, pinned to a commit on edgecommons/ggcommons (private). Building standalone needs
+# read access to that repo. The fetch goes through the git CLI (see .cargo/config.toml); locally use your
+# gh/git credential helper, and CI's reusable workflow rewrites the https URL with EDGECOMMONS_READ_TOKEN.
+# For local development against the sibling checkout, the gitignored .cargo/config.toml `paths` override
+# points cargo at ../ggcommons/libs/rust (Windows + WSL) — no Cargo.toml edit needed.
+ggcommons = { git = "https://github.com/edgecommons/ggcommons.git", rev = "cc037a92c1780c3d88cc98885cfdefec0403a898", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+anyhow = "1"
+async-trait = "0.1"

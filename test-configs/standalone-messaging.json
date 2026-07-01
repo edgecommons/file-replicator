@@ -1,0 +1,9 @@
+{
+  "messaging": {
+    "local": {
+      "host": "localhost",
+      "port": 1883,
+      "clientId": "file-replicator-local"
+    }
+  }
+}

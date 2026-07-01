@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+    paths-ignore: ['**.md', 'docs/**']
+  pull_request:
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+
+jobs:
+  ci:
+    # Reusable component CI from the org defaults repo. `secrets: inherit` passes the org-level
+    # EDGECOMMONS_READ_TOKEN so cargo can fetch the private ggcommons git dependency. The repo must be
+    # added to that secret's repository allow-list (org Actions secrets, via the REST API).
+    permissions:
+      contents: read
+    uses: edgecommons/.github/.github/workflows/component-ci.yml@main
+    with:
+      language: RUST
+      # Compile + test the shippable destination backends as they land (P2+: dest-s3, dest-sftp,
+      # dest-http). Empty at P0 (default features only). The 90% coverage gate (cargo llvm-cov
+      # --fail-under-lines 90) is enforced in-repo; the reusable workflow runs build+test+clippy.
+      rust-features: ""
+    secrets: inherit

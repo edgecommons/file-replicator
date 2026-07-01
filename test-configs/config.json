@@ -1,0 +1,37 @@
+{
+  "logging": { "level": "DEBUG", "rust_format": "{timestamp} [{level}] {target} - {message}" },
+  "heartbeat": {
+    "intervalSecs": 10,
+    "measures": { "cpu": true, "memory": true },
+    "targets": [ { "type": "metric" } ]
+  },
+  "metricEmission": { "target": "log", "namespace": "filereplicator" },
+  "tags": { "enterprise": "acme", "site": "factory-1" },
+  "component": {
+    "global": {
+      "defaults": { "retry": { "baseDelayMs": 1000, "maxDelayMs": 900000, "giveUpAfter": "7d" } },
+      "limits": { "maxConcurrentFiles": 8 }
+    },
+    "instances": [
+      {
+        "id": "spool-to-archive",
+        "ingress": {
+          "path": "./_spool/in",
+          "recursive": true,
+          "include": ["**/*"],
+          "exclude": ["**/*.tmp", "**/.*"],
+          "readiness": { "strategy": "stability", "quietSecs": 5 }
+        },
+        "egress": [ { "type": "local", "path": "./_spool/out", "fsync": true } ],
+        "schedule": { "mode": "immediate" },
+        "completion": {
+          "onSuccess": "archive",
+          "archiveDir": "./_spool/archive",
+          "onExhausted": "retainInPlace",
+          "verify": "checksum"
+        },
+        "limits": { "maxConcurrentFiles": 4 }
+      }
+    ]
+  }
+}

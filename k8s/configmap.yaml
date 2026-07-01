@@ -1,0 +1,23 @@
+# Component config for Kubernetes, mounted as a DIRECTORY at /etc/ggcommons so the CONFIGMAP source
+# watches the kubelet ..data swap and hot-reloads in-process (no restart). config.json carries the
+# component config, the messaging block (in-cluster broker via Service DNS), and the standard
+# ggcommons sections. The component NAME comes from the compiled-in binary constant, not this file.
+# Edit and `kubectl apply -f k8s/` to drive a hot reload. See DESIGN.md §7 for the full instance shape.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: file-replicator-config
+  labels:
+    app.kubernetes.io/name: file-replicator
+data:
+  config.json: |-
+    {
+      "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] {target} - {message}" },
+      "metricEmission": { "target": "log", "namespace": "filereplicator" },
+      "messaging": { "local": { "host": "emqx.default.svc.cluster.local", "port": 1883, "clientId": "file-replicator" } },
+      "tags": { "appId": "Demo", "site": "factory-1" },
+      "component": {
+        "global": { "limits": { "maxConcurrentFiles": 8 } },
+        "instances": []
+      }
+    }

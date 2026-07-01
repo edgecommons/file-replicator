@@ -1,0 +1,17 @@
+{
+  "component": {
+    "com.mbreissi.greengrass.FileReplicator": {
+      "author": "EdgeCommons",
+      "version": "1.0.0",
+      "build": {
+        "build_system": "custom",
+        "custom_build_command": ["bash", "build.sh"]
+      },
+      "publish": {
+        "bucket": "REPLACE_ME_GDK_BUCKET",
+        "region": "us-east-1"
+      }
+    }
+  },
+  "gdk_version": "1.0.0"
+}

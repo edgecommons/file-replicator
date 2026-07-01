@@ -1,0 +1,85 @@
+# Minimal Kubernetes Deployment for file-replicator. With --platform auto the library detects
+# KUBERNETES from the ServiceAccount token; config source defaults to CONFIGMAP, transport to MQTT
+# (broker config from the mounted ConfigMap), identity from the Downward API — so NO args are needed.
+# Build the image from ./Dockerfile and push to your registry (e.g. ghcr.io/edgecommons/file-replicator)
+# or `kind load` it for a local cluster, then set `image:` below.
+#
+# NOTE: replicas is 1 and the state PVC is ReadWriteOnce — file-replicator keeps a durable SQLite
+# work-queue + resume checkpoints on /data (DESIGN §14); it is not horizontally scalable within one
+# watched-directory set. The watched SOURCE directory (a hostPath / NFS / PVC you provide) and any
+# local-destination/archive/failed dirs must also be mounted; wire those per deployment.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: file-replicator
+  labels:
+    app.kubernetes.io/name: file-replicator
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate            # RWO state PVC: don't run two pods against it during a rollout
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: file-replicator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: file-replicator
+    spec:
+      automountServiceAccountToken: true   # the projected SA token is the platform=KUBERNETES auto-detect signal
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532                      # so the non-root uid can write the /data PVC
+      containers:
+        - name: file-replicator
+          image: REPLACE_ME   # e.g. ghcr.io/edgecommons/file-replicator:latest (build ./Dockerfile)
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          ports:
+            - { name: health, containerPort: 8081 }
+            - { name: metrics, containerPort: 9090 }
+          startupProbe:
+            httpGet: { path: /startupz, port: health }
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /livez, port: health }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/ggcommons, readOnly: true }   # WHOLE volume, never subPath (hot-reload)
+            - { name: data, mountPath: /data }                              # durable SQLite state + resume + archive/failed
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap: { name: file-replicator-config }
+        - name: data
+          persistentVolumeClaim: { claimName: file-replicator-data }
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: file-replicator-data
+  labels:
+    app.kubernetes.io/name: file-replicator
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
