@@ -281,11 +281,20 @@ flowchart LR
 
 - **One `Instance` task per watched dir** — independent watcher/scheduler/queue/workers/stats/activation, so
   a slow or failed destination on one instance never stalls another.
-- **Bounded worker pool per instance** + a **global** semaphore cap total in-flight (FR-REL-5).
+- **Bounded worker pool per instance** + a **global** cap on total in-flight files (FR-REL-5). That global
+  cap is a **priority-aware admission gate** (`src/admission.rs`), not a plain semaphore: under contention the
+  highest-priority instance (`instances[].priority`, lower = higher) is admitted first, FIFO within a priority,
+  no barging. It is **demand-adaptive** — an idle high-priority instance reserves nothing, so it never starves
+  a busy low-priority one of a slot it isn't using — and cancellation-safe (a waiter dropped on
+  shutdown/window-close leaks no permit). Admission-order only; no bandwidth weighting (use `limits.maxBandwidth`).
 - **Bandwidth governor**: token buckets, one per-instance and one global, throttle the transfer byte-stream
   (FR-REL-6, §13.5).
 - **Scheduler** gates whether `Ready` work may start (immediate=always; cron/window per §12) and whether the
   instance is **active** (§7.5).
+- **Permission handling**: ingress/egress/archive/failed dirs are validated at startup; any permission error
+  (startup or runtime) is logged **once** (deduplicated, never per-rescan) and emits a `PermissionDenied` event,
+  with the response set by `onPermissionError` = `disableInstance` (default; stop just that instance —
+  isolation preserved) | `fatal` (abort the whole component) | `retain`. Zero viable instances still fails fast.
 - Shutdown: `gg.shutdown_signal()` → stop new work, checkpoint resume state, drain/pause, flush, drop.
 
 ### 6.4 Data-flow (single file, immediate mode)
@@ -318,7 +327,10 @@ Config is one JSON document from the platform's source (FILE/CONFIGMAP/GG_CONFIG
 
 `ingress` / `egress` / `schedule` / `completion` / `retry` / `limits`, plus `enabled` and an optional
 `topics` override. Readiness lives under `ingress`; integrity + failed-folder under `completion`; bandwidth
-under `limits`. `completion` is its own section (§20-C, accepted).
+under `limits`. `completion` is its own section (§20-C, accepted). Two cross-cutting knobs sit at the instance
+level: **`priority`** (i32, default `100`, lower = higher — the priority-aware global admission order, §6.3)
+and **`onPermissionError`** (`disableInstance` default | `fatal` | `retain`; overrides `component.global.onPermissionError`,
+§6.3). The authoritative field-by-field reference is [`docs/reference/configuration.md`](docs/reference/configuration.md).
 
 ### 7.2 Annotated example — S3, immediate, archive-on-success, quarantine-on-fail
 
