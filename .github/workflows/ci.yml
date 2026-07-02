@@ -38,7 +38,8 @@ jobs:
     # protocol-call seams `dest/{s3,sftp,ftps,http,azure,gcs}/client.rs` (like ggcommons excludes
     # `testutil.rs`) AND every simulator-backed integration-test file (`tests/s3_floci.rs`,
     # `tests/p3_control_emqx.rs`, `tests/sftp_atmoz.rs`, `tests/azure_azurite.rs`,
-    # `tests/gcs_fakegcs.rs`, `tests/http_inprocess.rs`, `tests/p6_fanout.rs`) — this job provisions no floci/EMQX/docker-sftp/
+    # `tests/gcs_fakegcs.rs`, `tests/http_inprocess.rs`, `tests/p6_fanout.rs`, `tests/s3_real.rs`
+    # [opt-in real-AWS, FR_S3_REAL_BUCKET]) — this job provisions no floci/EMQX/docker-sftp/
     # azurite/fake-gcs-server and the P5 tests are probe-only (they self-skip when their port is down;
     # auto-start is opt-in via `FR_START_SIMULATORS=1`, never set here), so those bodies partly do not
     # run and would otherwise erode the margin. `http_inprocess.rs` is excluded too: although its
@@ -66,5 +67,5 @@ jobs:
       - name: Coverage gate (90% lines; SDK/protocol-call seams + self-skipping integration tests excluded)
         run: >
           cargo llvm-cov --features dest-s3,dest-sftp,dest-ftps,dest-http,dest-azure,dest-gcs
-          --ignore-filename-regex '(testutil|dest.(s3|sftp|ftps|http|azure|gcs).client|p3_control_emqx|s3_floci|sftp_atmoz|azure_azurite|gcs_fakegcs|http_inprocess|p6_fanout)\.rs'
+          --ignore-filename-regex '(testutil|dest.(s3|sftp|ftps|http|azure|gcs).client|p3_control_emqx|s3_floci|sftp_atmoz|azure_azurite|gcs_fakegcs|http_inprocess|p6_fanout|s3_real)\.rs'
           --fail-under-lines 90
