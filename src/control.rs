@@ -914,7 +914,7 @@ mod tests {
     fn cfg() -> Arc<Config> {
         Arc::new(
             Config::from_value(
-                "com.mbreissi.greengrass.FileReplicator",
+                "com.mbreissi.edgecommons.FileReplicator",
                 "gw-01",
                 json!({ "tags": { "site": "factory-1" }, "logging": { "level": "INFO" } }),
             )
@@ -1150,7 +1150,7 @@ mod tests {
             .await;
 
         let body = fake.only_reply().1.body;
-        assert_eq!(body["component"], json!("com.mbreissi.greengrass.FileReplicator"));
+        assert_eq!(body["component"], json!("com.mbreissi.edgecommons.FileReplicator"));
         assert_eq!(body["thing"], json!("gw-01"));
         assert_eq!(body["instances"].as_array().unwrap().len(), 2);
         assert_eq!(body["summary"]["instances"], json!(2));

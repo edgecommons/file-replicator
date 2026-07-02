@@ -60,7 +60,7 @@ use file_replicator::state::{SqliteStore, StateStore};
 use file_replicator::uns::Topics;
 
 /// The component's reverse-DNS full name (the `component_name` on every envelope).
-const COMPONENT: &str = "com.mbreissi.greengrass.FileReplicator";
+const COMPONENT: &str = "com.mbreissi.edgecommons.FileReplicator";
 /// Broker address the standalone MQTT provider connects to (the local `ggcommons-emqx`).
 const BROKER: &str = "127.0.0.1:1883";
 

@@ -1,7 +1,7 @@
 # file-replicator — Requirements & Design
 
 > **Status:** DRAFT for review · **Version:** 0.2 (revised after review round 1) · **Date:** 2026-07-01
-> **Component:** `file-replicator` · **Full name:** `com.mbreissi.greengrass.FileReplicator`
+> **Component:** `file-replicator` · **Full name:** `com.mbreissi.edgecommons.FileReplicator`
 > **Category:** `sink` (northbound delivery) · **Language:** Rust · **Library:** `ggcommons`
 > **Platforms:** HOST · GREENGRASS · KUBERNETES
 
@@ -222,7 +222,7 @@ IDs follow the ecosystem `FR-<AREA>-<n>` convention. RFC-2119 keywords.
 
 ```rust
 use ggcommons::prelude::*;
-const COMPONENT_NAME: &str = "com.mbreissi.greengrass.FileReplicator";
+const COMPONENT_NAME: &str = "com.mbreissi.edgecommons.FileReplicator";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

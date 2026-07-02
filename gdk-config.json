@@ -1,6 +1,6 @@
 {
   "component": {
-    "com.mbreissi.greengrass.FileReplicator": {
+    "com.mbreissi.edgecommons.FileReplicator": {
       "author": "EdgeCommons",
       "version": "1.0.0",
       "build": {

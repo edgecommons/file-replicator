@@ -21,7 +21,7 @@ use file_replicator::app;
 use ggcommons::prelude::*;
 
 /// The component's full name (matches `recipe.yaml` / `gdk-config.json`).
-const COMPONENT_NAME: &str = "com.mbreissi.greengrass.FileReplicator";
+const COMPONENT_NAME: &str = "com.mbreissi.edgecommons.FileReplicator";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

@@ -1,6 +1,6 @@
 # file-replicator — component notes
 
-EdgeCommons **sink** component (Rust). Full name `com.mbreissi.greengrass.FileReplicator`. Depends on the
+EdgeCommons **sink** component (Rust). Full name `com.mbreissi.edgecommons.FileReplicator`. Depends on the
 `ggcommons` Rust library. Read the org umbrella `../CLAUDE.md` first (platform matrix, validation infra,
 local-dev sibling override).
 

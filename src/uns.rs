@@ -36,7 +36,7 @@ use ggcommons::config::template;
 use ggcommons::prelude::Config;
 
 /// The short registry slug used as the `{component}` path segment (DESIGN §15.2) — deliberately
-/// *not* the reverse-DNS full name (`com.mbreissi.greengrass.FileReplicator`).
+/// *not* the reverse-DNS full name (`com.mbreissi.edgecommons.FileReplicator`).
 pub const COMPONENT_SLUG: &str = "file-replicator";
 
 /// AWS IoT Core maximum topic length in UTF-8 bytes (DESIGN §15.1).
@@ -263,12 +263,12 @@ mod tests {
     use serde_json::json;
 
     fn cfg(thing: &str) -> Config {
-        Config::from_value("com.mbreissi.greengrass.FileReplicator", thing, json!({})).unwrap()
+        Config::from_value("com.mbreissi.edgecommons.FileReplicator", thing, json!({})).unwrap()
     }
 
     fn cfg_with_tags(thing: &str, tags: serde_json::Value) -> Config {
         Config::from_value(
-            "com.mbreissi.greengrass.FileReplicator",
+            "com.mbreissi.edgecommons.FileReplicator",
             thing,
             json!({ "tags": tags }),
         )

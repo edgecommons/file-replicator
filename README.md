@@ -1,6 +1,6 @@
 # file-replicator
 
-> EdgeCommons **sink** component (Rust) · full name `com.mbreissi.greengrass.FileReplicator`
+> EdgeCommons **sink** component (Rust) · full name `com.mbreissi.edgecommons.FileReplicator`
 
 Watches local directories and **replicates files** to one or more destinations — another local directory,
 **S3**, and (designed, phased) SFTP/FTPS, HTTP(S), Azure Blob, and GCS — either **as files arrive**

@@ -1,6 +1,6 @@
 ---
 RecipeFormatVersion: "2020-01-25"
-ComponentName: "com.mbreissi.greengrass.FileReplicator"
+ComponentName: "com.mbreissi.edgecommons.FileReplicator"
 ComponentVersion: "1.0.0"
 ComponentDescription: "EdgeCommons file-replicator: watches directories and replicates files to local/S3 destinations on arrival or on cron schedules/windows."
 ComponentPublisher: "EdgeCommons"
@@ -43,7 +43,7 @@ ComponentConfiguration:
         instances: []
     accessControl:
       aws.greengrass.ipc.pubsub:
-        "com.mbreissi.greengrass.FileReplicator:pubsub:1":
+        "com.mbreissi.edgecommons.FileReplicator:pubsub:1":
           policyDescription: Allows access to publish/subscribe to all local topics.
           operations:
             - "aws.greengrass#PublishToTopic"
@@ -51,7 +51,7 @@ ComponentConfiguration:
           resources:
             - "*"
       aws.greengrass.ipc.mqttproxy:
-        "com.mbreissi.greengrass.FileReplicator:iotcore:1":
+        "com.mbreissi.edgecommons.FileReplicator:iotcore:1":
           policyDescription: Allows access to publish/subscribe to all topics on IoT Core.
           operations:
             - "aws.greengrass#PublishToIoTCore"
@@ -59,7 +59,7 @@ ComponentConfiguration:
           resources:
             - "*"
       aws.greengrass.ShadowManager:
-        "com.mbreissi.greengrass.FileReplicator:shadow:1":
+        "com.mbreissi.edgecommons.FileReplicator:shadow:1":
           policyDescription: Allows access to thing shadows.
           operations:
             - "aws.greengrass#GetThingShadow"

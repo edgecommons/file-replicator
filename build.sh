@@ -14,7 +14,7 @@
 #   GGCOMMONS_TARGET=x86_64-unknown-linux-gnu ./build.sh
 set -euo pipefail
 
-COMPONENT_NAME="com.mbreissi.greengrass.FileReplicator"
+COMPONENT_NAME="com.mbreissi.edgecommons.FileReplicator"
 COMPONENT_VERSION="$(python3 -c 'import json; c = json.load(open("gdk-config.json"))["component"]; print(next(iter(c.values()))["version"])')"
 BIN_NAME="file-replicator"
 
