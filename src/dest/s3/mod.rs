@@ -8,7 +8,9 @@
 //! ## Where the code lives (coverage seam, NFR-2)
 //! Everything in **this file** is either pure decision logic (part planning, key mapping, checksum
 //! codecs, resume bookkeeping, credential selection, client-param derivation, error classification)
-//! or the streaming file read — all unit-tested with no network. Every line that makes an actual AWS
+//! or the streaming file reads (a checksum-only pass, [`hash_range`], and the throttled/progress
+//! -reported egress body, [`RangeBody`]) — all unit-tested with no network, and bounded to one
+//! [`READ_CHUNK`] at a time (no whole-part/whole-file buffer). Every line that makes an actual AWS
 //! SDK round-trip lives in [`client`], which is excluded from the coverage gate (it is unreachable in
 //! CI/unit runs; the floci integration tests in `tests/s3_floci.rs` self-skip when floci is down, so
 //! they never gate). The lazy client builder and the whole `impl Destination for S3Dest` delegation
@@ -29,8 +31,13 @@
 
 pub mod client;
 
-use std::sync::Arc;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::task::{Context, Poll};
 
+use bytes::Bytes;
+use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{MultipartCfg, S3Egress};
@@ -447,7 +454,16 @@ fn is_permanent_code(code: &str) -> bool {
     )
 }
 
-/// True for S3 error codes worth retrying (throttling / capacity / transient server faults).
+/// True for S3 error codes worth retrying (throttling / capacity / transient server faults) — plus the
+/// flexible-checksum / digest **mismatch** codes. Because the object's flexible-checksum header is
+/// computed in a separate [`hash_range`] pass from the throttled [`RangeBody`] egress, a source
+/// rewritten in place during the (bandwidth-capped, possibly minutes-long) send desyncs the sent
+/// checksum from the sent body, which a checksum-validating endpoint rejects with `BadDigest` /
+/// `XAmzContentChecksumMismatch` / `XAmzContentSHA256Mismatch`. Classifying those transient lets the
+/// next attempt re-read the source metadata and re-hash the now-stable bytes (self-healing) instead of
+/// permanently quarantining a legitimately-changing source (DESIGN §11.4/§13.2). `InvalidDigest` — a
+/// *malformed* digest value — is deliberately NOT here: that is a client-side bug, not a content race,
+/// so it stays permanent (via the 4xx path).
 fn is_transient_code(code: &str) -> bool {
     matches!(
         code,
@@ -460,6 +476,9 @@ fn is_transient_code(code: &str) -> bool {
             | "TooManyRequests"
             | "ServiceUnavailable"
             | "InternalError"
+            | "BadDigest"
+            | "XAmzContentChecksumMismatch"
+            | "XAmzContentSHA256Mismatch"
     )
 }
 
@@ -507,22 +526,36 @@ pub fn classify_s3(code: Option<&str>, status: Option<u16>, transport: bool) -> 
 
 // ---- streaming read (pure, no network) ----------------------------------------------------------
 
-/// Read `len` bytes from `path` starting at `offset` into memory, throttling every chunk through the
-/// bandwidth governor, folding them into a single-pass [`Checksum`] (DESIGN §13.1), and reporting the
-/// **delta** of each chunk via `on_progress` (the caller turns deltas into the cumulative total the
-/// [`ProgressSink`] wants — one accumulator for a single PUT, a shared one across concurrent parts).
-///
-/// This is the whole streaming/integrity path for both `PutObject` (offset 0, whole file) and each
-/// multipart part; keeping it here (not in [`client`]) makes it unit-testable with a real file and no
-/// network. The in-memory buffer is bounded by `len` (≤ the multipart part size, DESIGN NFR-3).
-pub async fn read_range(
-    path: &std::path::Path,
-    offset: u64,
-    len: u64,
-    bw: &Bandwidth,
-    algo: Algorithm,
-    on_progress: &(dyn Fn(u64) + Send + Sync),
-) -> Result<(Vec<u8>, Checksum)> {
+/// The truncation message shared between [`hash_range`]'s (`ReplError`) and [`RangeBody`]'s
+/// (`io::Error`, surfaced through the SDK's dispatch-failure → [`client::map_sdk`] transport
+/// classification) short-read guards, so both passes fail the same way for the same reason.
+fn truncated_msg(path: &Path, offset: u64, len: u64, read: u64) -> String {
+    format!("source truncated: read {read} of {len} bytes at offset {offset} from {}", path.display())
+}
+
+/// Whether the source changed under an in-flight upload: its size or mtime differs from what the
+/// upload path captured before it hashed. Because the flexible-checksum header is computed in a
+/// separate [`hash_range`] pass from the throttled [`RangeBody`] egress, a same-length OR resized
+/// in-place rewrite during the (potentially minutes-long, bandwidth-capped) send would leave the stored
+/// object's bytes desynced from the sent checksum. The single-PUT and multipart paths re-stat the
+/// source after the send and, if this returns `true`, fail `Transient` so the next attempt re-reads
+/// metadata + re-hashes the now-stable bytes (self-healing). On checksum-validating endpoints S3 also
+/// rejects the desynced send itself (`BadDigest`, classified transient by [`is_transient_code`]); this
+/// guard additionally protects the explicitly-supported non-validating S3-compatible endpoints
+/// (MinIO/floci) whose `verify` downgrades to size-only and would otherwise silently accept the mismatch
+/// then release the source (DESIGN §11.4/§13.2).
+pub fn source_changed(orig_size: u64, orig_mtime_ms: i64, now_size: u64, now_mtime_ms: i64) -> bool {
+    orig_size != now_size || orig_mtime_ms != now_mtime_ms
+}
+
+/// Hash `len` bytes of `path` starting at `offset` in a single streaming pass (DESIGN §11.4/§13.1) —
+/// **no** bandwidth throttle, **no** progress report: this is a local disk read (computing the S3
+/// flexible-checksum header that must precede the body) not egress, so it must not consume the
+/// governor's budget or move the [`ProgressSink`]. [`range_byte_stream`] is the throttled/progress
+/// -reported egress pass over the same range. Bounded 64 KiB working buffer regardless of `len`
+/// (DESIGN NFR-3) — this replaces the old whole-range `Vec<u8>` buffer entirely; hashing never
+/// materializes more than one chunk.
+pub async fn hash_range(path: &Path, offset: u64, len: u64, algo: Algorithm) -> Result<Checksum> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     let mut file = tokio::fs::File::open(path).await.map_err(ReplError::classify_io)?;
@@ -531,7 +564,6 @@ pub async fn read_range(
             .await
             .map_err(ReplError::classify_io)?;
     }
-    let mut buf = Vec::with_capacity(len.min(64 * MIB) as usize);
     let mut hasher = Hasher::new(algo);
     let mut remaining = len;
     let mut chunk = vec![0u8; READ_CHUNK];
@@ -543,23 +575,102 @@ pub async fn read_range(
             .map_err(ReplError::classify_io)?;
         if n == 0 {
             // EOF before `len`: the source shrank/was truncated since `deliver` read its metadata
-            // (or a producer is still rewriting it). Delivering the short buffer would ship a
-            // truncated object — and under `verify:none` the worker would then delete the source
-            // (data loss). Fail as Transient so the next attempt re-reads metadata and re-plans
-            // against the current size (self-healing) rather than committing a partial object.
-            return Err(ReplError::Transient(format!(
-                "source truncated: read {} of {len} bytes at offset {offset} from {}",
-                len - remaining,
-                path.display()
-            )));
+            // (or a producer is still rewriting it). Fail as Transient so the next attempt re-reads
+            // metadata and re-plans against the current size (self-healing) rather than hashing (and
+            // then shipping) a partial object.
+            return Err(ReplError::Transient(truncated_msg(path, offset, len, len - remaining)));
         }
-        bw.throttle(n as u64).await;
         hasher.update(&chunk[..n]);
-        buf.extend_from_slice(&chunk[..n]);
         remaining -= n as u64;
-        on_progress(n as u64);
     }
-    Ok((buf, hasher.finish()))
+    Ok(hasher.finish())
+}
+
+/// A `Send + Sync` streaming egress body over one byte range of `path`: reads bounded [`READ_CHUNK`]
+/// windows straight off disk, throttling every chunk through the bandwidth governor and reporting its
+/// length via `on_progress` **as it is handed to the SDK** (not pre-read into a buffer) — the
+/// memory-bounded replacement for the old whole-part `Vec<u8>` body. Implements [`http_body::Body`] so
+/// [`client`] can wrap it into a retryable `SdkBody` (`SdkBody::from_body_0_4`) for `PutObject` /
+/// `UploadPart` without ever materializing more than one chunk of the range at a time (peak transfer
+/// memory ≈ `max_concurrent × READ_CHUNK`, independent of part/file size).
+///
+/// A short read before the range is exhausted yields an `io::Error` (mirrors [`hash_range`]'s
+/// truncation guard); the SDK surfaces that as a dispatch failure, which [`client::map_sdk`] classifies
+/// as `Transient` — same self-healing re-plan behavior as before.
+pub struct RangeBody {
+    // A boxed `dyn Stream` is `Send` but not (in general) `Sync`, and `http_body::Body` requires
+    // `Sync`. `poll_data` is handed `Pin<&mut Self>` (this struct is `Unpin`, so `get_mut()` recovers
+    // `&mut Self`), i.e. every call already has exclusive access — the `Mutex` exists purely to make
+    // the type `Sync`; `get_mut()` (not `lock()`) bypasses any runtime locking.
+    stream: StdMutex<Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>>,
+    len: u64,
+}
+
+impl RangeBody {
+    /// Build the streaming body for `[offset, offset+len)` of `path`. `on_progress` receives each
+    /// chunk's length (a delta, like [`hash_range`]'s caller pattern) as it streams.
+    pub fn new(
+        path: Arc<Path>,
+        offset: u64,
+        len: u64,
+        bw: Bandwidth,
+        on_progress: Arc<dyn Fn(u64) + Send + Sync>,
+    ) -> Self {
+        let stream = async_stream::try_stream! {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+            let mut file = tokio::fs::File::open(&*path).await?;
+            if offset > 0 {
+                file.seek(std::io::SeekFrom::Start(offset)).await?;
+            }
+            let mut remaining = len;
+            let mut chunk = vec![0u8; READ_CHUNK];
+            while remaining > 0 {
+                let want = remaining.min(READ_CHUNK as u64) as usize;
+                let n = file.read(&mut chunk[..want]).await?;
+                if n == 0 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        truncated_msg(&path, offset, len, len - remaining),
+                    ))?;
+                }
+                bw.throttle(n as u64).await;
+                on_progress(n as u64);
+                remaining -= n as u64;
+                yield Bytes::copy_from_slice(&chunk[..n]);
+            }
+        };
+        RangeBody {
+            stream: StdMutex::new(Box::pin(stream)),
+            len,
+        }
+    }
+}
+
+impl http_body::Body for RangeBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_data(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Bytes, std::io::Error>>> {
+        let this = self.get_mut();
+        this.stream.get_mut().expect("range body mutex").as_mut().poll_next(cx)
+    }
+
+    fn poll_trailers(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<Option<http::HeaderMap>, std::io::Error>> {
+        Poll::Ready(Ok(None))
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        // Exact (lower == upper) so the SDK derives a real `Content-Length` (S3 `PutObject`/
+        // `UploadPart` need it; this is not `aws-chunked` transfer-encoded).
+        http_body::SizeHint::with_exact(self.len)
+    }
 }
 
 // ---- the destination ----------------------------------------------------------------------------
@@ -1136,6 +1247,21 @@ mod tests {
     }
 
     #[test]
+    fn classify_checksum_mismatch_is_transient_for_self_heal() {
+        // A precomputed-checksum-vs-streamed-body desync (source rewritten in place between the
+        // hash_range pass and the throttled egress) must retry + re-plan against the now-stable bytes,
+        // not permanently quarantine the file (DESIGN §11.4).
+        for c in ["BadDigest", "XAmzContentChecksumMismatch", "XAmzContentSHA256Mismatch"] {
+            assert!(
+                classify_s3(Some(c), Some(400), false).is_transient(),
+                "{c} should self-heal (transient)"
+            );
+        }
+        // A malformed digest value is a client bug, not a content race → stays permanent (4xx path).
+        assert!(classify_s3(Some("InvalidDigest"), Some(400), false).is_permanent());
+    }
+
+    #[test]
     fn classify_unknown_service_code_is_permanent_bare_failure_is_transient() {
         // A service error with an unrecognized code (server rejected) → permanent.
         assert!(classify_s3(Some("SomethingWeird"), None, false).is_permanent());
@@ -1145,32 +1271,29 @@ mod tests {
         assert!(classify_s3(Some("SlowDown"), Some(400), false).is_transient());
     }
 
-    // ---- read_range (streaming, no network) -----------------------------------------------------
+    // ---- source_changed (mid-upload stability guard) --------------------------------------------
+
+    #[test]
+    fn source_changed_detects_size_or_mtime_drift() {
+        assert!(!source_changed(100, 42, 100, 42), "stable source (size+mtime unchanged)");
+        assert!(source_changed(100, 42, 101, 42), "grew");
+        assert!(source_changed(100, 42, 99, 42), "shrank");
+        assert!(source_changed(100, 42, 100, 43), "same-length in-place rewrite (mtime bumped)");
+        assert!(source_changed(100, 42, 101, 43), "both changed");
+    }
+
+    // ---- hash_range (streaming, no network, no throttle/progress) --------------------------------
 
     #[tokio::test]
-    async fn read_range_reads_whole_file_hashes_and_reports_progress() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+    async fn hash_range_hashes_whole_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.bin");
         let data = vec![7u8; READ_CHUNK * 2 + 100];
         std::fs::write(&path, &data).unwrap();
 
-        let seen = Arc::new(AtomicU64::new(0));
-        let s = seen.clone();
-        let (buf, ck) = read_range(
-            &path,
-            0,
-            data.len() as u64,
-            &Bandwidth::unlimited(),
-            Algorithm::Crc32c,
-            &move |d| {
-                s.fetch_add(d, Ordering::SeqCst);
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(buf, data, "whole file read");
-        assert_eq!(seen.load(Ordering::SeqCst), data.len() as u64, "progress deltas sum to len");
+        let ck = hash_range(&path, 0, data.len() as u64, Algorithm::Crc32c)
+            .await
+            .unwrap();
         // Checksum equals the one-pass integrity hash of the same bytes.
         let mut r = data.as_slice();
         let (_, expect) = crate::integrity::hash_reader(&mut r, Algorithm::Crc32c).unwrap();
@@ -1178,63 +1301,196 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_range_reads_an_offset_slice() {
+    async fn hash_range_hashes_an_offset_slice() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.bin");
         let data: Vec<u8> = (0..30_000u32).map(|i| (i % 256) as u8).collect();
         std::fs::write(&path, &data).unwrap();
 
-        let (buf, ck) = read_range(
-            &path,
-            10_000,
-            5_000,
-            &Bandwidth::unlimited(),
-            Algorithm::Crc32c,
-            &|_d| {},
-        )
-        .await
-        .unwrap();
-        assert_eq!(buf, &data[10_000..15_000], "reads exactly the requested range");
+        let ck = hash_range(&path, 10_000, 5_000, Algorithm::Crc32c).await.unwrap();
         let mut slice = &data[10_000..15_000];
         let (_, expect) = crate::integrity::hash_reader(&mut slice, Algorithm::Crc32c).unwrap();
         assert_eq!(ck, expect, "per-part checksum is over the part bytes only");
     }
 
     #[tokio::test]
-    async fn read_range_short_read_is_transient_not_a_silent_truncation() {
-        // If the source shrank since `deliver` planned the transfer, read_range must FAIL (so no
-        // truncated object is delivered + the source deleted under verify:none), not return a short
-        // buffer. Transient so the next attempt re-plans against the smaller size (self-healing).
+    async fn hash_range_short_read_is_transient_not_a_silent_truncation() {
+        // If the source shrank since `deliver` planned the transfer, hash_range must FAIL (so no
+        // truncated object is later delivered + the source deleted under verify:none), not return a
+        // short hash. Transient so the next attempt re-plans against the smaller size (self-healing).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("short.bin");
         std::fs::write(&path, vec![9u8; 1000]).unwrap();
-        let err = read_range(
-            &path,
-            0,
-            5000, // ask for more than the file holds
-            &Bandwidth::unlimited(),
-            Algorithm::Crc32c,
-            &|_d| {},
-        )
-        .await
-        .unwrap_err();
+        let err = hash_range(&path, 0, 5000, Algorithm::Crc32c).await.unwrap_err();
         assert!(err.is_transient(), "short read must be transient (re-plan), got {err:?}");
         assert!(err.to_string().contains("truncated"), "diagnostic mentions truncation: {err}");
     }
 
     #[tokio::test]
-    async fn read_range_missing_file_is_permanent() {
-        let err = read_range(
-            std::path::Path::new("/no/such/file.bin"),
-            0,
-            10,
-            &Bandwidth::unlimited(),
-            Algorithm::Crc32c,
-            &|_d| {},
-        )
-        .await
-        .unwrap_err();
+    async fn hash_range_missing_file_is_permanent() {
+        let err = hash_range(std::path::Path::new("/no/such/file.bin"), 0, 10, Algorithm::Crc32c)
+            .await
+            .unwrap_err();
         assert!(err.is_permanent(), "NotFound source classifies permanent: {err:?}");
+    }
+
+    // ---- range_byte_stream / RangeBody (streaming egress body, no network) -----------------------
+
+    /// Drain a [`RangeBody`] via its `http_body::Body` impl, folding a [`Hasher`] over the yielded
+    /// chunks (mirroring how the real send path would consume it) and returning `(bytes, checksum)`.
+    async fn drain_body(mut body: RangeBody, algo: Algorithm) -> std::io::Result<(Vec<u8>, Checksum)> {
+        use http_body::Body as _;
+        let mut out = Vec::new();
+        let mut hasher = Hasher::new(algo);
+        let mut pinned = Pin::new(&mut body);
+        while let Some(chunk) = std::future::poll_fn(|cx| pinned.as_mut().poll_data(cx)).await {
+            let bytes = chunk?;
+            hasher.update(&bytes);
+            out.extend_from_slice(&bytes);
+        }
+        Ok((out, hasher.finish()))
+    }
+
+    #[tokio::test]
+    async fn range_byte_stream_reads_whole_file_throttles_and_reports_progress() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let path: Arc<Path> = dir.path().join("f.bin").into();
+        let data = vec![7u8; READ_CHUNK * 2 + 100];
+        std::fs::write(&path, &data).unwrap();
+
+        let seen = Arc::new(AtomicU64::new(0));
+        let s = seen.clone();
+        let body = RangeBody::new(
+            path.clone(),
+            0,
+            data.len() as u64,
+            Bandwidth::unlimited(),
+            Arc::new(move |d| {
+                s.fetch_add(d, Ordering::SeqCst);
+            }),
+        );
+        // Exact size hint drives the SDK's Content-Length.
+        assert_eq!(
+            http_body::Body::size_hint(&body).exact(),
+            Some(data.len() as u64)
+        );
+        let (buf, ck) = drain_body(body, Algorithm::Crc32c).await.unwrap();
+        assert_eq!(buf, data, "whole file streamed");
+        assert_eq!(seen.load(Ordering::SeqCst), data.len() as u64, "progress deltas sum to len");
+        let mut r = data.as_slice();
+        let (_, expect) = crate::integrity::hash_reader(&mut r, Algorithm::Crc32c).unwrap();
+        assert_eq!(ck, expect);
+    }
+
+    #[tokio::test]
+    async fn range_byte_stream_streams_an_offset_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path: Arc<Path> = dir.path().join("f.bin").into();
+        let data: Vec<u8> = (0..30_000u32).map(|i| (i % 256) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+
+        let body = RangeBody::new(path, 10_000, 5_000, Bandwidth::unlimited(), Arc::new(|_d| {}));
+        let (buf, ck) = drain_body(body, Algorithm::Crc32c).await.unwrap();
+        assert_eq!(buf, &data[10_000..15_000], "streams exactly the requested range");
+        let mut slice = &data[10_000..15_000];
+        let (_, expect) = crate::integrity::hash_reader(&mut slice, Algorithm::Crc32c).unwrap();
+        assert_eq!(ck, expect, "per-part checksum is over the part bytes only");
+    }
+
+    #[tokio::test]
+    async fn range_byte_stream_never_buffers_more_than_one_chunk() {
+        // The defect this refactor fixes: no whole-range `Vec<u8>` buffer. Assert every yielded chunk
+        // is at most READ_CHUNK bytes, for a range much larger than one chunk.
+        let dir = tempfile::tempdir().unwrap();
+        let path: Arc<Path> = dir.path().join("big.bin").into();
+        let data = vec![3u8; READ_CHUNK * 5 + 1234];
+        std::fs::write(&path, &data).unwrap();
+
+        let body = RangeBody::new(
+            path,
+            0,
+            data.len() as u64,
+            Bandwidth::unlimited(),
+            Arc::new(|_d| {}),
+        );
+        use http_body::Body as _;
+        let mut body = Box::pin(body);
+        let mut total = 0usize;
+        let mut max_chunk = 0usize;
+        while let Some(chunk) = std::future::poll_fn(|cx| body.as_mut().poll_data(cx)).await {
+            let bytes = chunk.unwrap();
+            max_chunk = max_chunk.max(bytes.len());
+            total += bytes.len();
+        }
+        assert_eq!(total, data.len());
+        assert!(max_chunk <= READ_CHUNK, "chunk {max_chunk} exceeds READ_CHUNK {READ_CHUNK}");
+    }
+
+    #[tokio::test]
+    async fn range_byte_stream_throttles_through_the_bandwidth_governor() {
+        // The governor must gate the streamed bytes (not a pre-read): draining the body with a slow
+        // per-instance bucket must take real wait time proportional to the data, under paused tokio
+        // time so the assertion is deterministic (mirrors ratelimit.rs's paused-time pattern).
+        let dir = tempfile::tempdir().unwrap();
+        let path: Arc<Path> = dir.path().join("f.bin").into();
+        let data = vec![1u8; 2000];
+        std::fs::write(&path, &data).unwrap();
+
+        tokio::time::pause();
+        let clock = Arc::new(crate::ratelimit::ManualClock::new());
+        // 1000 B/s starts with a 1000-byte burst; the 2000-byte file drains it then owes ~1s.
+        let bucket = Arc::new(crate::ratelimit::TokenBucket::new(1000, clock));
+        let bw = Bandwidth::new(bucket, Arc::new(crate::ratelimit::TokenBucket::unlimited()));
+        let body = RangeBody::new(path, 0, data.len() as u64, bw, Arc::new(|_d| {}));
+        let start = tokio::time::Instant::now();
+        let (buf, _) = drain_body(body, Algorithm::Crc32c).await.unwrap();
+        assert_eq!(buf.len(), data.len());
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(900),
+            "expected the governor to gate streamed bytes, elapsed {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn range_byte_stream_short_read_is_transient_after_sdk_mapping() {
+        // A short read surfaces as an io::Error from the body; `client::map_sdk` classifies the
+        // resulting SDK dispatch failure as Transient (unit-tested directly here on the io::Error
+        // path, mirroring hash_range's guard so both passes fail the same way for the same reason).
+        let dir = tempfile::tempdir().unwrap();
+        let path: Arc<Path> = dir.path().join("short.bin").into();
+        std::fs::write(&path, vec![9u8; 1000]).unwrap();
+
+        let body = RangeBody::new(path, 0, 5000, Bandwidth::unlimited(), Arc::new(|_d| {}));
+        let err = drain_body(body, Algorithm::Crc32c).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("truncated"), "diagnostic mentions truncation: {err}");
+    }
+
+    #[tokio::test]
+    async fn range_byte_stream_missing_file_yields_an_error() {
+        let path: Arc<Path> = std::path::Path::new("/no/such/file.bin").into();
+        let body = RangeBody::new(path, 0, 10, Bandwidth::unlimited(), Arc::new(|_d| {}));
+        drain_body(body, Algorithm::Crc32c).await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn range_byte_stream_poll_trailers_is_always_empty() {
+        // `poll_trailers` is on the coverage-counted side; exercise it so it is not dead-to-tests. A
+        // RangeBody carries a *precomputed* flexible-checksum header, never a trailing checksum, so it
+        // yields no trailers — `poll_trailers` must resolve immediately to `Ok(None)`.
+        use http_body::Body as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path: Arc<Path> = dir.path().join("f.bin").into();
+        std::fs::write(&path, vec![1u8; 10]).unwrap();
+
+        let mut body = RangeBody::new(path, 0, 10, Bandwidth::unlimited(), Arc::new(|_d| {}));
+        let mut pinned = Pin::new(&mut body);
+        let trailers = std::future::poll_fn(|cx| pinned.as_mut().poll_trailers(cx))
+            .await
+            .unwrap();
+        assert!(trailers.is_none(), "RangeBody yields no trailers");
     }
 
     // ---- S3Dest::build --------------------------------------------------------------------------

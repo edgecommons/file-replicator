@@ -28,7 +28,18 @@ cloudwatch = ["ggcommons/cloudwatch"]
 # credentials subsystem (base `credentials` feature — pure local vault; NOT `credentials-aws`) so an
 # egress `{"$secret":"..."}` resolves through `gg.credentials()` → `get_aws_credentials`. Joins the
 # default feature set per DESIGN §22.2 (batteries-included; immature backends stay off).
-dest-s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:base64", "ggcommons/credentials"]
+dest-s3 = [
+    "dep:aws-sdk-s3",
+    "dep:aws-config",
+    "dep:base64",
+    "dep:aws-smithy-types",
+    "dep:http-body",
+    "dep:http",
+    "dep:async-stream",
+    "dep:futures-core",
+    "dep:bytes",
+    "ggcommons/credentials",
+]
 # P5 — SFTP destination (DESIGN §10.3, §22.2). Pure-Rust SSH (`russh`/`russh-sftp` — no C toolchain),
 # so it stays Windows-clean like the rest of the P5 backends. Off by default (joins the build only when
 # asked); the ggcommons credentials subsystem resolves an optional `{"$secret":"..."}` egress override.
@@ -109,6 +120,22 @@ aws-config = { version = "1", optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
 # S3 flexible-checksum header codec (4-byte-BE CRC32C / 32-byte SHA-256 → base64).
 base64 = { version = "0.22", optional = true }
+# Streaming upload body (peak-RSS fix): `aws-sdk-s3` re-exports `aws-smithy-types` at whatever version
+# it pins, but we need `SdkBody::from_body_0_4`/`ByteStream::from_body_0_4` as *our* API surface to wrap
+# a custom range-reading `http_body::Body` — so it's a direct dep here too, with the `http-body-0-4-x`
+# feature (bridges the older `http-body` 0.4 body trait used by this SDK's HTTP stack) and `rt-tokio`
+# (path-based `ByteStream` helpers used by unit tests). `http-body`/`http` 0.4/0.2 are the exact
+# transitive versions `aws-smithy-types`'s `http-body-0-4-x` feature resolves — a direct dep on the same
+# crate+version is unified by cargo, not a second copy, so `dest/s3/mod.rs` can `impl http_body::Body`
+# for its custom range-streaming body. `async-stream`+`futures-core` build that body as an async
+# generator (`try_stream!`) over chunked `tokio::fs::File` reads instead of a hand-rolled poll state
+# machine; `bytes` is the `Body::Data` the SDK expects. All pure-Rust, Windows-clean.
+aws-smithy-types = { version = "1", features = ["http-body-0-4-x", "rt-tokio"], optional = true }
+http-body = { version = "0.4", optional = true }
+http = { version = "0.2", optional = true }
+async-stream = { version = "0.3", optional = true }
+futures-core = { version = "0.3", optional = true }
+bytes = { version = "1", optional = true }
 
 # --- P5 SFTP destination deps (optional; gated by `dest-sftp`, DESIGN §22.2) ---------------------
 # Pure-Rust SSH client + SFTP subsystem — no C toolchain, builds clean on Windows/MSVC like the rest
@@ -133,7 +160,7 @@ rustls-native-certs = { version = "0.8", optional = true }
 # --- P5 HTTP(S) destination deps (optional; gated by `dest-http`, DESIGN §22.2) ------------------
 # `default-features = false` + `rustls-tls` keeps this off OpenSSL (pure-Rust TLS, Windows/MSVC-clean
 # like the rest of this crate); resume streams a sequence of whole-chunk `Vec<u8>` bodies (mirrors
-# `dest/s3::read_range`), so no `stream`/`multipart` feature is needed.
+# `dest/s3::{hash_range,RangeBody}`), so no `stream`/`multipart` feature is needed.
 reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
 
 # --- P5 Azure Blob destination deps (optional; gated by `dest-azure`, DESIGN §22.2) --------------
@@ -158,3 +185,6 @@ tokio = { version = "1", features = ["test-util", "macros", "rt"] }
 async-trait = "0.1"
 serde_json = "1"
 tokio-util = { version = "0.7", features = ["rt"] }
+# Peak-RSS sampling for the real-S3 streaming-upload memory assertion (tests/s3_real.rs) — proves the
+# multipart body streams bounded chunks off disk instead of buffering whole parts in memory.
+sysinfo = "0.33"

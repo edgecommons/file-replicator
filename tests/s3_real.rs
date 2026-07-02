@@ -11,7 +11,8 @@
 #![cfg(feature = "dest-s3")]
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use file_replicator::config::{
     Collision, CompletionCfg, EgressCfg, MultipartCfg, OnExhausted, OnSuccess, S3Egress, Verify,
@@ -57,12 +58,24 @@ fn work_item(root: &Path, rel: &str) -> WorkItem {
     }
 }
 
+/// Real S3 has strong read-after-write consistency, but running these four `multi_thread` S3 tests plus
+/// the 25 ms RSS sampler thread all at once was observed to flake (a `HeadObject` 404 right after a
+/// successful `CompleteMultipartUpload` — a parallel-run artifact, not a production defect). Serialize
+/// the opt-in suite so each test has the endpoint to itself. The guard is acquired only *after* each
+/// test's `FR_S3_REAL_BUCKET` skip check, so the no-bucket (CI) path never contends. `tokio::sync::Mutex`
+/// (held across `.await`) rather than `std::sync::Mutex` so `clippy::await_holding_lock` stays clean.
+fn real_s3_serial() -> &'static tokio::sync::Mutex<()> {
+    static M: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    M.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_s3_checksum_verify_roundtrip() {
     let Ok(bucket) = std::env::var("FR_S3_REAL_BUCKET") else {
         eprintln!("skipping real-S3 test: set FR_S3_REAL_BUCKET to run");
         return;
     };
+    let _serial = real_s3_serial().lock().await;
     let prefix =
         std::env::var("FR_S3_REAL_PREFIX").unwrap_or_else(|_| "file-replicator-verify-test/".into());
 
@@ -105,6 +118,7 @@ async fn real_s3_worker_archives_after_checksum_verify() {
         eprintln!("skipping real-S3 worker test: set FR_S3_REAL_BUCKET to run");
         return;
     };
+    let _serial = real_s3_serial().lock().await;
     let prefix = std::env::var("FR_S3_REAL_PREFIX")
         .unwrap_or_else(|_| "file-replicator-verify-test/".into());
 
@@ -166,6 +180,7 @@ async fn real_s3_worker_multipart_archives_after_checksum_verify() {
         eprintln!("skipping real-S3 multipart test: set FR_S3_REAL_BUCKET to run");
         return;
     };
+    let _serial = real_s3_serial().lock().await;
     let prefix = std::env::var("FR_S3_REAL_PREFIX")
         .unwrap_or_else(|_| "file-replicator-verify-test/".into());
 
@@ -220,4 +235,148 @@ async fn real_s3_worker_multipart_archives_after_checksum_verify() {
     );
     assert!(!src_exists && archived, "multipart source must be archived");
     eprintln!("PASS: multipart worker archived after real-S3 checksum verify");
+}
+
+/// Peak-RSS proof that the multipart upload body streams bounded chunks off disk instead of
+/// buffering a whole part (or the whole file) in memory (the P2-review finding: "read_range buffers
+/// the whole part/small-file into memory" — measured ~500 MB peak RSS on-device for 2x1GiB @ 8x16MiB
+/// parts). A background sampler thread polls *this process's* RSS via `sysinfo` while a large
+/// multipart upload (several concurrent parts) runs against real S3, and asserts the observed peak
+/// stays well under the old whole-part-buffering bound (`part_size * max_concurrent_parts`) — if the
+/// body still materialized a whole part per in-flight task, peak RSS would sit at or above that bound;
+/// bounded-chunk streaming keeps it a small fraction of it regardless of part size/file size.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_s3_multipart_upload_peak_rss_is_bounded_not_part_buffered() {
+    let Ok(bucket) = std::env::var("FR_S3_REAL_BUCKET") else {
+        eprintln!("skipping real-S3 peak-RSS test: set FR_S3_REAL_BUCKET to run");
+        return;
+    };
+    let _serial = real_s3_serial().lock().await;
+    let prefix =
+        std::env::var("FR_S3_REAL_PREFIX").unwrap_or_else(|_| "file-replicator-verify-test/".into());
+
+    // NOTE (measurement caveat): `sysinfo` reports Windows working-set RSS, which the OS can trim under
+    // memory pressure — on a RAM-constrained host a buffering regression could be trimmed out of the
+    // working set and this probe could false-pass. It is a valid discriminator only on an un-pressured
+    // host (verified here with a large margin: tens of MiB observed vs the 128 MiB bound).
+    const PART_SIZE: u64 = 16 * 1024 * 1024; // 16 MiB
+    const CONCURRENCY: usize = 8;
+    const FILE_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB → 16 parts, 2 full concurrency rounds
+    let whole_part_buffering_bound_bytes = PART_SIZE * CONCURRENCY as u64; // 128 MiB
+
+    let src = tempfile::tempdir().unwrap();
+    let rel = "peak-rss-probe.bin";
+    write_pattern_file(&src.path().join(rel), FILE_SIZE);
+
+    let mp = MultipartCfg {
+        threshold_bytes: Some(PART_SIZE),
+        part_size_bytes: Some(PART_SIZE),
+        max_concurrent_parts: Some(CONCURRENCY),
+    };
+    let dest: SharedDestination = build_destination(
+        &EgressCfg::S3(Box::new(real_egress(&bucket, &prefix, mp))),
+        &DestDeps::default(),
+    )
+    .expect("build real S3 dest");
+    let item = work_item(src.path(), rel);
+    let bw = Bandwidth::new(
+        Arc::new(TokenBucket::unlimited()),
+        Arc::new(TokenBucket::unlimited()),
+    );
+
+    // Background sampler: refresh-and-record this process's RSS at a steady cadence for the duration
+    // of the upload. `AtomicU64` for the running max (bytes), `AtomicBool` to stop the thread once the
+    // upload (+ one final sample) completes.
+    let peak_bytes = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let sampler = {
+        let peak_bytes = peak_bytes.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+            let pid = Pid::from_u32(std::process::id());
+            let mut sys = System::new();
+            let refresh = ProcessRefreshKind::nothing().with_memory();
+            loop {
+                sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, refresh);
+                if let Some(p) = sys.process(pid) {
+                    let mem = p.memory(); // bytes (sysinfo 0.30+)
+                    peak_bytes.fetch_max(mem, Ordering::Relaxed);
+                }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        })
+    };
+
+    let delivered = dest
+        .deliver(&item, None, &ProgressSink::noop(), &bw)
+        .await
+        .expect("deliver large multipart file to real S3");
+
+    stop.store(true, Ordering::Relaxed);
+    sampler.join().expect("rss sampler thread");
+    let peak = peak_bytes.load(Ordering::Relaxed);
+    let peak_mb = peak as f64 / (1024.0 * 1024.0);
+    let bound_mb = whole_part_buffering_bound_bytes as f64 / (1024.0 * 1024.0);
+    eprintln!(
+        "PEAK RSS during {}MiB multipart upload ({}MiB parts x {} concurrency) = {peak_mb:.1} MiB \
+         (whole-part-buffering bound would be >= {bound_mb:.1} MiB)",
+        FILE_SIZE / (1024 * 1024),
+        PART_SIZE / (1024 * 1024),
+        CONCURRENCY,
+    );
+
+    // Verify + clean up regardless of the assertion outcome below (best-effort delete).
+    let vr = dest.verify(&item, &delivered, Verify::Checksum).await;
+    eprintln!("VERIFY(Checksum) => {vr:?}");
+    let key = format!("{prefix}{rel}");
+    delete_object_best_effort(&bucket, &key).await;
+    vr.expect("verify(Checksum) against REAL S3 must pass");
+
+    assert!(
+        peak > 0,
+        "sampler never observed a non-zero RSS reading; the measurement is broken, not the code"
+    );
+    assert!(
+        peak_bytes.load(Ordering::Relaxed) < whole_part_buffering_bound_bytes,
+        "peak RSS ({peak_mb:.1} MiB) must stay well under the whole-part-buffering bound \
+         ({bound_mb:.1} MiB = {}MiB part x {CONCURRENCY} concurrent) — a regression back to buffering \
+         a whole part per in-flight task would sit at or above this bound",
+        PART_SIZE / (1024 * 1024),
+    );
+    eprintln!("PASS: peak RSS {peak_mb:.1} MiB stays well under the {bound_mb:.1} MiB whole-part-buffering bound");
+}
+
+/// Write a `size`-byte file with a cheap repeating byte pattern without holding it all in memory at
+/// once (this helper itself must not defeat the point of the test it sets up for).
+fn write_pattern_file(path: &Path, size: u64) {
+    use std::io::Write;
+    const CHUNK: usize = 1024 * 1024;
+    let pattern: Vec<u8> = (0..CHUNK).map(|i| (i % 251) as u8).collect();
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+    let mut written = 0u64;
+    while written < size {
+        let want = ((size - written) as usize).min(CHUNK);
+        f.write_all(&pattern[..want]).unwrap();
+        written += want as u64;
+    }
+    f.flush().unwrap();
+}
+
+/// Best-effort `DeleteObject` cleanup so the RSS test doesn't leave the probe object behind under
+/// `file-replicator-verify-test/` (mirrors the ambient-credential-chain client build the other tests
+/// use via [`build_destination`], but this test needs the raw SDK client for a delete call the
+/// `Destination` trait doesn't expose).
+async fn delete_object_best_effort(bucket: &str, key: &str) {
+    let sdk = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_sdk_s3::config::Region::new("us-east-1"))
+        .load()
+        .await;
+    let client = aws_sdk_s3::Client::new(&sdk);
+    if let Err(e) = client.delete_object().bucket(bucket).key(key).send().await {
+        eprintln!("WARN: cleanup delete_object({bucket}/{key}) failed (non-fatal): {e:?}");
+    }
 }

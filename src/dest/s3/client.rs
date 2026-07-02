@@ -12,9 +12,10 @@
 //! restart-on-`NoSuchUpload`), the lazy client builder ([`S3Dest::s3`]), and the
 //! `impl Destination for S3Dest` delegation glue all live here so [`super::S3Dest`] stays on the
 //! coverage-counted side with only pure/decision logic. Helpers this file calls (`plan_upload`,
-//! `object_key`, `read_range`, `checksum_to_b64`, `S3ResumeToken`, `classify_s3`,
+//! `object_key`, `hash_range`, `RangeBody`, `checksum_to_b64`, `S3ResumeToken`, `classify_s3`,
 //! `compare_object_checksum`, `build_handle`) are the unit-tested pure functions in [`super`].
 
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -22,7 +23,7 @@ use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::primitives::{ByteStream, SdkBody};
 use aws_sdk_s3::types::{
     ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart, ServerSideEncryption,
     StorageClass,
@@ -38,10 +39,37 @@ use crate::integrity::Algorithm;
 use crate::ratelimit::Bandwidth;
 
 use super::{
-    build_handle, checksum_to_b64, classify_s3, compare_object_checksum, handle_key,
-    handle_s3_checksum, missing_parts, object_key, part_len, plan_upload, read_range, S3ClientParams,
-    S3CompletedPart, S3Dest, S3ResumeToken, UploadPlan,
+    build_handle, checksum_to_b64, classify_s3, compare_object_checksum, hash_range, handle_key,
+    handle_s3_checksum, missing_parts, object_key, part_len, plan_upload, source_changed, RangeBody,
+    S3ClientParams, S3CompletedPart, S3Dest, S3ResumeToken, UploadPlan,
 };
+
+/// Wrap a range of `path` into a retryable, streamed `ByteStream` for `PutObject`/`UploadPart`: a
+/// fresh [`RangeBody`] (re-opens + re-seeks the file) is built each time the SDK needs to (re)send the
+/// body — the first send, or an SDK-internal retry of a transient failure. Bounded chunk memory (no
+/// whole-part `Vec`, DESIGN NFR-3); throttle + progress run once per actual byte send. An SDK-internal
+/// retry rebuilds the body and re-throttles/re-reports the resent bytes: re-throttling is correct
+/// (those bytes really are sent again), and re-reporting cannot overshoot because the caller's
+/// `on_progress` clamps the running total to the object/part size (so progress is bounded to 100%
+/// even across retries). This retry-rebuild path is not unit-testable here (it needs a live SDK
+/// transient), but the clamp makes its only observable effect a bounded no-op.
+fn streaming_body(
+    path: Arc<Path>,
+    offset: u64,
+    len: u64,
+    bw: Bandwidth,
+    on_progress: Arc<dyn Fn(u64) + Send + Sync>,
+) -> ByteStream {
+    ByteStream::new(SdkBody::retryable(move || {
+        SdkBody::from_body_0_4(RangeBody::new(
+            path.clone(),
+            offset,
+            len,
+            bw.clone(),
+            on_progress.clone(),
+        ))
+    }))
+}
 
 // ---- lazy client + trait glue -------------------------------------------------------------------
 
@@ -149,7 +177,9 @@ pub(super) async fn deliver(
     let key = object_key(&dest.prefix, &item.relpath);
 
     match plan_upload(size, &dest.multipart) {
-        UploadPlan::Single => put_single(dest, client, item, &key, size, progress, bw).await,
+        UploadPlan::Single => {
+            put_single(dest, client, item, &key, size, mtime_ms, progress, bw).await
+        }
         UploadPlan::Multipart {
             part_size,
             num_parts,
@@ -172,36 +202,45 @@ fn file_mtime_ms(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-/// Single `PutObject` with a precomputed flexible checksum (one streaming read pass, DESIGN §11.4).
+/// Single `PutObject` with a precomputed flexible checksum. Two disk passes over the same range: pass 1
+/// ([`hash_range`]) computes the flexible-checksum header that must precede the body; pass 2 (a streamed
+/// [`RangeBody`]) is the throttled/progress-reported egress. This doubles the source read versus the old
+/// whole-range `Vec` buffer — the deliberate memory-for-I/O tradeoff that bounds peak transfer RSS to a
+/// single [`READ_CHUNK`](super) regardless of file size (DESIGN §11.4/NFR-3). Because the two passes are
+/// independent reads, a post-send size+mtime re-check ([`source_changed`]) rejects a source mutated
+/// mid-upload (`Transient` → re-plan) so the stored object can never silently desync from the sent
+/// checksum.
+#[allow(clippy::too_many_arguments)]
 async fn put_single(
     dest: &S3Dest,
     client: &Client,
     item: &WorkItem,
     key: &str,
     size: u64,
+    mtime_ms: i64,
     progress: &ProgressSink,
     bw: &Bandwidth,
 ) -> Result<Delivered> {
-    let total = Arc::new(AtomicU64::new(0));
-    let buf;
-    let checksum;
-    {
-        let t = total.clone();
-        let p = progress.clone();
-        let (b, c) = read_range(&item.abs_source, 0, size, bw, dest.algo, &move |d| {
-            p.report(t.fetch_add(d, Ordering::Relaxed) + d);
-        })
-        .await?;
-        buf = b;
-        checksum = c;
-    }
-
+    // Pass 1 (local disk, no throttle/no progress): precompute the flexible-checksum header that must
+    // precede the body. Pass 2 (below) is the throttled/progress-reported streamed send.
+    let checksum = hash_range(&item.abs_source, 0, size, dest.algo).await?;
     let ck_b64 = checksum_to_b64(&checksum);
-    let mut req = client
-        .put_object()
-        .bucket(&dest.bucket)
-        .key(key)
-        .body(ByteStream::from(buf));
+
+    let path: Arc<Path> = item.abs_source.clone().into();
+    let total = Arc::new(AtomicU64::new(0));
+    let p = progress.clone();
+    let body = streaming_body(
+        path,
+        0,
+        size,
+        bw.clone(),
+        Arc::new(move |d| {
+            // Clamp to `size`: an SDK-internal retry rebuilds the body and re-reports its bytes, which
+            // would otherwise push the reported running total past 100% (see `streaming_body`).
+            p.report((total.fetch_add(d, Ordering::Relaxed) + d).min(size));
+        }),
+    );
+    let mut req = client.put_object().bucket(&dest.bucket).key(key).body(body);
     if let Some(b64) = &ck_b64 {
         req = match dest.algo {
             Algorithm::Crc32c => req.checksum_crc32_c(b64),
@@ -236,6 +275,20 @@ async fn put_single(
     // Server-side echo must match what we computed (defence in depth over TLS).
     if let (Some(local), Some(remote)) = (&ck_b64, &obj_ck) {
         compare_object_checksum(local, remote)?;
+    }
+    // The object is stored. Because the checksum (pass 1) and the streamed body (pass 2) are two
+    // independent disk reads, re-stat the source: a same-length OR resized in-place rewrite during the
+    // (throttled) send desyncs the stored bytes from the sent checksum. A checksum-validating endpoint
+    // already rejected such a send (BadDigest → transient); this additionally covers non-validating
+    // S3-compatible endpoints (MinIO/floci) whose verify downgrades to size-only. Transient → the next
+    // attempt re-hashes the now-stable bytes and overwrites the object (self-heals, DESIGN §11.4/§13.2).
+    let after = tokio::fs::metadata(&item.abs_source)
+        .await
+        .map_err(ReplError::classify_io)?;
+    if source_changed(size, mtime_ms, after.len(), file_mtime_ms(&after)) {
+        return Err(ReplError::Transient(format!(
+            "s3 source changed during upload of {key}; re-planning against the current bytes"
+        )));
     }
     let handle = build_handle(key, obj_ck.as_deref().or(ck_b64.as_deref()), dest.algo, false);
     Ok(Delivered {
@@ -411,7 +464,7 @@ async fn run_multipart_attempt(
             let bucket = dest.bucket.clone();
             let key = key.to_string();
             let upload_id = token.upload_id.clone();
-            let path = item.abs_source.clone();
+            let path: Arc<Path> = item.abs_source.clone().into();
             let algo = dest.algo;
             let bw = bw.clone();
             let progress = progress.clone();
@@ -422,23 +475,33 @@ async fn run_multipart_attempt(
             let relpath = item.relpath.clone();
 
             set.spawn(async move {
-                let (buf, part_ck) = {
-                    let t = total.clone();
-                    let p = progress.clone();
-                    read_range(&path, offset, len, &bw, algo, &move |d| {
-                        p.report(t.fetch_add(d, Ordering::Relaxed) + d);
-                    })
+                // Pass 1 (local disk, no throttle/no progress): precompute the part's checksum header.
+                let part_ck = hash_range(&path, offset, len, algo)
                     .await
-                    .map_err(MpuError::Fatal)?
-                };
+                    .map_err(MpuError::Fatal)?;
                 let b64 = checksum_to_b64(&part_ck);
+                // Pass 2: the throttled/progress-reported streamed send.
+                let t = total.clone();
+                let p = progress.clone();
+                let body = streaming_body(
+                    path.clone(),
+                    offset,
+                    len,
+                    bw.clone(),
+                    Arc::new(move |d| {
+                        // Clamp to the object size (the shared accumulator is committed + streamed
+                        // across all concurrent parts): an SDK-internal retry re-reports a part's bytes,
+                        // which would otherwise push the reported total past 100% (see `streaming_body`).
+                        p.report((t.fetch_add(d, Ordering::Relaxed) + d).min(size));
+                    }),
+                );
                 let mut req = client
                     .upload_part()
                     .bucket(&bucket)
                     .key(&key)
                     .upload_id(&upload_id)
                     .part_number(part_number as i32)
-                    .body(ByteStream::from(buf));
+                    .body(body);
                 if let Some(b) = &b64 {
                     req = match algo {
                         Algorithm::Crc32c => req.checksum_crc32_c(b),
@@ -544,6 +607,20 @@ async fn run_multipart_attempt(
         Err(e) if is_no_such_upload(&e) => return Err(MpuError::Gone),
         Err(e) => return Err(MpuError::Fatal(map_sdk(e))),
     };
+
+    // Same source-stability re-check as the single-PUT path: each part's checksum header was computed
+    // in a pass separate from that part's streamed body, so a source rewritten mid-upload leaves the
+    // assembled object desynced from those checksums (invisible to a size-only verify on a non-validating
+    // endpoint). Transient → the next attempt sees a changed mtime, discards the resume token, and
+    // re-uploads a fresh, consistent object (DESIGN §11.4/§13.2).
+    let after = tokio::fs::metadata(&item.abs_source)
+        .await
+        .map_err(|e| MpuError::Fatal(ReplError::classify_io(e)))?;
+    if source_changed(size, mtime_ms, after.len(), file_mtime_ms(&after)) {
+        return Err(MpuError::Fatal(ReplError::Transient(format!(
+            "s3 source changed during multipart upload of {key}; re-planning"
+        ))));
+    }
 
     let obj_ck = response_checksum(dest.algo, resp.checksum_crc32_c(), resp.checksum_sha256());
     let handle = build_handle(key, obj_ck.as_deref(), dest.algo, true);

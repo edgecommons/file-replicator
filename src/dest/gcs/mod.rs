@@ -60,7 +60,7 @@
 //! ## Where the code lives (coverage seam, NFR-2)
 //! Everything in **this file** is pure decision logic (object-path mapping, chunk-size/range math,
 //! credential selection, resume bookkeeping, error classification, range-header parsing) plus the
-//! streaming *local* file read (no network — mirrors `dest/s3::read_range`/`dest/azure`'s equivalent) —
+//! streaming *local* file read (no network — mirrors `dest/s3::{hash_range,RangeBody}`/`dest/azure`'s equivalent) —
 //! all unit-tested with no network. Every line that opens an HTTP connection to GCS or the fake-gcs-
 //! server lives in [`client`], excluded from the coverage gate (mirrors `dest/{s3,sftp,ftps,http,azure}/
 //! client.rs`). The self-skipping integration test (`tests/gcs_fakegcs.rs`) exercises it live against
@@ -340,7 +340,7 @@ pub fn classify_gcs(status: Option<u16>, transport: bool) -> ReplError {
 
 /// Read `len` bytes from `path` starting at `offset` into memory, throttling every chunk through the
 /// bandwidth governor and reporting the **delta** of each chunk via `on_progress` (mirrors
-/// `dest/s3::read_range`/`dest/azure::read_source_range`). The in-memory buffer is bounded by `len`
+/// `dest/s3::{hash_range,RangeBody}`/`dest/azure::read_source_range`). The in-memory buffer is bounded by `len`
 /// (≤ the resolved chunk size).
 pub async fn read_source_range(
     path: &Path,

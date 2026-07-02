@@ -38,7 +38,7 @@
 //! ## Where the code lives (coverage seam, NFR-2)
 //! Everything in **this file** is pure decision logic (URL/path mapping, method/auth/resume
 //! bookkeeping, chunk-range math, error classification) plus the streaming *local* file read (no
-//! network — mirrors `dest/s3::read_range`) — all unit-tested with no network. Every line that opens
+//! network — mirrors `dest/s3::{hash_range,RangeBody}`) — all unit-tested with no network. Every line that opens
 //! an HTTP connection or sends a request lives in [`client`], excluded from the coverage gate (mirrors
 //! `dest/{s3,sftp,ftps}/{mod.rs,client.rs}`). The in-process integration test (`tests/http_inprocess.rs`)
 //! always runs (no simulator container to skip), exercising `client.rs` live end to end.
@@ -329,8 +329,8 @@ pub fn classify_http(status: Option<u16>, transport: bool) -> ReplError {
 
 /// Read `len` bytes from `path` starting at `offset` into memory, throttling every chunk through the
 /// bandwidth governor and reporting the **delta** of each chunk via `on_progress`. This is the local
-/// half of a chunk send (no network — mirrors `dest/s3::read_range` minus the inline checksum, since
-/// the caller folds the bytes into a whole-file [`Hasher`] that must also see the resumed prefix, see
+/// half of a chunk send (no network — mirrors `dest/s3::RangeBody`, which likewise streams bytes
+/// without hashing, since the caller folds the bytes into a whole-file [`Hasher`] that must also see the resumed prefix, see
 /// [`hash_local_prefix`]). The in-memory buffer is bounded by `len` (≤ `egress.chunkBytes`).
 pub async fn read_source_range(
     path: &Path,

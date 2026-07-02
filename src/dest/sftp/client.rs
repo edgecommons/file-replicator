@@ -343,7 +343,7 @@ async fn deliver(
 
     if total != size {
         // The source shrank/grew mid-transfer (metadata read at the start vs. what was actually
-        // streamed). Same anti-truncation guard as `s3::read_range`: fail transient so the next
+        // streamed). Same anti-truncation guard as `s3::hash_range`/`RangeBody`: fail transient so the next
         // attempt re-plans against the current size rather than publishing a short/long object.
         return Err(ReplError::Transient(format!(
             "sftp source size changed during transfer: expected {size}, streamed {total}"
