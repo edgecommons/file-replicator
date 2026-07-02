@@ -36,8 +36,18 @@ The component owns the `component` section (`component.global` + `component.inst
 | `path` | string | *(required)* | Source directory. |
 | `recursive` | bool | `false` | Watch the whole tree; preserve subtree at destination. |
 | `include` / `exclude` | string[] | `[]` | Globs, matched against the source-relative path. |
-| `rescanSecs` | int | — | Reconciliation rescan interval. |
+| `rescanSecs` | int | `30` | Reconciliation-rescan interval — the **fallback** discovery path (see note). |
 | `readiness` | object | `{ "strategy": "stability", "quietSecs": 5 }` | `stability` \| `marker` \| `rename` \| `glob`. |
+
+> **Discovery latency & degraded mode.** Files are discovered by an OS file watch (low-latency) *and* the
+> periodic `rescanSecs` rescan (fallback). Normally the watch drives discovery and ready latency is
+> ≈ `quietSecs` (a second or two), regardless of `rescanSecs`. If the watch can't be established or misses an
+> event — common on **network filesystems (NFS/SMB), container bind-mounts/overlay volumes, and FUSE** — the
+> instance logs a warning and falls back to the rescan: no file is lost, but discovery can take up to
+> `rescanSecs`. On such filesystems, **lower `rescanSecs`** to bound worst-case latency (the rescan is a cheap
+> directory walk); raise it only on very large/slow spools. The startup log says which mode you're in
+> (`OS file watch active` vs `… using periodic rescan only`). See
+> [Explanation › Discovery](../explanation.md).
 
 ### `egress` (item)
 `type` selects the backend: `local` \| `s3` (modeled) \| `sftp` \| `ftps` \| `http` \| `azure` \| `gcs`
