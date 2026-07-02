@@ -132,6 +132,23 @@ impl StabilityTracker {
     pub fn tracked(&self) -> usize {
         self.seen.len()
     }
+
+    /// The shortest time until any tracked-but-not-yet-stable file will satisfy the quiet window —
+    /// i.e. when a follow-up observation should be taken to (potentially) promote it to ready.
+    /// `None` when nothing is mid-window. The engine self-schedules a near-term re-check off this
+    /// after an OS-watch nudge: a finished file emits no further watch events, so its
+    /// stability-confirming observation would otherwise only land on the next periodic rescan
+    /// (making the OS watch useless for the default strategy — discovery latency ≈ `rescanSecs`).
+    pub fn pending_recheck(&self) -> Option<Duration> {
+        let now = self.clock.now();
+        self.seen
+            .values()
+            .filter_map(|e| {
+                let ready_at = e.since.checked_add(self.quiet)?;
+                (ready_at > now).then(|| ready_at.saturating_duration_since(now))
+            })
+            .min()
+    }
 }
 
 /// The companion marker path for `file` given a `suffix` (e.g. `a.csv` + `.done` → `a.csv.done`).
@@ -239,6 +256,16 @@ impl ReadyStrategy {
         }
     }
 
+    /// Delay until a mid-stability-window file should be re-observed (see
+    /// [`StabilityTracker::pending_recheck`]). Only the time-based `stability` strategy needs this:
+    /// `marker`/`rename`/`glob` all become ready on a filesystem event that itself nudges the watcher.
+    pub fn pending_recheck(&self) -> Option<Duration> {
+        match self {
+            ReadyStrategy::Stability(t) => t.pending_recheck(),
+            _ => None,
+        }
+    }
+
     /// Evaluate readiness for `path` using `probe`. `exclude` gates the glob strategy (temp files).
     pub fn is_ready(
         &mut self,
@@ -324,6 +351,30 @@ mod tests {
         assert!(!t.observe(p, Observation { size: 20, mtime_ms: 2 }), "only 4s since reset");
         clock.advance(Duration::from_secs(1));
         assert!(t.observe(p, Observation { size: 20, mtime_ms: 2 }));
+    }
+
+    #[test]
+    fn pending_recheck_tracks_the_stability_window() {
+        let clock = Arc::new(ManualClock::new());
+        let mut t = StabilityTracker::new(Duration::from_secs(5), clock.clone());
+        // Nothing tracked yet → no re-check scheduled.
+        assert_eq!(t.pending_recheck(), None);
+        // First sighting → pending; a follow-up observation is due in the full quiet window.
+        let p = Path::new("a.bin");
+        let obs = Observation {
+            size: 10,
+            mtime_ms: 1,
+        };
+        assert!(!t.observe(p, obs));
+        assert_eq!(t.pending_recheck(), Some(Duration::from_secs(5)));
+        // Part-way through the window → recheck due for the remaining time only.
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(t.pending_recheck(), Some(Duration::from_secs(3)));
+        // Once the window elapses and the file is confirmed ready, it is no longer pending — so the
+        // engine stops self-scheduling re-checks (no busy loop after a file settles).
+        clock.advance(Duration::from_secs(3));
+        assert!(t.observe(p, obs));
+        assert_eq!(t.pending_recheck(), None);
     }
 
     #[test]

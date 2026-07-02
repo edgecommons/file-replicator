@@ -775,6 +775,18 @@ impl Instance {
         self.tick(now_ms()).await; // initial sweep
 
         loop {
+            // If any file is mid-stability-window, self-schedule a near-term re-observation rather than
+            // waiting out the full reconciliation rescan. A finished file emits NO further OS-watch
+            // nudge, so its stability-confirming (2nd) observation would otherwise only land on the next
+            // periodic rescan — collapsing discovery latency to `rescanSecs` and rendering the OS watch
+            // useless for the default `stability` strategy. Clamped ≥100ms so a file right at its
+            // boundary can't spin the loop, and ≤`rescan` so it never delays past the fallback.
+            let recheck = self
+                .watcher
+                .lock()
+                .expect("watcher mutex")
+                .pending_recheck()
+                .map(|d| d.clamp(Duration::from_millis(100), self.rescan));
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = ticker.tick() => self.tick(now_ms()).await,
@@ -785,6 +797,8 @@ impl Instance {
                 // `rescan` seconds late. Immediate mode's `next_wake` is always `None`, so this branch
                 // degrades to the harmless 24h fallback and never fires meaningfully.
                 _ = tokio::time::sleep(self.sched_wake_delay()) => self.tick(now_ms()).await,
+                // The stability re-check (above): only armed while a file is mid-window.
+                _ = tokio::time::sleep(recheck.unwrap_or(self.rescan)), if recheck.is_some() => self.tick(now_ms()).await,
             }
         }
         tracing::info!(instance = %self.id, "instance stopped (durable state checkpointed)");
@@ -822,10 +836,20 @@ impl Instance {
         } else {
             RecursiveMode::NonRecursive
         };
+        let watch_id = self.id.clone();
         let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if res.is_ok() {
-                // Coalesce: a full channel already has a pending nudge, so a drop is harmless.
-                let _ = nudge_tx.try_send(());
+            match res {
+                // Any change nudges a tick; coalesced (a full channel already has a pending nudge, so
+                // a dropped send is harmless — the tick re-scans everything).
+                Ok(_) => {
+                    let _ = nudge_tx.try_send(());
+                }
+                // Surface watch errors (e.g. inotify queue overflow) instead of silently dropping them:
+                // the periodic rescan still guarantees correctness, but an operator should see that the
+                // low-latency watch has degraded.
+                Err(e) => {
+                    tracing::warn!(instance = %watch_id, error = %e, "OS file watch event error")
+                }
             }
         }) {
             Ok(w) => w,
@@ -838,6 +862,7 @@ impl Instance {
             tracing::warn!(instance = %self.id, error = %e, "OS file watch failed; using periodic rescan only");
             return None;
         }
+        tracing::info!(instance = %self.id, path = %root.display(), "OS file watch active");
         Some(watcher)
     }
 }

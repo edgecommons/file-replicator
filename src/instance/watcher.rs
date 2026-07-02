@@ -161,6 +161,14 @@ impl Watcher {
         self.recursive
     }
 
+    /// Delay until a file currently inside its stability window is due for a follow-up observation,
+    /// or `None` when nothing is pending. The run loop self-schedules a near-term re-check off this so
+    /// OS-watch-discovered files don't wait out the full reconciliation rescan (see
+    /// [`crate::readiness::StabilityTracker::pending_recheck`]).
+    pub fn pending_recheck(&self) -> Option<std::time::Duration> {
+        self.strategy.pending_recheck()
+    }
+
     /// Scan the tree and return the candidates judged **ready** by the configured strategy. Candidates
     /// whose readiness probe errors (e.g. the file vanished between scan and probe) are skipped.
     pub fn discover(&mut self, probe: &dyn ReadinessProbe) -> Vec<Candidate> {
