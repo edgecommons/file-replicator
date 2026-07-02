@@ -18,6 +18,15 @@ pub enum ReplError {
     /// Auth denied / no-such-target / precondition / config — fail fast to `Exhausted` (DESIGN §13.4).
     #[error("permanent: {0}")]
     Permanent(String),
+    /// Permission/access denied — a *permanent* failure (fail fast, exactly like [`Permanent`](Self::Permanent))
+    /// that ALSO drives the Feature A egress permission dedup-log + `PermissionDenied` event
+    /// (`src/permission.rs`). Split out from `Permanent` so the worker can detect a permission denial by
+    /// **classification** (see [`is_permission_denied`](Self::is_permission_denied)) rather than by
+    /// inspecting a raw [`Io`](Self::Io) kind: every shipping backend funnels its `io::Error`s through
+    /// [`classify_io`](Self::classify_io) / `classify_sftp`, which collapse the `io::ErrorKind` into a
+    /// string, so a raw `Io(PermissionDenied)` never actually reaches the worker in production.
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
     /// Checksum / size mismatch — retriable, but counted separately for diagnostics.
     #[error("integrity: {0}")]
     Integrity(String),
@@ -46,7 +55,7 @@ impl ReplError {
         match self {
             ReplError::Transient(_) | ReplError::Integrity(_) => true,
             ReplError::Io(e) => !Self::io_kind_is_permanent(e.kind()),
-            ReplError::Permanent(_) | ReplError::State(_) => false,
+            ReplError::Permanent(_) | ReplError::PermissionDenied(_) | ReplError::State(_) => false,
         }
     }
 
@@ -57,19 +66,38 @@ impl ReplError {
     /// is an engine-level fault handled out of band, not a per-item retry/exhaust decision.
     pub fn is_permanent(&self) -> bool {
         match self {
-            ReplError::Permanent(_) => true,
+            ReplError::Permanent(_) | ReplError::PermissionDenied(_) => true,
             ReplError::Io(e) => Self::io_kind_is_permanent(e.kind()),
             ReplError::Transient(_) | ReplError::Integrity(_) | ReplError::State(_) => false,
         }
     }
 
-    /// Map a raw [`io::Error`] to a classified [`ReplError`]: `NotFound` / `PermissionDenied`
-    /// become [`Permanent`](Self::Permanent); everything else is treated as [`Transient`](Self::Transient).
+    /// True when this error represents a **permission/access denial**, whether it was classified into the
+    /// dedicated [`PermissionDenied`](Self::PermissionDenied) variant (the production path — every
+    /// shipping backend routes its io errors through [`classify_io`](Self::classify_io) / `classify_sftp`)
+    /// or is still a raw [`Io`](Self::Io) whose kind is `PermissionDenied` (the injection-seam path a
+    /// fake destination uses in tests). The worker keys the Feature A egress dedup-log + `PermissionDenied`
+    /// event off THIS, not off the raw `Io` variant — which no real destination ever surfaces, so matching
+    /// on it directly (as the first cut did) was dead code in production.
+    pub fn is_permission_denied(&self) -> bool {
+        match self {
+            ReplError::PermissionDenied(_) => true,
+            ReplError::Io(e) => e.kind() == io::ErrorKind::PermissionDenied,
+            _ => false,
+        }
+    }
+
+    /// Map a raw [`io::Error`] to a classified [`ReplError`]: `PermissionDenied` becomes the dedicated
+    /// [`PermissionDenied`](Self::PermissionDenied) variant (so the worker's Feature A egress dedup-log +
+    /// event actually fire — it is still *permanent* for the retry engine), `NotFound` becomes
+    /// [`Permanent`](Self::Permanent), and everything else is treated as [`Transient`](Self::Transient).
     pub fn classify_io(e: io::Error) -> Self {
-        if Self::io_kind_is_permanent(e.kind()) {
-            ReplError::Permanent(format!("io: {e} ({:?})", e.kind()))
-        } else {
-            ReplError::Transient(format!("io: {e} ({:?})", e.kind()))
+        match e.kind() {
+            io::ErrorKind::PermissionDenied => {
+                ReplError::PermissionDenied(format!("io: {e} ({:?})", e.kind()))
+            }
+            io::ErrorKind::NotFound => ReplError::Permanent(format!("io: {e} ({:?})", e.kind())),
+            _ => ReplError::Transient(format!("io: {e} ({:?})", e.kind())),
         }
     }
 
@@ -123,6 +151,31 @@ mod tests {
     }
 
     #[test]
+    fn classify_io_permission_denied_maps_to_the_permission_denied_variant() {
+        // The production path: a real backend's permission error is routed through `classify_io`, which
+        // must yield the dedicated `PermissionDenied` variant so the worker's Feature A egress dedup-log
+        // + event fire (matching on the raw `Io` variant, as the first cut did, was dead code — no
+        // shipping destination returns `Io`).
+        let e = ReplError::classify_io(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
+        assert!(matches!(e, ReplError::PermissionDenied(_)), "got {e:?}");
+        assert!(e.is_permission_denied());
+        assert!(e.is_permanent(), "still fail-fast for the retry engine");
+        assert!(!e.is_transient());
+    }
+
+    #[test]
+    fn is_permission_denied_covers_the_raw_io_injection_seam_and_rejects_others() {
+        // A fake destination (tests) injects the raw `Io(PermissionDenied)` variant — still detected.
+        let raw: ReplError = io::Error::new(io::ErrorKind::PermissionDenied, "no").into();
+        assert!(raw.is_permission_denied());
+        // Everything that is NOT a permission denial is rejected — including a `NotFound` (which
+        // `classify_io` maps to plain `Permanent`) and an unrelated permanent/transient error.
+        assert!(!ReplError::classify_io(io::Error::new(io::ErrorKind::NotFound, "gone")).is_permission_denied());
+        assert!(!ReplError::Permanent("nope".into()).is_permission_denied());
+        assert!(!ReplError::Transient("later".into()).is_permission_denied());
+    }
+
+    #[test]
     fn classify_io_timeout_is_transient() {
         let e = ReplError::classify_io(io::Error::new(io::ErrorKind::TimedOut, "slow"));
         assert!(e.is_transient());
@@ -152,6 +205,7 @@ mod tests {
     fn display_has_prefix() {
         assert_eq!(ReplError::Transient("boom".into()).to_string(), "transient: boom");
         assert_eq!(ReplError::Permanent("nope".into()).to_string(), "permanent: nope");
+        assert_eq!(ReplError::PermissionDenied("no".into()).to_string(), "permission denied: no");
         assert_eq!(ReplError::Integrity("bad".into()).to_string(), "integrity: bad");
         assert_eq!(ReplError::State("db".into()).to_string(), "state: db");
     }

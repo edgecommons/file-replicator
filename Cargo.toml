@@ -180,6 +180,11 @@ futures = { version = "0.3", optional = true }
 tempfile = "3"
 # `test-util` enables paused-time tests (deterministic bandwidth-throttle assertions, no real sleeps).
 tokio = { version = "1", features = ["test-util", "macros", "rt"] }
+# Manual-poll future driving (no full task/scheduler needed) for the `PriorityGate` cancellation-safety
+# / grant-then-cancel-redistribution unit tests (`src/admission.rs`), where the exact interleaving of
+# "polled to Pending" -> "release_one hands off" -> "future dropped before consuming the grant" must be
+# deterministic rather than timing-dependent.
+tokio-test = "0.4"
 # Integration tests (`tests/`) implement a fake/failing `Destination` (async-trait), read the
 # quarantine `.error.json` sidecar (serde_json), and drive `Instance::run` (CancellationToken).
 async-trait = "0.1"

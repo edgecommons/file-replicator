@@ -382,6 +382,12 @@ pub fn classify_sftp(kind: &str, transport: bool) -> ReplError {
     if transport {
         return ReplError::Transient(format!("sftp transport failure ({kind})"));
     }
+    // A `permission_denied` SFTP status is permanent AND must drive the Feature A egress permission
+    // dedup-log + `PermissionDenied` event (`src/permission.rs`) — so it gets the dedicated variant the
+    // worker keys off, not plain `Permanent` (which would only ever surface as `RetriesExhausted`).
+    if kind == "permission_denied" {
+        return ReplError::PermissionDenied(format!("sftp error: {kind}"));
+    }
     if is_permanent_kind(kind) {
         return ReplError::Permanent(format!("sftp error: {kind}"));
     }
@@ -615,6 +621,18 @@ mod tests {
         for k in ["auth", "permission_denied", "host_key_mismatch", "no_such_file", "bad_message", "op_unsupported"] {
             assert!(classify_sftp(k, false).is_permanent(), "{k} should be permanent");
         }
+    }
+
+    #[test]
+    fn classify_permission_denied_is_the_permission_denied_variant() {
+        // A `permission_denied` status must be detectable as a permission denial (Feature A egress
+        // event), not just "some permanent error" — distinct from `auth`/`no_such_file`, which stay
+        // plain `Permanent`.
+        let e = classify_sftp("permission_denied", false);
+        assert!(e.is_permission_denied(), "drives the egress PermissionDenied event");
+        assert!(e.is_permanent());
+        assert!(!classify_sftp("auth", false).is_permission_denied());
+        assert!(!classify_sftp("no_such_file", false).is_permission_denied());
     }
 
     #[test]

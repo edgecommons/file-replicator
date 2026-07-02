@@ -22,9 +22,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use file_replicator::admission::PriorityGate;
 use file_replicator::config::{
     CompletionCfg, EgressCfg, GlobReadiness, GlobalCfg, IngressCfg, InstanceCfg, LimitsCfg,
     LocalEgress, OnExhausted, OnSuccess, ReadinessCfg, RetryCfg, ScheduleCfg, Verify,
@@ -69,6 +69,8 @@ fn local_cfg(id: &str, src: &Path, dst: &Path, completion: CompletionCfg) -> Ins
         retry: None,
         limits: None,
         topics: None,
+        on_permission_error: None,
+        priority: 100,
     }
 }
 
@@ -83,7 +85,7 @@ fn build(cfg: InstanceCfg, store: Arc<dyn StateStore>) -> Instance {
         cfg,
         &GlobalCfg::default(),
         store,
-        Arc::new(Semaphore::new(16)),
+        Arc::new(PriorityGate::new(16)),
         Arc::new(TokenBucket::unlimited()),
         None,
         &DestDeps::default(),
@@ -432,6 +434,8 @@ async fn failed_delivery_retries_then_quarantines_while_other_instance_unaffecte
         }),
         limits: None,
         topics: None,
+        on_permission_error: None,
+        priority: 100,
     };
     cfg_a.completion.on_success = OnSuccess::Delete;
 
@@ -442,7 +446,7 @@ async fn failed_delivery_retries_then_quarantines_while_other_instance_unaffecte
         cfg_a,
         &GlobalCfg::default(),
         store.clone(),
-        Arc::new(Semaphore::new(16)),
+        Arc::new(PriorityGate::new(16)),
         Arc::new(TokenBucket::unlimited()),
         None,
         dest_a,
@@ -642,7 +646,7 @@ async fn per_instance_bandwidth_cap_enforces_minimum_transfer_time() {
 /// across instances, not merely per-instance.
 #[tokio::test]
 async fn global_bandwidth_cap_is_shared_across_instances() {
-    let global_sem = Arc::new(Semaphore::new(16));
+    let global_gate = Arc::new(PriorityGate::new(16));
     // 2000 B/s shared; per-instance buckets are unlimited so only the global cap can throttle.
     let global_bw = Arc::new(TokenBucket::new(
         parse_byte_rate("2000").unwrap(),
@@ -664,7 +668,7 @@ async fn global_bandwidth_cap_is_shared_across_instances() {
             cfg,
             &GlobalCfg::default(),
             store.clone(),
-            global_sem.clone(),
+            global_gate.clone(),
             global_bw.clone(),
             None,
             &DestDeps::default(),
@@ -727,6 +731,8 @@ async fn completion_does_not_fire_when_verify_fails() {
         }),
         limits: None,
         topics: None,
+        on_permission_error: None,
+        priority: 100,
     };
     let dest = Arc::new(VerifyFailingDest::new(dst.path()));
     let calls = dest.deliver_calls.clone();
@@ -736,7 +742,7 @@ async fn completion_does_not_fire_when_verify_fails() {
         cfg,
         &GlobalCfg::default(),
         store.clone(),
-        Arc::new(Semaphore::new(16)),
+        Arc::new(PriorityGate::new(16)),
         Arc::new(TokenBucket::unlimited()),
         None,
         dest,

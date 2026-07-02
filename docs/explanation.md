@@ -68,6 +68,88 @@ Retries are **time-governed** (`giveUpAfter`, default 7 days) rather than attemp
 from persisted checkpoints, and a **disconnection circuit-breaker** avoids a reconnect thundering-herd —
 so a multi-hour to ~2-day outage is tolerated without loss. (DESIGN §13.4.)
 
+## Cross-instance priority
+Every instance shares two process-wide governors (DESIGN §8.3): the global bandwidth token bucket, and
+the global concurrency cap (`component.global.limits.maxConcurrentFiles`, default 64) that bounds
+in-flight *files* across ALL instances at once. Under light load neither governor matters — every
+instance simply gets a slot/bytes as it asks. Under **contention** for the global concurrency cap
+(more instances trying to transfer than there are free slots), each instance's `priority` (default
+`100`; lower = higher priority, the same convention used elsewhere in the config) decides who is
+admitted first: the queued waiter with the lowest `priority` number goes first, and waiters at the same
+priority are served strictly in the order they started waiting (FIFO — a later-arriving instance at the
+same priority never jumps an earlier one).
+
+This is **admission order only** — it does not create a reservation. An instance that isn't currently
+contending for a global slot (idle, or its files are all done) holds nothing back for itself: a
+high-priority instance with no work in flight never starves a busy low-priority one of a slot it isn't
+using. The moment the high-priority instance *does* have work and joins the queue, it jumps ahead of
+whatever lower-priority instance is still waiting — but anything already admitted and running keeps
+running to completion; priority is not preemptive.
+
+Two things `priority` deliberately does **not** do:
+
+- It doesn't affect an instance's own `limits.maxConcurrentFiles` — that per-instance cap is unrelated
+  to cross-instance admission and stays exactly as configured regardless of priority.
+- It doesn't weight the bandwidth token bucket. A higher-priority instance gets its transfer *started*
+  sooner under concurrency contention, but once running, it competes for bytes-per-second on equal terms
+  with everyone else. Weighting bandwidth by priority is explicitly out of scope for this feature — if
+  you need a class of instances to also get more of the byte-rate budget, give them their own
+  `limits.maxBandwidth` rather than relying on `priority`.
+
+In practice: leave `priority` at the default for most instances, and lower it (e.g. `10`) only for the
+handful whose files genuinely need to jump the queue when the global cap is saturated — a
+latency-sensitive control-signal spool ahead of a bulk nightly archive feed sharing the same process, for
+example.
+
+## Permission handling
+A watched directory or a destination directory can be unreadable/unwritable — a bad mount, a chmod
+mistake, a container running as the wrong user. Two things are true of every such failure, no matter
+when it happens or what policy is configured:
+
+1. It is **always** logged and **always** surfaced as a `PermissionDenied` event (`{path, role, error}`,
+   `role` one of `ingress`/`egress`/`archive`/`failed`) — an operator must never be silently starved of
+   files with no signal why.
+2. It is logged **once**, not once per reconciliation rescan (and, on the egress side, not once per
+   file). Before this feature, an unreadable directory produced a `debug!` line on *every* scan —
+   indistinguishable from normal operation in the logs, and a genuine spam risk on a busy rescan
+   interval. A per-instance dedup log now tracks each distinct failing key and only re-logs on a real
+   state change: the first sighting, a later *recovery* (the key becomes accessible again — logged once,
+   at `INFO`, so "it's fixed" is as visible as "it broke"), or after a long quiet interval (an hour) for
+   a persistently-broken key so it never goes completely silent either. On the ingress side the key is
+   the watched directory path; on the egress side it is the **destination** — so a broken-permission
+   destination logs/emits once for the destination, not once for every file it can't deliver (which also
+   bounds the dedup state to the fixed number of configured destinations rather than growing per file).
+
+**Startup validation.** Before an instance starts, its ingress directory (readable), every `local`
+egress directory (writable), and a configured `archiveDir`/`failedDir` (creatable-or-writable) are
+probed. A violation is resolved against `onPermissionError` (component-wide default `disableInstance`,
+overridable per instance — see the configuration reference):
+
+- **`disableInstance`** (the default) — skip just that instance. This reuses the existing "skip a
+  malformed instance, keep the rest running" behavior (FR-CFG-4): **instance isolation is the whole
+  point** — one operator's typo'd path must never take down every other instance's replication. A
+  disabled instance still shows up in `get-status` (component-wide and scoped-by-id), with
+  `disabled: true` and `disabledReason`, instead of silently vanishing or reading as "unknown instance".
+- **`fatal`** — abort the whole component. An explicit opt-in for deployments that would rather fail
+  loudly at startup than run in a visibly degraded state.
+- **`retain`** — start the instance anyway. It will keep hitting the same error on every rescan/transfer
+  attempt; the dedup-logging above is what keeps that from being a log-spam problem, and the
+  `PermissionDenied` events are what keeps an operator informed without watching logs.
+
+If **every** instance ends up disabled (or the configured set was empty to begin with), the component
+still fails to start — this is the same "fail only if zero instances start" rule P1 already applies to
+malformed config, now also reachable via an all-inaccessible instance set.
+
+**Runtime.** A directory can also become inaccessible mid-run (unmounted, permissions changed under a
+running process). On the ingress side, the discovery scan keeps walking past an unreadable subdirectory
+(never fatal to the scan) and reports it through the same dedup-log + event path; a file the scan can
+list but not open because of a *permission* denial is reported the same way. On the egress side, a
+permission-denied delivery error is detected by how the backend **classifies** the failure (every
+destination funnels its errors through the same taxonomy, so a real read-only/`chmod 000` target is
+caught, not just a synthetic one), dedup-logged + surfaced as a `PermissionDenied` event once per
+destination, and then follows the **existing, unchanged** retry/quarantine decision — the permission
+handling here is observability, not a new failure-handling branch. (See `src/permission.rs`.)
+
 ## The unified namespace
 All command/event/state topics are rooted on the globally-unique ThingName:
 `{thing}/file-replicator/{cmd|evt|state}/…` — RESTful, within IoT Core's 256-byte/7-slash limits, and

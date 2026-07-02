@@ -2,26 +2,28 @@
 //!
 //! A thin coordinator over the durable [`StateStore`]: it enqueues ready files, atomically claims the
 //! oldest-ready batch (write-ahead `Ready → InProgress`, gated by each item's backoff clock), and
-//! hands out concurrency **slots**. Two semaphores bound in-flight **items** (files — one slot per item,
-//! held across its fan-out to N destinations; see [`SlotGuard`]) — a **per-instance** one
-//! (`limits.maxConcurrentFiles`) so one instance can't monopolize the process, and a **global** one
-//! (`component.global.limits.maxConcurrentFiles`) shared across every instance (FR-REL-5). The
-//! durable state machine itself lives in [`state`](crate::state) (the transitions) and
-//! [`worker`](crate::instance::worker) (the retry/backoff decision); this module owns only the
-//! queue-front + backpressure.
+//! hands out concurrency **slots**. Two governors bound in-flight **items** (files — one slot per item,
+//! held across its fan-out to N destinations; see [`SlotGuard`]) — a **per-instance** [`Semaphore`]
+//! (`limits.maxConcurrentFiles`) so one instance can't monopolize the process, and a **global**
+//! priority-aware [`PriorityGate`] (`component.global.limits.maxConcurrentFiles`, Feature B —
+//! `src/admission.rs`) shared across every instance (FR-REL-5), admitting higher-`priority` instances
+//! first under contention. The durable state machine itself lives in [`state`](crate::state) (the
+//! transitions) and [`worker`](crate::instance::worker) (the retry/backoff decision); this module owns
+//! only the queue-front + backpressure.
 
 use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::admission::{GateGuard, PriorityGate};
 use crate::domain::{ItemState, WorkItem};
 use crate::error::Result;
 use crate::state::StateStore;
 
-/// The per-instance queue front: durable claim/enqueue plus the two concurrency semaphores.
+/// The per-instance queue front: durable claim/enqueue plus the two concurrency governors.
 ///
-/// `Clone` is cheap (three `Arc`s + a `String` + a `usize`) and shares the same underlying store and
-/// semaphores, so a clone can be moved into a `spawn_blocking` closure to run a bulk scan
+/// `Clone` is cheap (three `Arc`s + a `String` + a `usize` + an `i32`) and shares the same underlying
+/// store and governors, so a clone can be moved into a `spawn_blocking` closure to run a bulk scan
 /// (`promote_due`) off the async runtime without disturbing slot accounting (DESIGN §6.3).
 #[derive(Clone)]
 pub struct Queue {
@@ -29,9 +31,14 @@ pub struct Queue {
     store: Arc<dyn StateStore>,
     /// Bounds this instance's in-flight transfers (`limits.maxConcurrentFiles`).
     per_instance: Arc<Semaphore>,
-    /// Shared across all instances (`component.global.limits.maxConcurrentFiles`).
-    global: Arc<Semaphore>,
+    /// Shared across all instances (`component.global.limits.maxConcurrentFiles`); admits waiters in
+    /// priority order under contention (Feature B).
+    global: Arc<PriorityGate>,
     per_limit: usize,
+    /// This instance's cross-instance GLOBAL admission priority (lower = higher priority; Feature B,
+    /// `InstanceCfg::priority`). Governs ONLY the `global` gate above — never the per-instance
+    /// semaphore, and never bandwidth (out of scope for Feature B).
+    priority: i32,
 }
 
 /// A held concurrency slot: one global permit and one per-instance permit. Both release on drop, so a
@@ -45,18 +52,21 @@ pub struct Queue {
 /// independently by the global bandwidth token bucket regardless of task count, and one hung destination
 /// pins only its own item's slot (never the whole cap).
 pub struct SlotGuard {
-    _global: OwnedSemaphorePermit,
+    _global: GateGuard,
     _per_instance: OwnedSemaphorePermit,
 }
 
 impl Queue {
     /// Build the queue for `instance`. `per_limit` (clamped to ≥ 1) sizes the per-instance semaphore;
-    /// `global` is the shared semaphore built once by the app.
+    /// `global` is the shared priority-aware admission gate built once by the app (Feature B); `priority`
+    /// is this instance's resolved GLOBAL admission priority (lower = higher priority — see
+    /// [`crate::config::InstanceCfg::priority`]).
     pub fn new(
         instance: String,
         store: Arc<dyn StateStore>,
         per_limit: usize,
-        global: Arc<Semaphore>,
+        global: Arc<PriorityGate>,
+        priority: i32,
     ) -> Self {
         let per_limit = per_limit.max(1);
         Queue {
@@ -65,6 +75,7 @@ impl Queue {
             per_instance: Arc::new(Semaphore::new(per_limit)),
             global,
             per_limit,
+            priority,
         }
     }
 
@@ -110,17 +121,15 @@ impl Queue {
         self.store.claim_ready(&self.instance, limit, now)
     }
 
-    /// Acquire one concurrency slot, awaiting a free permit in **both** the global and per-instance
-    /// semaphores (global first, then per-instance — a consistent order, so no deadlock). The returned
-    /// [`SlotGuard`] releases both on drop.
+    /// Acquire one concurrency slot, awaiting admission from **both** the global gate and the
+    /// per-instance semaphore (global first, then per-instance — a consistent order, so no deadlock).
+    /// The global admission is priority-aware (Feature B): this instance's `priority` decides its place
+    /// in line under cross-instance contention for the global cap; the per-instance semaphore is plain
+    /// FIFO regardless (priority is a GLOBAL-only concept). The returned [`SlotGuard`] releases both on
+    /// drop.
     pub async fn acquire_slot(&self) -> SlotGuard {
+        let global = self.global.acquire(self.priority).await;
         // `Semaphore`s live for the whole run and are never closed, so `acquire_owned` cannot error.
-        let global = self
-            .global
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("global concurrency semaphore closed");
         let per_instance = self
             .per_instance
             .clone()
@@ -141,6 +150,9 @@ mod tests {
     use crate::state::SqliteStore;
 
     const INST: &str = "q";
+    /// The neutral default priority (`InstanceCfg::priority`'s default) — irrelevant to every test in
+    /// this module except the priority-specific ones below, which build their own queues directly.
+    const DEFAULT_PRIORITY: i32 = 100;
 
     fn queue(per_limit: usize, global_permits: usize) -> Queue {
         let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
@@ -148,7 +160,8 @@ mod tests {
             INST.to_string(),
             store,
             per_limit,
-            Arc::new(Semaphore::new(global_permits)),
+            Arc::new(PriorityGate::new(global_permits)),
+            DEFAULT_PRIORITY,
         )
     }
 
@@ -220,12 +233,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn global_semaphore_gates_across_instances() {
+    async fn global_gate_gates_across_instances() {
         // Two instances share a global cap of 1.
         let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let global = Arc::new(Semaphore::new(1));
-        let a = Queue::new("a".into(), store.clone(), 4, global.clone());
-        let b = Queue::new("b".into(), store, 4, global.clone());
+        let global = Arc::new(PriorityGate::new(1));
+        let a = Queue::new("a".into(), store.clone(), 4, global.clone(), DEFAULT_PRIORITY);
+        let b = Queue::new("b".into(), store, 4, global.clone(), DEFAULT_PRIORITY);
         let ga = a.acquire_slot().await; // takes the only global permit
         assert!(tokio::time::timeout(std::time::Duration::from_millis(50), b.acquire_slot())
             .await
@@ -234,5 +247,48 @@ mod tests {
         let _gb = tokio::time::timeout(std::time::Duration::from_millis(50), b.acquire_slot())
             .await
             .expect("global permit frees up for the other instance");
+    }
+
+    /// Feature B end-to-end at the `Queue` level (not just `PriorityGate` in isolation): under
+    /// cross-instance contention for the shared global cap, the higher-priority instance's queued
+    /// `acquire_slot` is admitted first — proving `InstanceCfg::priority` actually reaches the gate via
+    /// `Queue::new`/`acquire_slot`, not just that `PriorityGate` itself orders correctly.
+    #[tokio::test]
+    async fn global_gate_admits_the_higher_priority_instance_first_under_contention() {
+        let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let global = Arc::new(PriorityGate::new(1));
+        let holder_q = Queue::new("holder".into(), store.clone(), 4, global.clone(), DEFAULT_PRIORITY);
+        let low = Queue::new("low".into(), store.clone(), 4, global.clone(), 200); // low priority
+        let high = Queue::new("high".into(), store, 4, global.clone(), 1); // high priority
+
+        let holder = holder_q.acquire_slot().await; // takes the only global permit
+
+        // Enqueue the LOW-priority waiter first, then the HIGH-priority one — proving admission order
+        // follows priority, not enqueue order. `high` holds its slot until explicitly told to release
+        // (a oneshot handshake) so the assertion below can't race its own guard's drop.
+        let low_task = tokio::spawn(async move {
+            let _g = low.acquire_slot().await;
+        });
+        tokio::task::yield_now().await;
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let high_task = tokio::spawn(async move {
+            let _g = high.acquire_slot().await;
+            acquired_tx.send(()).unwrap();
+            release_rx.await.unwrap(); // hold the slot until the test says so
+        });
+        tokio::task::yield_now().await;
+
+        drop(holder); // release -> must hand off to `high`, not `low` (enqueued first but lower prio)
+        tokio::time::timeout(std::time::Duration::from_millis(200), acquired_rx)
+            .await
+            .expect("high-priority waiter admitted promptly")
+            .unwrap();
+        // The low-priority waiter is still blocked (never granted while the high-priority one holds).
+        assert!(!low_task.is_finished(), "low-priority waiter must not be admitted ahead of the high one");
+
+        release_tx.send(()).unwrap();
+        high_task.await.unwrap();
+        low_task.abort();
     }
 }

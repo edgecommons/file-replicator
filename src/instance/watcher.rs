@@ -35,6 +35,16 @@ fn mtime_ms_of(md: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+/// A directory that could not be walked/read during a [`scan`] (Feature A, `src/permission.rs`):
+/// carried up so the caller can dedup-log it and emit a `PermissionDenied` event instead of the old
+/// silent per-rescan `debug!` (the log-spam footgun this fixes — every entry here would otherwise
+/// re-surface on every reconciliation rescan).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanIssue {
+    pub path: PathBuf,
+    pub kind: std::io::ErrorKind,
+}
+
 /// A file discovered by [`scan`]: its source-root-relative, forward-slash key plus the absolute path,
 /// size, and last-modified time captured from the directory entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,13 +65,16 @@ pub struct Candidate {
 ///
 /// Directories under any path in `skip` (e.g. an in-tree archive/failed folder) are pruned so
 /// completed/quarantined files are never re-discovered. The result is sorted by `relpath` for
-/// deterministic ordering. Unreadable directories/entries are skipped, never fatal.
+/// deterministic ordering. Unreadable directories/entries are never fatal to the scan — the walk keeps
+/// going — but every failure is recorded in `issues` (Feature A) so the caller can dedup-log it and emit
+/// a `PermissionDenied` event instead of silently re-attempting (and re-`debug!`-logging) it forever.
 pub fn scan(
     root: &Path,
     recursive: bool,
     include: &GlobMatcher,
     exclude: &GlobMatcher,
     skip: &[PathBuf],
+    issues: &mut Vec<ScanIssue>,
 ) -> Vec<Candidate> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -69,18 +82,33 @@ pub fn scan(
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(e) => {
+                issues.push(ScanIssue { path: dir.clone(), kind: e.kind() });
                 tracing::debug!(dir = %dir.display(), error = %e, "read_dir failed; skipping");
                 continue;
             }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            // A per-`DirEntry` iteration error (a single entry that can't be read/stat'd while
+            // enumerating an otherwise-readable directory — e.g. a per-entry permission failure) is
+            // recorded as a [`ScanIssue`] instead of being silently dropped by `.flatten()`, keeping
+            // Feature A's "every walk failure is recorded (dedup-logged), never a silent skip" contract.
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    issues.push(ScanIssue { path: dir.clone(), kind: e.kind() });
+                    continue;
+                }
+            };
             let path = entry.path();
             if skip.iter().any(|s| path.starts_with(s)) {
                 continue;
             }
             let ft = match entry.file_type() {
                 Ok(t) => t,
-                Err(_) => continue,
+                Err(e) => {
+                    issues.push(ScanIssue { path: path.clone(), kind: e.kind() });
+                    continue;
+                }
             };
             if ft.is_dir() {
                 if recursive {
@@ -169,15 +197,21 @@ impl Watcher {
         self.strategy.pending_recheck()
     }
 
-    /// Scan the tree and return the candidates judged **ready** by the configured strategy. Candidates
-    /// whose readiness probe errors (e.g. the file vanished between scan and probe) are skipped.
-    pub fn discover(&mut self, probe: &dyn ReadinessProbe) -> Vec<Candidate> {
+    /// Scan the tree and return the candidates judged **ready** by the configured strategy, plus any
+    /// [`ScanIssue`]s hit while walking (Feature A — the caller dedup-logs + emits `PermissionDenied`
+    /// for these instead of the old silent per-rescan skip). A candidate whose readiness probe fails
+    /// with a *permission* denial is likewise recorded as a [`ScanIssue`] (so a file-level permission
+    /// error gets the same bounded, once-only signal); any other probe error (e.g. the file vanished
+    /// between scan and probe) is a transient, self-correcting condition and is quietly skipped.
+    pub fn discover(&mut self, probe: &dyn ReadinessProbe) -> (Vec<Candidate>, Vec<ScanIssue>) {
+        let mut issues = Vec::new();
         let candidates = scan(
             &self.root,
             self.recursive,
             &self.include,
             &self.exclude,
             &self.skip,
+            &mut issues,
         );
         // Snapshot the paths present this scan so per-file readiness bookkeeping (the stability
         // tracker) can be evicted for files that no longer exist — otherwise it would grow without
@@ -188,13 +222,22 @@ impl Watcher {
             match self.strategy.is_ready(&c.abs, probe, &self.exclude) {
                 Ok(true) => ready.push(c),
                 Ok(false) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    // A file the scan could list but cannot open/stat because of a *permission* denial
+                    // (Feature A): route it through the same dedup+`PermissionDenied` event path as an
+                    // unreadable directory, rather than the silent per-rescan `debug!` a file-level
+                    // permission error would otherwise get (which would re-log every rescan, forever).
+                    issues.push(ScanIssue { path: c.abs, kind: e.kind() });
+                }
                 Err(e) => {
+                    // Any other probe error (e.g. the file vanished between scan and probe) is a
+                    // transient, self-correcting condition — a quiet debug line, not a scan issue.
                     tracing::debug!(path = %c.abs.display(), error = %e, "readiness probe failed");
                 }
             }
         }
         self.strategy.retain_tracked(&present);
-        ready
+        (ready, issues)
     }
 }
 
@@ -234,10 +277,12 @@ mod tests {
         write(&dir.path().join("nested/b.csv"), b"33");
         let inc = GlobMatcher::new(&["**/*.csv".into()]).unwrap();
         let exc = GlobMatcher::new(&["**/*.tmp".into()]).unwrap();
-        let got = scan(dir.path(), true, &inc, &exc, &[]);
+        let mut issues = Vec::new();
+        let got = scan(dir.path(), true, &inc, &exc, &[], &mut issues);
         let rels: Vec<_> = got.iter().map(|c| c.relpath.as_str()).collect();
         assert_eq!(rels, vec!["a.csv", "nested/b.csv"]); // forward-slash, sorted, .tmp excluded
         assert_eq!(got.iter().find(|c| c.relpath == "nested/b.csv").unwrap().size, 2);
+        assert!(issues.is_empty(), "a clean tree has no scan issues");
     }
 
     #[test]
@@ -246,7 +291,8 @@ mod tests {
         write(&dir.path().join("top.csv"), b"1");
         write(&dir.path().join("sub/deep.csv"), b"2");
         let all = GlobMatcher::empty();
-        let got = scan(dir.path(), false, &all, &GlobMatcher::empty(), &[]);
+        let mut issues = Vec::new();
+        let got = scan(dir.path(), false, &all, &GlobMatcher::empty(), &[], &mut issues);
         let rels: Vec<_> = got.iter().map(|c| c.relpath.as_str()).collect();
         assert_eq!(rels, vec!["top.csv"]);
     }
@@ -258,9 +304,74 @@ mod tests {
         write(&dir.path().join("archive/done.csv"), b"2");
         let all = GlobMatcher::empty();
         let skip = vec![dir.path().join("archive")];
-        let got = scan(dir.path(), true, &all, &GlobMatcher::empty(), &skip);
+        let mut issues = Vec::new();
+        let got = scan(dir.path(), true, &all, &GlobMatcher::empty(), &skip, &mut issues);
         let rels: Vec<_> = got.iter().map(|c| c.relpath.as_str()).collect();
         assert_eq!(rels, vec!["keep.csv"], "in-tree archive dir must be pruned");
+    }
+
+    #[test]
+    fn scan_reports_an_unreadable_directory_as_an_issue() {
+        // A FILE where a subdirectory-to-walk is expected makes `read_dir` fail deterministically
+        // cross-platform, standing in for a permission-denied directory (Feature A).
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("keep.csv"), b"1");
+        let not_a_dir = dir.path().join("looks-like-a-dir");
+        write(&not_a_dir, b"actually a file");
+        // Force it onto the walk stack as if it were a directory by scanning IT directly as root.
+        let all = GlobMatcher::empty();
+        let mut issues = Vec::new();
+        let got = scan(&not_a_dir, true, &all, &GlobMatcher::empty(), &[], &mut issues);
+        assert!(got.is_empty());
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].path, not_a_dir);
+    }
+
+    /// A readiness probe that always fails with a chosen [`io::ErrorKind`] — drives the `discover`
+    /// probe-error branches (Feature A) deterministically, without needing real un-openable files.
+    struct FailProbe(std::io::ErrorKind);
+    impl ReadinessProbe for FailProbe {
+        fn observe(&self, _path: &Path) -> std::io::Result<crate::readiness::Observation> {
+            Err(std::io::Error::new(self.0, "probe failed"))
+        }
+        fn marker_exists(&self, _marker: &Path) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn discover_records_a_permission_denied_readiness_probe_as_a_scan_issue() {
+        // A file the scan lists but the readiness probe can't open/stat due to a permission denial is
+        // surfaced as a ScanIssue (→ dedup + PermissionDenied event), not a silent per-rescan skip.
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("f.bin"), b"hello");
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
+        let mut ing = ingress(dir.path(), false, &[], &[]);
+        // The stability strategy calls `probe.observe`, so a failing probe reaches the error branch.
+        ing.readiness = ReadinessCfg::Stability(StabilityReadiness { quiet_secs: 5 });
+        let mut w = Watcher::from_cfg(&ing, clock, vec![]).unwrap();
+
+        let (ready, issues) = w.discover(&FailProbe(std::io::ErrorKind::PermissionDenied));
+        assert!(ready.is_empty());
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].kind, std::io::ErrorKind::PermissionDenied);
+        assert_eq!(issues[0].path, dir.path().join("f.bin"));
+    }
+
+    #[test]
+    fn discover_skips_a_non_permission_readiness_probe_error_without_an_issue() {
+        // A non-permission probe error (e.g. the file vanished between scan and probe) is transient and
+        // self-correcting: quietly skipped, NOT recorded as a scan issue.
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("f.bin"), b"hello");
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
+        let mut ing = ingress(dir.path(), false, &[], &[]);
+        ing.readiness = ReadinessCfg::Stability(StabilityReadiness { quiet_secs: 5 });
+        let mut w = Watcher::from_cfg(&ing, clock, vec![]).unwrap();
+
+        let (ready, issues) = w.discover(&FailProbe(std::io::ErrorKind::NotFound));
+        assert!(ready.is_empty());
+        assert!(issues.is_empty(), "a non-permission probe error is not a scan issue");
     }
 
     #[test]
@@ -270,11 +381,12 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
         let mut w = Watcher::from_cfg(&ingress(dir.path(), true, &["**/*.csv"], &[]), clock, vec![])
             .unwrap();
-        let ready = w.discover(&RealProbe);
+        let (ready, issues) = w.discover(&RealProbe);
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].relpath, "a.csv");
         assert_eq!(w.root(), dir.path());
         assert!(w.recursive());
+        assert!(issues.is_empty());
     }
 
     #[test]
@@ -287,10 +399,10 @@ mod tests {
         ing.readiness = ReadinessCfg::Stability(StabilityReadiness { quiet_secs: 5 });
         let mut w = Watcher::from_cfg(&ing, dyn_clock, vec![]).unwrap();
         // First observation: not yet stable.
-        assert!(w.discover(&RealProbe).is_empty());
+        assert!(w.discover(&RealProbe).0.is_empty());
         // The file is untouched; after the quiet window it is promoted to ready.
         clock.advance(Duration::from_secs(5));
-        let ready = w.discover(&RealProbe);
+        let (ready, _issues) = w.discover(&RealProbe);
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].relpath, "f.bin");
     }

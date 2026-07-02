@@ -78,6 +78,66 @@ fn lenient_opt_usize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<usize>, D
     Ok(lenient_opt_u64(d)?.map(|v| v as usize))
 }
 
+/// Accept a JSON integer or an integer-valued float for a required (signed) `i32` field — the same
+/// FR-CFG-3 leniency as [`lenient_u64`], but signed: `priority` (Feature B) is a signed 0-255-ish
+/// convention (lower = higher priority) and a Greengrass-delivered negative "boost" value must parse
+/// too.
+fn lenient_i32<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
+    use serde::de::Error;
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|f| f as i64))
+            .map(|v| v as i32)
+            .ok_or_else(|| Error::custom("expected an integer")),
+        other => Err(Error::custom(format!("expected a number, got {other}"))),
+    }
+}
+
+/// Map a JSON value to a known [`PermissionPolicy`], or `None` (with a `warn`) for anything
+/// unrecognized. Shared by the global (non-optional) and per-instance (optional) lenient parsers below.
+fn permission_policy_from_value(v: &serde_json::Value) -> Option<PermissionPolicy> {
+    match v.as_str() {
+        Some("disableInstance") => Some(PermissionPolicy::DisableInstance),
+        Some("fatal") => Some(PermissionPolicy::Fatal),
+        Some("retain") => Some(PermissionPolicy::Retain),
+        other => {
+            tracing::warn!(
+                value = ?other,
+                "unrecognized onPermissionError (expected disableInstance|fatal|retain); ignoring this field"
+            );
+            None
+        }
+    }
+}
+
+/// Lenient parse for `component.global.onPermissionError`: a typo'd value (e.g. `"fatel"`) must NOT
+/// reject the whole `GlobalCfg`. [`load_global`] falls back coarsely — a serde error on ANY field drops
+/// the ENTIRE `component.global` block back to defaults — so without this, one misspelled policy string
+/// would silently discard every sibling global setting (a configured `maxConcurrentFiles`, bandwidth
+/// cap, topics, retry defaults). Instead: warn and fall back to just the default policy, leaving the
+/// siblings intact. (`#[serde(default)]` still handles the absent-field case; this runs only when the
+/// field is present.)
+fn lenient_permission_policy_global<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<PermissionPolicy, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(permission_policy_from_value(&v).unwrap_or_default())
+}
+
+/// As [`lenient_permission_policy_global`] but for the per-instance `Option` override: a null or
+/// unrecognized value yields `None` (inherit the component default) rather than dropping the whole
+/// instance from [`load_instances`] over a typo in one optional field.
+fn lenient_permission_policy_opt<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<PermissionPolicy>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    if v.is_null() {
+        return Ok(None);
+    }
+    Ok(permission_policy_from_value(&v))
+}
+
 /// One watched-directory instance = one `component.instances[]` entry.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,6 +170,20 @@ pub struct InstanceCfg {
     // would split an instance's command surface from its event/state stream (DESIGN §15.7); the whole
     // component shares the component prefix in P3. The component-wide `global.topics.prefix` IS honored.
     pub topics: Option<TopicsCfg>,
+    /// Per-instance override of `component.global.onPermissionError` (`None` inherits the component
+    /// default — see [`PermissionPolicy`] and [`resolve_permission_policy`]). Parsed leniently: a typo'd
+    /// value warns and falls back to `None` (inherit) rather than dropping the whole instance.
+    #[serde(default, deserialize_with = "lenient_permission_policy_opt")]
+    pub on_permission_error: Option<PermissionPolicy>,
+    /// Cross-instance GLOBAL concurrency-admission priority (Feature B, `src/admission.rs`): under
+    /// contention for the shared `component.global.limits.maxConcurrentFiles` cap, a lower `priority`
+    /// number is admitted first (matching the file-replicator-wide 0-255 convention — lower = higher
+    /// priority), FIFO among equal priorities. Governs the GLOBAL admission decision ONLY — it does not
+    /// affect this instance's own `limits.maxConcurrentFiles` cap, and there is no bandwidth weighting
+    /// by priority. Demand-adaptive: an instance that isn't currently contending for a global slot
+    /// reserves nothing, regardless of its priority. Default 100 (a neutral mid value).
+    #[serde(default = "default_priority", deserialize_with = "lenient_i32")]
+    pub priority: i32,
 }
 
 /// Ingress: the source directory and how files are discovered + judged ready.
@@ -640,6 +714,31 @@ pub struct RetryCfg {
     pub max_attempts: Option<u32>,
 }
 
+/// Startup-validation / runtime permission-error policy (the [`crate::permission`] module). Governs
+/// what happens when an instance's ingress/egress/archive/failed directory is unreadable/unwritable —
+/// at startup validation and, for `retain`, for the runtime dedup-logging path too. Instance-scoped by
+/// default (NOT a whole-component-fatal policy): a bad instance is disabled, its siblings keep running.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionPolicy {
+    /// Skip (don't start) just the offending instance; every other instance is unaffected (FR-CFG-4's
+    /// skip-bad-instance path). The default — matches the existing skip-on-malformed-config behavior.
+    #[default]
+    DisableInstance,
+    /// Abort the whole component (returns an error from `App::run`). An explicit opt-in for
+    /// deployments that would rather fail loudly than run degraded.
+    Fatal,
+    /// Start the instance anyway. Runtime dedup-logging (log once, not per rescan) plus the
+    /// `PermissionDenied` event carry the ongoing diagnostic signal.
+    Retain,
+}
+
+/// Resolve the effective [`PermissionPolicy`] for an instance: its own `onPermissionError` override
+/// wins; otherwise it inherits `component.global.onPermissionError`.
+pub fn resolve_permission_policy(inst: &InstanceCfg, global: &GlobalCfg) -> PermissionPolicy {
+    inst.on_permission_error.unwrap_or(global.on_permission_error)
+}
+
 /// Concurrency + bandwidth caps.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -678,6 +777,12 @@ pub struct GlobalCfg {
     /// Global UNS topic prefix. P3 (control/events): consumed by the topic builder, not the engine.
     #[allow(dead_code)]
     pub topics: Option<TopicsCfg>,
+    /// Component-wide default startup-validation / runtime permission-error policy (an instance's own
+    /// `onPermissionError` wins — see [`resolve_permission_policy`]). Defaults to `disableInstance`.
+    /// Parsed leniently so a typo'd value falls back to the default WITHOUT dropping the rest of
+    /// `component.global` (see [`lenient_permission_policy_global`]).
+    #[serde(default, deserialize_with = "lenient_permission_policy_global")]
+    pub on_permission_error: PermissionPolicy,
 }
 
 /// `component.global.defaults` — values an instance inherits when it does not set its own.
@@ -711,6 +816,11 @@ fn default_quiet_secs() -> u64 {
 }
 fn default_marker_suffix() -> String {
     ".done".to_string()
+}
+/// Default GLOBAL concurrency-admission priority (Feature B) when an instance sets none — a neutral
+/// mid value on the 0-255-ish (lower = higher priority) convention.
+fn default_priority() -> i32 {
+    100
 }
 
 /// Parse every `component.instances[]` entry into an [`InstanceCfg`], logging and skipping any
@@ -904,6 +1014,193 @@ mod tests {
         let mut ids: Vec<String> = load_instances(&cfg).into_iter().map(|i| i.id).collect();
         ids.sort();
         assert_eq!(ids, vec!["good1".to_string(), "good2".to_string()], "bad skipped, good kept");
+    }
+
+    // ---- permission policy (Feature A) ------------------------------------------------------------
+
+    #[test]
+    fn on_permission_error_defaults_to_disable_instance() {
+        let inst = parse(serde_json::json!({
+            "id": "x",
+            "ingress": { "path": "/in" },
+            "egress": [ { "type": "local", "path": "/out" } ]
+        }));
+        assert_eq!(inst.on_permission_error, None, "absent → inherit the component default");
+
+        let cfg = Config::from_value("com.test", "thing", serde_json::json!({ "component": {} }))
+            .unwrap();
+        let g = load_global(&cfg);
+        assert_eq!(g.on_permission_error, PermissionPolicy::DisableInstance);
+    }
+
+    #[test]
+    fn on_permission_error_parses_fatal_and_retain() {
+        let cfg = Config::from_value(
+            "com.test",
+            "thing",
+            serde_json::json!({ "component": { "global": { "onPermissionError": "fatal" } } }),
+        )
+        .unwrap();
+        assert_eq!(load_global(&cfg).on_permission_error, PermissionPolicy::Fatal);
+
+        let inst = parse(serde_json::json!({
+            "id": "x",
+            "ingress": { "path": "/in" },
+            "egress": [ { "type": "local", "path": "/out" } ],
+            "onPermissionError": "retain"
+        }));
+        assert_eq!(inst.on_permission_error, Some(PermissionPolicy::Retain));
+    }
+
+    #[test]
+    fn bad_global_on_permission_error_falls_back_but_keeps_sibling_limits() {
+        // A typo'd onPermissionError must NOT nuke the rest of component.global (the coarse load_global
+        // whole-object fallback would otherwise silently drop a configured concurrency cap). The bad
+        // field falls back to the default policy; the sibling limits survive.
+        let cfg = Config::from_value(
+            "com.test",
+            "thing",
+            serde_json::json!({
+                "component": {
+                    "global": {
+                        "onPermissionError": "fatel", // typo
+                        "limits": { "maxConcurrentFiles": 32 }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let g = load_global(&cfg);
+        assert_eq!(
+            g.on_permission_error,
+            PermissionPolicy::DisableInstance,
+            "typo'd policy falls back to the default"
+        );
+        assert_eq!(
+            g.limits.and_then(|l| l.max_concurrent_files),
+            Some(32),
+            "the sibling limits value is preserved, not discarded"
+        );
+    }
+
+    #[test]
+    fn bad_instance_on_permission_error_inherits_and_is_not_dropped() {
+        // A typo'd per-instance override falls back to None (inherit global) instead of dropping the
+        // whole instance from load_instances.
+        let cfg = Config::from_value(
+            "com.test",
+            "thing",
+            serde_json::json!({
+                "component": {
+                    "instances": [
+                        { "id": "ok", "ingress": { "path": "/a" },
+                          "egress": [ { "type": "local", "path": "/o" } ],
+                          "onPermissionError": "disabel" } // typo
+                    ]
+                }
+            }),
+        )
+        .unwrap();
+        let insts = load_instances(&cfg);
+        assert_eq!(insts.len(), 1, "the instance is kept, not dropped over a typo'd optional field");
+        assert_eq!(insts[0].on_permission_error, None, "unrecognized → inherit the component default");
+        assert_eq!(
+            resolve_permission_policy(&insts[0], &GlobalCfg::default()),
+            PermissionPolicy::DisableInstance
+        );
+    }
+
+    #[test]
+    fn non_numeric_priority_skips_just_that_instance() {
+        // FR-CFG-4 + lenient_i32's error path: a non-numeric `priority` is a hard parse error for that
+        // field (it is a required i32, not an optional string-tolerant one), so the offending instance is
+        // skipped while its valid siblings survive.
+        let cfg = Config::from_value(
+            "com.test",
+            "thing",
+            serde_json::json!({
+                "component": {
+                    "instances": [
+                        { "id": "good", "ingress": { "path": "/a" },
+                          "egress": [ { "type": "local", "path": "/o1" } ] },
+                        { "id": "badprio", "ingress": { "path": "/b" },
+                          "egress": [ { "type": "local", "path": "/o2" } ],
+                          "priority": "high" } // non-numeric → skipped
+                    ]
+                }
+            }),
+        )
+        .unwrap();
+        let ids: Vec<String> = load_instances(&cfg).into_iter().map(|i| i.id).collect();
+        assert_eq!(ids, vec!["good".to_string()], "only the non-numeric-priority instance is skipped");
+    }
+
+    #[test]
+    fn resolve_permission_policy_instance_override_wins_else_inherits_global() {
+        let mut global = GlobalCfg {
+            on_permission_error: PermissionPolicy::Fatal,
+            ..Default::default()
+        };
+        let mut inst = parse(serde_json::json!({
+            "id": "x",
+            "ingress": { "path": "/in" },
+            "egress": [ { "type": "local", "path": "/out" } ]
+        }));
+        // No override → inherits the global default.
+        assert_eq!(resolve_permission_policy(&inst, &global), PermissionPolicy::Fatal);
+
+        // An instance override wins regardless of the global value.
+        inst.on_permission_error = Some(PermissionPolicy::Retain);
+        assert_eq!(resolve_permission_policy(&inst, &global), PermissionPolicy::Retain);
+
+        global.on_permission_error = PermissionPolicy::DisableInstance;
+        assert_eq!(
+            resolve_permission_policy(&inst, &global),
+            PermissionPolicy::Retain,
+            "instance override still wins"
+        );
+    }
+
+    // ---- priority (Feature B) ---------------------------------------------------------------------
+
+    #[test]
+    fn priority_defaults_to_100_when_absent() {
+        let inst = parse(serde_json::json!({
+            "id": "x",
+            "ingress": { "path": "/in" },
+            "egress": [ { "type": "local", "path": "/out" } ]
+        }));
+        assert_eq!(inst.priority, 100);
+    }
+
+    #[test]
+    fn priority_is_lenient_and_accepts_negatives() {
+        // Plain integer.
+        let inst = parse(serde_json::json!({
+            "id": "x",
+            "ingress": { "path": "/in" },
+            "egress": [ { "type": "local", "path": "/out" } ],
+            "priority": 5
+        }));
+        assert_eq!(inst.priority, 5);
+
+        // FR-CFG-3: a Greengrass-delivered integer-valued double must parse identically.
+        let inst = parse(serde_json::json!({
+            "id": "x",
+            "ingress": { "path": "/in" },
+            "egress": [ { "type": "local", "path": "/out" } ],
+            "priority": 5.0
+        }));
+        assert_eq!(inst.priority, 5);
+
+        // Negative = "boost past the highest normal priority" — must parse (signed field).
+        let inst = parse(serde_json::json!({
+            "id": "x",
+            "ingress": { "path": "/in" },
+            "egress": [ { "type": "local", "path": "/out" } ],
+            "priority": -10
+        }));
+        assert_eq!(inst.priority, -10);
     }
 
     #[test]

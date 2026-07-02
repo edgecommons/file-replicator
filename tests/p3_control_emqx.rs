@@ -45,8 +45,8 @@ use ggcommons::messaging::{
 };
 use ggcommons::prelude::Config;
 use serde_json::{json, Value};
-use tokio::sync::Semaphore;
 
+use file_replicator::admission::PriorityGate;
 use file_replicator::config::{
     CompletionCfg, EgressCfg, GlobReadiness, GlobalCfg, IngressCfg, InstanceCfg, LocalEgress,
     OnSuccess, ReadinessCfg, ScheduleCfg,
@@ -179,6 +179,8 @@ fn instance_cfg(id: &str, src: &Path, dst: &Path) -> InstanceCfg {
         retry: None,
         limits: None,
         topics: None,
+        on_permission_error: None,
+        priority: 100,
     }
 }
 
@@ -203,7 +205,7 @@ fn build_instance(
         instance_cfg(id, src, dst),
         &GlobalCfg::default(),
         store,
-        Arc::new(Semaphore::new(16)),
+        Arc::new(PriorityGate::new(16)),
         Arc::new(TokenBucket::unlimited()),
         None,
         &DestDeps::default(),

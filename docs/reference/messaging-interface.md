@@ -28,11 +28,21 @@ enabled with `legacyConfigTopic: true` (DESIGN §15.6).
 `FileDiscovered`, `FileReady`, `ReplicationStarted`, `ReplicationProgress` (throttled), `ReplicationCompleted`,
 `ReplicationFailed`, `FileArchived`, `FileDeleted`, `FileQuarantined`, `RetriesExhausted`, `ScheduleTriggered`,
 `WindowOpened`, `WindowClosed`, `ScanComplete`, `Disconnected`, `Reconnected`, `InstanceActivated`,
-`InstanceDeactivated`, `ComponentReady`.
+`InstanceDeactivated`, `ComponentReady`, `PermissionDenied`.
+
+`PermissionDenied` (`{ "path": string, "role": "ingress"|"egress"|"archive"|"failed", "error": string }`) —
+a directory/target the instance depends on is unreadable/unwritable, at startup or at runtime. ALWAYS
+emitted, but **deduplicated** so it is not repeated on every rescan or every file: for `ingress`/`archive`/`failed`
+the dedup key (carried in `path`) is the directory, and for `egress` it is the **destination** (so a
+broken-permission destination emits once, not once per file — `path` then names the destination). A
+recovery re-arms the dedup, so a later re-break emits again. See **Permission handling** in
+`explanation.md`. Governed by `onPermissionError` (`component.global` / per-instance).
 
 ## State (`state`, **retained**)
 `{thing}/file-replicator/state/instances/{id}` and `…/state` carry the latest snapshot (retained) so a
-fresh UI/cloud subscriber renders correctly on connect.
+fresh UI/cloud subscriber renders correctly on connect. An instance disabled at startup by
+`onPermissionError: disableInstance` still gets a snapshot/`get-status` doc — `active: false`,
+`disabled: true`, `disabledReason` — instead of appearing as an unknown id.
 
 Envelope: the standard ggcommons `Message` (`header`/`tags`/`body`); events use `header.name =
 "FileReplicatorEvent"`, `version = "1.0"`, with `body.event` discriminating. See DESIGN §16/§17 for full

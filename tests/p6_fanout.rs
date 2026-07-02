@@ -26,9 +26,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use file_replicator::admission::PriorityGate;
 use file_replicator::config::{
     CompletionCfg, EgressCfg, GlobReadiness, GlobalCfg, IngressCfg, InstanceCfg, LocalEgress,
     OnSuccess, ReadinessCfg, ScheduleCfg, Verify,
@@ -211,6 +211,8 @@ async fn fanout_two_local_dests_both_receive_content_source_completes_once() {
         retry: None,
         limits: None,
         topics: None,
+        on_permission_error: None,
+        priority: 100,
     };
 
     let store = store_in_memory();
@@ -218,7 +220,7 @@ async fn fanout_two_local_dests_both_receive_content_source_completes_once() {
         cfg,
         &GlobalCfg::default(),
         store.clone(),
-        Arc::new(Semaphore::new(16)),
+        Arc::new(PriorityGate::new(16)),
         Arc::new(TokenBucket::unlimited()),
         None,
         &DestDeps::default(),
@@ -282,6 +284,8 @@ async fn one_permanently_failing_dest_blocks_completion_but_preserves_the_other_
         retry: None,
         limits: None,
         topics: None,
+        on_permission_error: None,
+        priority: 100,
     };
 
     let (dest_good, calls_good) = NamedLocalDest::build("good", dst_good.path());
@@ -292,7 +296,7 @@ async fn one_permanently_failing_dest_blocks_completion_but_preserves_the_other_
         cfg,
         &GlobalCfg::default(),
         store.clone(),
-        Arc::new(Semaphore::new(16)),
+        Arc::new(PriorityGate::new(16)),
         Arc::new(TokenBucket::unlimited()),
         None,
         vec![dest_good, dest_bad],
@@ -400,13 +404,15 @@ async fn crash_mid_fanout_recovers_by_delivering_only_the_remaining_destination(
         retry: None,
         limits: None,
         topics: None,
+        on_permission_error: None,
+        priority: 100,
     };
     let inst = Arc::new(
         Instance::build_with_dests(
             cfg,
             &GlobalCfg::default(),
             store.clone(),
-            Arc::new(Semaphore::new(16)),
+            Arc::new(PriorityGate::new(16)),
             Arc::new(TokenBucket::unlimited()),
             None,
             vec![dest_a, dest_b],

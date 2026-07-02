@@ -13,9 +13,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ggcommons::prelude::*;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use crate::admission::PriorityGate;
 use crate::config::{self, InstanceCfg};
 use crate::control::{ControlPlane, InstanceControl};
 use crate::dest::DestDeps;
@@ -93,14 +93,17 @@ impl App {
         );
         tracing::info!(db = %db_path.display(), "durable state opened");
 
-        // Global concurrency + bandwidth caps (aggregate across instances).
+        // Global concurrency + bandwidth caps (aggregate across instances). The concurrency governor is
+        // a priority-aware admission gate (Feature B, `src/admission.rs`), not a plain semaphore: under
+        // cross-instance contention for this shared cap, a lower-`priority`-number instance is admitted
+        // first (FIFO among equal priorities); an idle high-priority instance reserves nothing.
         let global_slots = global
             .limits
             .as_ref()
             .and_then(|l| l.max_concurrent_files)
             .unwrap_or(DEFAULT_GLOBAL_SLOTS)
             .max(1);
-        let global_sem = Arc::new(Semaphore::new(global_slots));
+        let global_gate = Arc::new(PriorityGate::new(global_slots));
         let global_rate = global
             .limits
             .as_ref()
@@ -158,6 +161,11 @@ impl App {
         let cancel = CancellationToken::new();
         let mut handles = Vec::new();
         let mut control_instances: Vec<Arc<dyn InstanceControl>> = Vec::new();
+        // Feature A (`src/permission.rs`): instances a startup permission/access violation disabled
+        // under the (default) `onPermissionError: disableInstance` policy — surfaced to `get-status`
+        // via `ControlPlane::with_disabled` below, so a configured-but-never-started instance is
+        // reported with its reason instead of "unknown instance".
+        let mut disabled_infos: Vec<crate::control::DisabledInstanceInfo> = Vec::new();
         for cfg in instances_cfg {
             let id = cfg.id.clone();
             // A per-instance `topics.prefix` override is deferred (§15.7): honoring it here would put
@@ -173,11 +181,78 @@ impl App {
             }
             let topics = Arc::new(Topics::from_config(&self.config, global_prefix.as_deref(), None));
             let events = Events::new(msg.clone(), topics, thing.clone(), tags.clone());
+
+            // Feature A startup validation (§2 of the design): probe the instance's ingress/egress/
+            // archive/failed directories BEFORE building it, and apply the resolved policy. A violation
+            // is ALWAYS logged once (startup is inherently a single occurrence, so no separate dedup
+            // state is needed here — the runtime dedup log covers the ongoing "retain" case) and gets a
+            // `PermissionDenied` event, regardless of what the policy then does with it.
+            let policy = config::resolve_permission_policy(&cfg, &global);
+            let violations = crate::permission::validate_instance(&cfg);
+            for v in &violations {
+                tracing::error!(
+                    instance = %id, path = %v.path.display(), role = v.role.as_str(), error = %v.msg,
+                    "startup permission/access check failed"
+                );
+                events
+                    .instance_event(
+                        &id,
+                        Event::PermissionDenied {
+                            path: v.path.display().to_string(),
+                            role: v.role.as_str().to_string(),
+                            error: v.msg.clone(),
+                        },
+                        now_ms(),
+                    )
+                    .await;
+            }
+            match crate::permission::apply_policy(policy, &violations) {
+                crate::permission::PolicyOutcome::Fatal => {
+                    // Earlier, viable instances in this loop were already `tokio::spawn`ed. `fatal` aborts
+                    // partway through, so cancel + drain them before returning the error — otherwise, if
+                    // `App::run`'s error is ever handled without an immediate process exit, those instance
+                    // tasks would keep running orphaned (with the process exiting the runtime tears them
+                    // down anyway, but we don't rely on that).
+                    cancel.cancel();
+                    for h in handles {
+                        let _ = h.await;
+                    }
+                    anyhow::bail!(
+                        "instance '{id}': startup permission check failed and onPermissionError=fatal \
+                         ({} violation(s)); aborting the component",
+                        violations.len()
+                    );
+                }
+                crate::permission::PolicyOutcome::Skip => {
+                    let first = &violations[0];
+                    tracing::error!(
+                        instance = %id,
+                        "instance disabled by onPermissionError=disableInstance (default); \
+                         see the PermissionDenied event(s) above for every violation"
+                    );
+                    disabled_infos.push(crate::control::DisabledInstanceInfo {
+                        id: id.clone(),
+                        reason: violations
+                            .iter()
+                            .map(|v| format!("{}: {} ({})", v.role.as_str(), v.path.display(), v.msg))
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                        role: first.role.as_str().to_string(),
+                        path: first.path.display().to_string(),
+                    });
+                    continue;
+                }
+                // `Start`: either no violations, or the policy is `retain` — build the instance
+                // normally. A `retain` instance leans on its own runtime `PermissionLog` (Instance/
+                // Worker) for ongoing dedup-logging; nothing further to do here.
+                crate::permission::PolicyOutcome::Start => {}
+            }
+
             match Instance::build(
                 cfg,
                 &global,
                 store.clone(),
-                global_sem.clone(),
+                global_gate.clone(),
                 global_bw.clone(),
                 Some(self.metrics.clone()),
                 &deps,
@@ -186,6 +261,14 @@ impl App {
                 Ok(inst) => {
                     tracing::info!(instance = %id, active = inst.is_active(), "instance started");
                     let inst = Arc::new(inst);
+                    // Feature A: this instance started despite startup violation(s) only under `retain`
+                    // (otherwise it would have been skipped/aborted above). The startup loop already
+                    // emitted one `PermissionDenied` per violation; seed the runtime ingress dedup-log so
+                    // the first rescan does not emit a duplicate for the same (path, kind) — preserving
+                    // "emitted once per distinct (path, error kind)".
+                    if !violations.is_empty() {
+                        inst.seed_permission_log(&violations, now_ms());
+                    }
                     control_instances.push(inst.clone());
                     let child = cancel.child_token();
                     let run_inst = inst.clone();
@@ -207,13 +290,10 @@ impl App {
         // P3 control plane (DESIGN §15/§16): subscribe the `cmd/#` topic space on the Unified
         // Namespace and answer get-config / get-status / trigger / set-activation via `reply_to`.
         // Messaging may be absent on some platforms — the plane then degrades to a no-op (DESIGN §6).
-        let control = Arc::new(ControlPlane::build(
-            msg.clone(),
-            &self.config,
-            &global,
-            store.clone(),
-            control_instances,
-        ));
+        let control = Arc::new(
+            ControlPlane::build(msg.clone(), &self.config, &global, store.clone(), control_instances)
+                .with_disabled(disabled_infos),
+        );
         if let Err(e) = control.clone().start().await {
             tracing::warn!(error = %e, "control plane failed to subscribe; continuing without it");
         }
@@ -292,6 +372,8 @@ mod tests {
             retry: None,
             limits: None,
             topics: None,
+            on_permission_error: None,
+            priority: 100,
         }
     }
 
@@ -322,5 +404,106 @@ mod tests {
         let (kept, dropped) = dedup_instance_ids(vec![]);
         assert!(kept.is_empty());
         assert!(dropped.is_empty());
+    }
+
+    // ---- Feature A: the same startup-validation composition `App::run`'s per-instance loop uses -----
+    //
+    // `App::run` itself needs a full `GgCommons` harness to unit-test (this crate's convention — see
+    // the integration tests under `tests/`, none of which drive `App::run` directly). These tests
+    // instead exercise the EXACT decision pipeline that loop applies to each `cfg` — resolve the policy,
+    // validate, apply the policy — with real tempdirs, so `disableInstance`/`fatal`/`retain` and the
+    // "every instance skipped → nothing would start" invariant that feeds the existing `handles.is_empty
+    // ()` bail (unchanged by this feature) are all verified end-to-end.
+
+    use crate::config::PermissionPolicy;
+    use crate::permission::{self, PolicyOutcome};
+
+    fn bad_ingress_cfg(id: &str, policy: Option<PermissionPolicy>) -> InstanceCfg {
+        // A FILE where the ingress dir is expected makes startup validation fail deterministically.
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("f.txt");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        std::mem::forget(dir); // keep the tempdir alive for the duration of the test
+        let mut c = cfg(id, not_a_dir.to_str().unwrap());
+        c.on_permission_error = policy;
+        c
+    }
+
+    fn outcome_for(cfg: &InstanceCfg, global: &config::GlobalCfg) -> PolicyOutcome {
+        let policy = config::resolve_permission_policy(cfg, global);
+        let violations = permission::validate_instance(cfg);
+        permission::apply_policy(policy, &violations)
+    }
+
+    #[test]
+    fn startup_policy_disable_instance_skips_just_that_instance() {
+        let bad = bad_ingress_cfg("bad", None); // inherits the component default
+        let global = config::GlobalCfg::default(); // disableInstance
+        assert_eq!(outcome_for(&bad, &global), PolicyOutcome::Skip);
+    }
+
+    #[test]
+    fn startup_policy_fatal_would_abort_the_whole_component() {
+        let bad = bad_ingress_cfg("bad", Some(PermissionPolicy::Fatal));
+        let global = config::GlobalCfg::default();
+        assert_eq!(outcome_for(&bad, &global), PolicyOutcome::Fatal);
+    }
+
+    #[test]
+    fn startup_policy_retain_starts_the_instance_anyway() {
+        let bad = bad_ingress_cfg("bad", Some(PermissionPolicy::Retain));
+        let global = config::GlobalCfg::default();
+        assert_eq!(outcome_for(&bad, &global), PolicyOutcome::Start);
+    }
+
+    #[test]
+    fn startup_policy_clean_instance_always_starts_regardless_of_policy() {
+        // Real, per-test-unique tempdirs for BOTH ingress and egress — the shared `cfg()` helper's
+        // hardcoded `/out` egress path is fine for the other tests here (they only care that ANY
+        // violation exists), but this test needs a genuinely clean instance, and a literal path shared
+        // across parallel tests doing real create/write/remove probes is itself a race.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let mut clean = cfg("ok", src.path().to_str().unwrap());
+        clean.egress = vec![crate::config::EgressCfg::Local(crate::config::LocalEgress {
+            path: dst.path().to_path_buf(),
+            fsync: false,
+        })];
+        for policy in [
+            PermissionPolicy::DisableInstance,
+            PermissionPolicy::Fatal,
+            PermissionPolicy::Retain,
+        ] {
+            clean.on_permission_error = Some(policy);
+            assert_eq!(outcome_for(&clean, &config::GlobalCfg::default()), PolicyOutcome::Start);
+        }
+    }
+
+    #[test]
+    fn startup_policy_zero_viable_instances_is_what_feeds_the_existing_bail() {
+        // Every instance in the set resolves to `Skip` under the default policy → the count of `Start`
+        // outcomes is zero, which is exactly the condition `App::run`'s pre-existing `handles.is_empty()`
+        // guard (unchanged by this feature) turns into a process-fatal error (FR-CFG-4's "fail only if
+        // zero instances start" rule, now also reachable via an all-inaccessible instance set).
+        let global = config::GlobalCfg::default();
+        let cfgs = [bad_ingress_cfg("a", None), bad_ingress_cfg("b", None)];
+        let started = cfgs
+            .iter()
+            .filter(|c| outcome_for(c, &global) == PolicyOutcome::Start)
+            .count();
+        assert_eq!(started, 0, "an all-inaccessible instance set starts nothing");
+    }
+
+    #[test]
+    fn instance_level_override_wins_over_a_fatal_global_default() {
+        // A per-instance `retain` override still starts even when the component default is `fatal` —
+        // proving instance-scoped isolation: one bad/overridden instance's policy never escalates to
+        // the whole component unless ITS OWN resolved policy says so.
+        let bad = bad_ingress_cfg("bad", Some(PermissionPolicy::Retain));
+        let global = config::GlobalCfg {
+            on_permission_error: PermissionPolicy::Fatal,
+            ..Default::default()
+        };
+        assert_eq!(outcome_for(&bad, &global), PolicyOutcome::Start);
     }
 }

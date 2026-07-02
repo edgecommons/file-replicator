@@ -46,6 +46,7 @@ use crate::dest::SharedDestination;
 use crate::domain::{Checksum, Delivered, DestPhase, ItemState, ProgressSink, ResumeState, WorkItem};
 use crate::error::{ReplError, Result};
 use crate::events::{Event, Events, ProgressThrottle};
+use crate::permission::{PermissionLog, Role};
 use crate::ratelimit::Bandwidth;
 use crate::state::{StatsDelta, StateStore};
 
@@ -259,6 +260,16 @@ pub struct Worker {
     /// DESIGN §17). A no-op [`Events::disabled`] by default, so a worker built without messaging (or
     /// in a unit test) runs the exact P1/P2 pipeline with zero event overhead.
     events: Events,
+    /// Feature A (`src/permission.rs`) dedup-log for egress permission errors — ALWAYS logged once
+    /// (not on every retry attempt, and not once per file) plus a `PermissionDenied` event, before the
+    /// item follows the existing retry/quarantine path unchanged. Keyed by destination **label**, so a
+    /// broken-permission destination logs/emits once for the destination (bounding the dedup map to the
+    /// small, fixed number of configured destinations — no per-file growth). This is the instance's OWN,
+    /// separate log from the ingress `PermissionLog` (see [`crate::instance::Instance`]): the two have
+    /// different key spaces (destination label vs. ingress directory path) and different lifecycles
+    /// (ingress evicts recovered paths every tick; egress is inherently bounded by destination count),
+    /// so they are deliberately NOT shared. A fresh, unshared [`PermissionLog`] by default.
+    perm_log: Arc<PermissionLog>,
 }
 
 impl Worker {
@@ -320,6 +331,7 @@ impl Worker {
             rng: Arc::new(Mutex::new(StdRng::from_entropy())),
             metrics,
             events: Events::disabled(),
+            perm_log: Arc::new(PermissionLog::new()),
         }
     }
 
@@ -328,6 +340,15 @@ impl Worker {
     /// worker is shared behind an `Arc`. With the default [`Events::disabled`] every emit is a no-op.
     pub fn with_events(mut self, events: Events) -> Self {
         self.events = events;
+        self
+    }
+
+    /// Attach the Feature A permission dedup-log (the P3 control-plane wiring path,
+    /// [`crate::instance::Instance::build_with_dests`]). With the default fresh [`PermissionLog`] every
+    /// worker still dedups correctly — this just lets the instance own the `Arc` for its own lifetime
+    /// bookkeeping.
+    pub fn with_permission_log(mut self, perm_log: Arc<PermissionLog>) -> Self {
+        self.perm_log = perm_log;
         self
     }
 
@@ -457,6 +478,7 @@ impl Worker {
                     now,
                     attempts_so_far: attempts_of(&slot.label),
                     rng: self.rng.clone(),
+                    perm_log: self.perm_log.clone(),
                 };
                 set.spawn(run_one_dest(ctx));
             }
@@ -974,6 +996,8 @@ struct DestAttemptCtx {
     /// this is its first attempt) — the per-destination analogue of [`WorkItem::attempts`].
     attempts_so_far: u32,
     rng: Arc<Mutex<StdRng>>,
+    /// Feature A dedup-log (`src/permission.rs`) — see [`Worker::perm_log`].
+    perm_log: Arc<PermissionLog>,
 }
 
 /// Run one destination's independent deliver → verify attempt (DESIGN §20-B): the fan-out unit spawned
@@ -997,6 +1021,7 @@ async fn run_one_dest(ctx: DestAttemptCtx) -> Result<(String, DestOutcome)> {
         now,
         attempts_so_far,
         rng,
+        perm_log,
     } = ctx;
 
     let resume = store.load_resume(&instance, &item.relpath, &label)?;
@@ -1073,6 +1098,44 @@ async fn run_one_dest(ctx: DestAttemptCtx) -> Result<(String, DestOutcome)> {
             Ok((label, DestOutcome::Verified))
         }
         Err(e) => {
+            // Feature A (`src/permission.rs`): a permission-denied failure on this destination is
+            // ALWAYS logged (once, deduplicated — not on every retry attempt, and not once per file)
+            // and gets a `PermissionDenied` event, BEFORE falling through to the unchanged
+            // retry/quarantine decision below.
+            //
+            // Detection is by CLASSIFICATION ([`ReplError::is_permission_denied`]), not by matching the
+            // raw `Io` variant: every shipping backend funnels its io errors through `classify_io` /
+            // `classify_sftp` (which collapse the `io::ErrorKind` into a `Permanent`/`PermissionDenied`
+            // string), so a raw `Io(PermissionDenied)` never reaches here in production — matching on it
+            // was dead code that left the egress contract unmet (only fake test destinations inject it).
+            //
+            // The dedup key is the destination `label` (NOT `{label}:{relpath}`): a broken-permission
+            // destination should log/emit ONCE for the destination, not once per file — keying per file
+            // would both defeat "log once" on a high-churn spool AND grow the dedup map without bound
+            // (one entry per distinct relpath, only freed at instance stop). Per-label keying bounds the
+            // map to the (small, fixed) number of configured destinations, so no `recovered()`-style
+            // eviction is needed; a `RELOG_INTERVAL_MS` re-log still gives a stuck destination periodic
+            // visibility. There is no local filesystem path for every destination kind (e.g. S3), so the
+            // destination label stands in for "path" in the event body.
+            if e.is_permission_denied()
+                && perm_log.should_log(&label, std::io::ErrorKind::PermissionDenied, now)
+            {
+                tracing::warn!(
+                    instance = %instance, relpath = %item.relpath, dest = %label,
+                    "destination permission denied; will not spam this every retry / file"
+                );
+                events
+                    .instance_event(
+                        &instance,
+                        Event::PermissionDenied {
+                            path: label.clone(),
+                            role: Role::Egress.as_str().to_string(),
+                            error: e.to_string(),
+                        },
+                        now,
+                    )
+                    .await;
+            }
             let permanent = e.is_permanent();
             let err_str = e.to_string();
             // `RetryPolicy::decide` reads `attempts`/`discovered_at` off a `WorkItem` — probe with
@@ -2464,6 +2527,151 @@ mod tests {
         assert!(quarantined[0].body["quarantinePath"].as_str().unwrap().ends_with("bad.dat"));
         // A permanent failure never rides the retry path.
         assert!(fake.events_named("ReplicationFailed").is_empty());
+    }
+
+    // ---- Feature A: egress permission-denied dedup logging (`src/permission.rs`) -------------------
+
+    #[tokio::test]
+    async fn permission_denied_on_egress_emits_event_and_still_exhausts() {
+        // A permission-denied delivery error ALWAYS gets a `PermissionDenied` event (role=egress), and
+        // the item still follows the unchanged existing retry/quarantine path (permanent → exhausted).
+        //
+        // Crucially this drives the *production* classification path: a real backend (e.g. `LocalDest`)
+        // never returns the raw `Io` variant — it funnels every io error through `ReplError::classify_io`,
+        // which turns `PermissionDenied` into `ReplError::PermissionDenied`. The worker must detect THAT
+        // (via `is_permission_denied`), so this test injects exactly what `classify_io` produces rather
+        // than the raw `Io` a fake could conveniently return (which would give false confidence — the
+        // original bug was that only the raw-`Io` branch existed, and no shipping destination hits it).
+        let src = tempfile::tempdir().unwrap();
+        let store = store();
+        std::fs::write(src.path().join("bad.dat"), b"oops").unwrap();
+        store.upsert_ready(INST, "bad.dat", 4, 0, 1).unwrap();
+        let dest: SharedDestination = Arc::new(FailingDest {
+            err: || {
+                ReplError::classify_io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
+            },
+        });
+        let (fake, events) = recording_events();
+        let worker = Worker::new(
+            INST.into(),
+            store.clone(),
+            dest,
+            completion(OnSuccess::Delete),
+            src.path().to_path_buf(),
+            Bandwidth::unlimited(),
+            RetryPolicy::default(),
+            None,
+        )
+        .with_events(events);
+
+        let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
+        assert_eq!(
+            worker.process_item(&item, 100).await,
+            ItemState::Retained,
+            "permission denied classifies as permanent"
+        );
+
+        let denied = fake.events_named("PermissionDenied");
+        assert_eq!(denied.len(), 1);
+        assert_eq!(denied[0].body["role"], serde_json::json!("egress"));
+        assert_eq!(denied[0].body["path"], serde_json::json!("failing"), "keyed on the destination label");
+        assert!(denied[0].body["error"].as_str().unwrap().contains("denied"));
+        // The existing permanent-failure path is unchanged: still exhausted.
+        assert_eq!(fake.events_named("RetriesExhausted").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn permission_denied_on_egress_logs_once_not_per_attempt() {
+        // Drives `run_one_dest` directly (twice, same destination label) to prove the worker's wiring of
+        // `PermissionLog` actually dedups across attempts — the must-have from the design, distinct from
+        // `permission.rs`'s own unit tests of the dedup logic in isolation.
+        let src = tempfile::tempdir().unwrap();
+        let store = store();
+        std::fs::write(src.path().join("bad.dat"), b"oops").unwrap();
+        store.upsert_ready(INST, "bad.dat", 4, 0, 1).unwrap();
+        let dest: SharedDestination = Arc::new(FailingDest {
+            err: || ReplError::PermissionDenied("sftp error: permission_denied".into()),
+        });
+        let (fake, events) = recording_events();
+        let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
+        let perm_log = Arc::new(PermissionLog::new());
+
+        let ctx = |now: i64| DestAttemptCtx {
+            instance: INST.to_string(),
+            item: item.clone(),
+            label: "failing".to_string(),
+            dest: dest.clone(),
+            store: store.clone(),
+            bw: Bandwidth::unlimited(),
+            retry: RetryPolicy::default(),
+            verify_policy: Verify::Checksum,
+            events: events.clone(),
+            now,
+            attempts_so_far: 0,
+            rng: Arc::new(Mutex::new(StdRng::from_entropy())),
+            perm_log: perm_log.clone(),
+        };
+
+        run_one_dest(ctx(100)).await.unwrap();
+        run_one_dest(ctx(200)).await.unwrap(); // same destination label — must not re-emit
+
+        assert_eq!(
+            fake.events_named("PermissionDenied").len(),
+            1,
+            "deduplicated across repeated attempts, not one per attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_denied_on_egress_dedups_per_destination_not_per_file() {
+        // A broken-permission destination hit by many DISTINCT files logs/emits ONCE for the destination
+        // — not once per file. This is both the "log once" guarantee and the bound that keeps the egress
+        // dedup map from growing per-relpath on a high-churn spool (the coupled memory-leak finding).
+        let src = tempfile::tempdir().unwrap();
+        let store = store();
+        let (fake, events) = recording_events();
+        let perm_log = Arc::new(PermissionLog::new());
+        let dest: SharedDestination = Arc::new(FailingDest {
+            err: || ReplError::PermissionDenied("io: denied (PermissionDenied)".into()),
+        });
+
+        for (i, now) in [(0u32, 100i64), (1, 200), (2, 300)] {
+            let relpath = format!("f{i}.dat");
+            std::fs::write(src.path().join(&relpath), b"oops").unwrap();
+            store.upsert_ready(INST, &relpath, 4, 0, 1).unwrap();
+            let item = store
+                .claim_ready(INST, 10, now)
+                .unwrap()
+                .into_iter()
+                .find(|it| it.relpath == relpath)
+                .unwrap();
+            run_one_dest(DestAttemptCtx {
+                instance: INST.to_string(),
+                item,
+                label: "failing".to_string(),
+                dest: dest.clone(),
+                store: store.clone(),
+                bw: Bandwidth::unlimited(),
+                retry: RetryPolicy::default(),
+                verify_policy: Verify::Checksum,
+                events: events.clone(),
+                now,
+                attempts_so_far: 0,
+                rng: Arc::new(Mutex::new(StdRng::from_entropy())),
+                perm_log: perm_log.clone(),
+            })
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            fake.events_named("PermissionDenied").len(),
+            1,
+            "one event for the destination, not one per distinct file"
+        );
     }
 
     #[tokio::test]

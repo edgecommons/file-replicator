@@ -153,6 +153,15 @@ pub enum Event {
     Disconnected { link: String },
     /// **Deferred (circuit-breaker, §13.4)**: the destination link recovered.
     Reconnected { link: String },
+    /// A permission/access error on one of the instance's directories — startup validation or a
+    /// runtime rescan/transfer (`src/permission.rs`, Feature A). ALWAYS emitted once per dedup-logged
+    /// occurrence (log-once, not per rescan — see [`crate::permission::PermissionLog`]). `role` is
+    /// `"ingress"`/`"egress"`/`"archive"`/`"failed"` (see [`crate::permission::Role`]).
+    PermissionDenied {
+        path: String,
+        role: String,
+        error: String,
+    },
 }
 
 impl Event {
@@ -179,6 +188,7 @@ impl Event {
             Event::ScheduleComplete { .. } => "ScheduleComplete",
             Event::Disconnected { .. } => "Disconnected",
             Event::Reconnected { .. } => "Reconnected",
+            Event::PermissionDenied { .. } => "PermissionDenied",
         }
     }
 
@@ -283,6 +293,9 @@ impl Event {
             Event::ScheduleComplete { mode } => obj(json!({ "mode": mode })),
             Event::Disconnected { link } | Event::Reconnected { link } => {
                 obj(json!({ "link": link }))
+            }
+            Event::PermissionDenied { path, role, error } => {
+                obj(json!({ "path": path, "role": role, "error": error }))
             }
         }
     }
@@ -923,6 +936,41 @@ mod tests {
         assert!(t.should_emit(0, 0));
         assert!(t.should_emit(1, 0), "1% jump with step clamped to 1");
         assert!(!t.should_emit(1, 0), "no change");
+    }
+
+    #[test]
+    fn permission_denied_event_name_and_fields() {
+        let ev = Event::PermissionDenied {
+            path: "/data/in".into(),
+            role: "ingress".into(),
+            error: "permission denied (os error 13)".into(),
+        };
+        assert_eq!(ev.name(), "PermissionDenied");
+        let body = event_body(&ev, Some("plant-1"), 0);
+        assert_eq!(body["event"], json!("PermissionDenied"));
+        assert_eq!(body["path"], json!("/data/in"));
+        assert_eq!(body["role"], json!("ingress"));
+        assert_eq!(body["error"], json!("permission denied (os error 13)"));
+    }
+
+    #[tokio::test]
+    async fn permission_denied_event_rides_the_instance_topic() {
+        let fake = FakeMessaging::new();
+        let ev = emitter(fake.clone());
+        ev.instance_event(
+            "plant-1",
+            Event::PermissionDenied {
+                path: "/data/in".into(),
+                role: "ingress".into(),
+                error: "denied".into(),
+            },
+            0,
+        )
+        .await;
+        assert_eq!(
+            fake.topics(),
+            vec!["gw-01/file-replicator/evt/instances/plant-1/PermissionDenied"]
+        );
     }
 
     // ---- envelope + emit (through the fake) ----------------------------------------------------

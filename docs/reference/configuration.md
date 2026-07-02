@@ -13,9 +13,10 @@ The component owns the `component` section (`component.global` + `component.inst
 |---|---|---|---|
 | `defaults.retry` | object | — | Instance retry defaults (overridden per instance). See **retry**. |
 | `defaults.timezone` | string | UTC | Default schedule timezone. |
-| `limits.maxConcurrentFiles` | int | 8 | Global in-flight cap across all instances. |
+| `limits.maxConcurrentFiles` | int | 64 | Global in-flight cap across all instances. |
 | `limits.maxBandwidth` | string | — | Global aggregate byte-rate cap, e.g. `"50MB/s"` (P1). |
 | `topics.prefix` | string | `{ThingName}/file-replicator` | UNS prefix template (DESIGN §15). |
+| `onPermissionError` | `"disableInstance"` \| `"fatal"` \| `"retain"` | `"disableInstance"` | Component-wide default for what happens when an instance's ingress/egress/archive/failed directory fails a startup readable/writable check. An instance's own `onPermissionError` (below) overrides this. See **Permission handling** in `explanation.md`. |
 
 ## `component.instances[]` — one per watched directory
 | Key | Type | Default | Notes |
@@ -29,6 +30,8 @@ The component owns the `component` section (`component.global` + `component.inst
 | `retry` | object | global default | See **retry**. |
 | `limits` | object | — | `maxConcurrentFiles`, `maxBandwidth` (per-instance). |
 | `topics` | object | global prefix | `{ "prefix": "…" }` override. |
+| `onPermissionError` | `"disableInstance"` \| `"fatal"` \| `"retain"` | inherits `component.global.onPermissionError` | Per-instance override of the component-wide permission-error policy. `disableInstance` skips just this instance (its siblings keep running); `fatal` aborts the whole component; `retain` starts the instance anyway, leaning on runtime dedup-logging + the `PermissionDenied` event for ongoing diagnostics. If **every** instance ends up disabled (or the set is empty), the component still fails fast (FR-CFG-4's "zero instances started" rule). |
+| `priority` | int | `100` | Cross-instance **global** concurrency-admission priority: under contention for the shared `component.global.limits.maxConcurrentFiles` cap, a **lower** number is admitted first (the same 0-255-ish convention as elsewhere; ties broken FIFO by enqueue order). Governs ONLY the global admission decision — it does not affect this instance's own `limits.maxConcurrentFiles` cap, and there is **no bandwidth weighting** by priority. Demand-adaptive: an instance not currently contending for a global slot reserves nothing, regardless of its priority. See **Cross-instance priority** in `explanation.md`. |
 
 ### `ingress`
 | Key | Type | Default | Notes |

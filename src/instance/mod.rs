@@ -27,6 +27,7 @@ pub mod queue;
 pub mod watcher;
 pub mod worker;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,23 +35,24 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, TimeZone, Utc};
 use ggcommons::metrics::MetricService;
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::admission::PriorityGate;
 use crate::config::{EgressCfg, GlobalCfg, InstanceCfg, ScheduleCfg, WindowClose};
 use crate::control::{instance_state_snapshot, InstanceControl};
 use crate::dest::{build_destination, DestDeps, SharedDestination};
 use crate::domain::{ItemState, WorkItem};
 use crate::error::Result;
 use crate::events::{Event, Events};
+use crate::permission::{PermissionLog, Role};
 use crate::ratelimit::{parse_byte_rate, Bandwidth, Clock, SystemClock, TokenBucket};
 use crate::readiness::RealProbe;
 use crate::schedule::{Admission, Schedule};
 use crate::state::StateStore;
 
 use queue::Queue;
-use watcher::Watcher;
+use watcher::{ScanIssue, Watcher};
 use worker::{RetryPolicy, Worker};
 
 /// Default per-instance concurrency when neither the instance nor `component.global` sets a cap.
@@ -111,6 +113,14 @@ pub struct Instance {
     /// [`Events::disabled`] when messaging is absent (or in unit tests), so the P1/P2 engine runs
     /// unchanged. The worker holds a clone for the per-file lifecycle events.
     events: Events,
+    /// Feature A dedup-log state for **ingress** permission/access errors on this instance's watched
+    /// directory (`src/permission.rs`) — the "log once, not per rescan" gate for [`report_scan_issues`].
+    /// This is a SEPARATE `PermissionLog` from the worker's egress one ([`Worker::perm_log`]): the two
+    /// have different key spaces (ingress directory paths vs. destination labels) and lifecycles (this
+    /// one evicts recovered paths every tick via [`PermissionLog::recovered`]; the egress one is bounded
+    /// by the fixed destination count), so sharing a single log would let a per-tick ingress recovery
+    /// pass wrongly evict egress entries and re-arm egress spam.
+    perm_log: Arc<PermissionLog>,
 }
 
 /// Cross-tick schedule evaluation state (DESIGN §12), synchronous-only (no `.await` while a lock on
@@ -146,14 +156,15 @@ fn ms_to_utc(now_ms: i64) -> DateTime<Utc> {
 }
 
 impl Instance {
-    /// Assemble an instance from its config plus the process-wide shared governors (the global
-    /// concurrency semaphore and the global bandwidth bucket) and the shared durable store.
+    /// Assemble an instance from its config plus the process-wide shared governors (the
+    /// priority-aware global concurrency admission gate — Feature B, `src/admission.rs` — and the
+    /// global bandwidth bucket) and the shared durable store.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         cfg: InstanceCfg,
         global: &GlobalCfg,
         store: Arc<dyn StateStore>,
-        global_sem: Arc<Semaphore>,
+        global_gate: Arc<PriorityGate>,
         global_bw: Arc<TokenBucket>,
         metrics: Option<Arc<dyn MetricService>>,
         deps: &DestDeps,
@@ -174,7 +185,7 @@ impl Instance {
                 build_destination(e, &deps).map_err(|err| anyhow::anyhow!("instance '{}': {err}", cfg.id))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Self::build_with_dests(cfg, global, store, global_sem, global_bw, metrics, dests, events)
+        Self::build_with_dests(cfg, global, store, global_gate, global_bw, metrics, dests, events)
     }
 
     /// Assemble an instance with a **caller-supplied** [`SharedDestination`], bypassing the egress
@@ -189,13 +200,13 @@ impl Instance {
         cfg: InstanceCfg,
         global: &GlobalCfg,
         store: Arc<dyn StateStore>,
-        global_sem: Arc<Semaphore>,
+        global_gate: Arc<PriorityGate>,
         global_bw: Arc<TokenBucket>,
         metrics: Option<Arc<dyn MetricService>>,
         dest: SharedDestination,
         events: Events,
     ) -> anyhow::Result<Instance> {
-        Self::build_with_dests(cfg, global, store, global_sem, global_bw, metrics, vec![dest], events)
+        Self::build_with_dests(cfg, global, store, global_gate, global_bw, metrics, vec![dest], events)
     }
 
     /// Assemble an instance that fans a claimed item out to every destination in `dests` (P6, DESIGN
@@ -208,7 +219,7 @@ impl Instance {
         cfg: InstanceCfg,
         global: &GlobalCfg,
         store: Arc<dyn StateStore>,
-        global_sem: Arc<Semaphore>,
+        global_gate: Arc<PriorityGate>,
         global_bw: Arc<TokenBucket>,
         metrics: Option<Arc<dyn MetricService>>,
         dests: Vec<SharedDestination>,
@@ -294,7 +305,22 @@ impl Instance {
             .collect::<Vec<_>>()
             .join("+");
         let dest_supports_resume = dests.iter().all(|d| d.supports_resume());
-        let queue = Queue::new(cfg.id.clone(), store.clone(), per_limit, global_sem);
+        // Feature B (`src/admission.rs`): this instance's cross-instance GLOBAL admission priority
+        // (lower = higher priority) rides in with it so `Queue::acquire_slot` can hand it to
+        // `PriorityGate::acquire` — the per-instance semaphore below is unaffected by priority.
+        let queue = Queue::new(cfg.id.clone(), store.clone(), per_limit, global_gate, cfg.priority);
+        // Feature A (`src/permission.rs`): two dedup-logs, not one — the ingress one has a natural
+        // "still erroring" set every tick (this scan's issues) so it evicts recovered paths and stays
+        // tightly bounded (keyed by ingress directory path). The worker's egress errors have no
+        // equivalent whole-set signal per attempt, so it gets its OWN log, keyed by destination LABEL —
+        // a broken-permission destination is logged/emitted once for the destination (not once per
+        // file), which bounds that map to the small, fixed number of configured destinations (no
+        // per-relpath growth) and is dropped entirely at instance stop when the `Arc` is dropped. The
+        // two must stay separate: sharing one would let the ingress per-tick `recovered()` pass (whose
+        // still-erroring set is ingress paths only) evict every egress entry each tick and re-arm the
+        // egress spam this feature exists to prevent.
+        let perm_log = Arc::new(PermissionLog::new());
+        let worker_perm_log = Arc::new(PermissionLog::new());
         let worker = Arc::new(
             Worker::new_multi(
                 cfg.id.clone(),
@@ -306,7 +332,8 @@ impl Instance {
                 retry,
                 metrics,
             )
-            .with_events(events.clone()),
+            .with_events(events.clone())
+            .with_permission_log(worker_perm_log),
         );
 
         // Activation precedence (DESIGN §7.5): persisted runtime state ▸ config `enabled` ▸ default.
@@ -334,6 +361,7 @@ impl Instance {
             worker,
             store,
             events,
+            perm_log,
         })
     }
 
@@ -357,6 +385,24 @@ impl Instance {
         self.store.clear_activation(&self.id)?;
         self.active.store(self.config_enabled, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Feature A: seed the ingress dedup-log with startup permission [`Violation`](crate::permission::Violation)s
+    /// so a `retain` instance — one started *despite* a startup violation — does NOT re-emit a duplicate
+    /// `PermissionDenied` on its first rescan. The startup path ([`crate::app`]) already emitted exactly
+    /// one event per violation (that is the "once"); marking each ingress violation as already-logged at
+    /// `now` keeps the first tick, still inside the quiet window, silent for the same (path, kind) — so
+    /// the "emitted once per distinct (path, error kind)" guarantee holds across the startup→runtime
+    /// boundary. Only ingress-role violations matter: the runtime per-rescan re-emit path is
+    /// [`report_scan_issues`](Self::report_scan_issues) (ingress only); egress/archive/failed roles have
+    /// no per-rescan runtime re-emit to suppress. If the ingress path has actually recovered by the first
+    /// tick, [`PermissionLog::recovered`] evicts the seed and logs the usual INFO "access restored".
+    pub fn seed_permission_log(&self, violations: &[crate::permission::Violation], now: i64) {
+        for v in violations {
+            if v.role == Role::Ingress {
+                let _ = self.perm_log.should_log(&v.path.display().to_string(), v.kind, now);
+            }
+        }
     }
 
     /// One engine iteration (the testable unit): discover ready files → durably enqueue → claim a
@@ -391,7 +437,7 @@ impl Instance {
         // state.rs contract that bulk scans go through spawn_blocking). It mutates the readiness
         // tracker behind the shared `Arc<Mutex<Watcher>>`, so state persists across ticks.
         let watcher = self.watcher.clone();
-        let ready = match tokio::task::spawn_blocking(move || {
+        let (ready, issues) = match tokio::task::spawn_blocking(move || {
             let mut w = watcher.lock().expect("watcher mutex");
             w.discover(&RealProbe)
         })
@@ -400,9 +446,12 @@ impl Instance {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(instance = %self.id, error = %e, "discovery task failed");
-                Vec::new()
+                (Vec::new(), Vec::new())
             }
         };
+        // Feature A: dedup-log + emit `PermissionDenied` for any directory the scan couldn't read,
+        // instead of the old silent per-rescan skip (`src/permission.rs`).
+        self.report_scan_issues(&issues, now).await;
         let mut discovered: u64 = 0;
         for c in ready {
             // A brand-new relpath (no prior durable row) is a genuine `FileReady` transition; a row
@@ -500,6 +549,55 @@ impl Instance {
         // subscriber renders correctly. No-op when messaging is absent.
         if discovered > 0 || processed {
             self.publish_state(now).await;
+        }
+    }
+
+    /// Feature A (`src/permission.rs`): turn this tick's ingress [`ScanIssue`]s into the ALWAYS
+    /// log-once + `PermissionDenied` event contract, instead of the watcher's old silent per-rescan
+    /// `debug!`. Every issue is deduplicated per (instance, path, error-kind) via the shared
+    /// [`PermissionLog`] — a persistently-inaccessible ingress dir is logged/emitted once, not on
+    /// every reconciliation rescan. Paths that recovered since the last tick (no longer erroring) are
+    /// evicted from the dedup state and get a one-line INFO recovery log (also a state change worth
+    /// re-arming logging for, per the "log once, re-log on state change" contract).
+    async fn report_scan_issues(&self, issues: &[ScanIssue], now: i64) {
+        let still_erroring: HashSet<String> = issues
+            .iter()
+            .map(|i| i.path.display().to_string())
+            .collect();
+        for issue in issues {
+            let path = issue.path.display().to_string();
+            if !self.perm_log.should_log(&path, issue.kind, now) {
+                continue;
+            }
+            let msg = format!("{:?}", issue.kind);
+            if issue.kind == std::io::ErrorKind::PermissionDenied {
+                tracing::warn!(
+                    instance = %self.id, path = %path, kind = ?issue.kind,
+                    "ingress directory permission denied; will not spam this every rescan"
+                );
+                self.events
+                    .instance_event(
+                        &self.id,
+                        Event::PermissionDenied {
+                            path: path.clone(),
+                            role: Role::Ingress.as_str().to_string(),
+                            error: msg,
+                        },
+                        now,
+                    )
+                    .await;
+            } else {
+                // Other unreadable-directory kinds (e.g. NotFound — a watched subdir was removed) still
+                // get the same dedup treatment so they don't spam either, but are not a *permission*
+                // event.
+                tracing::debug!(
+                    instance = %self.id, path = %path, kind = ?issue.kind,
+                    "ingress directory unreadable; will not spam this every rescan"
+                );
+            }
+        }
+        for recovered in self.perm_log.recovered(&still_erroring) {
+            tracing::info!(instance = %self.id, path = %recovered, "ingress directory access restored");
         }
     }
 
@@ -964,6 +1062,8 @@ mod tests {
             retry: None,
             limits: None,
             topics: None,
+            on_permission_error: None,
+            priority: 100,
         }
     }
 
@@ -972,7 +1072,7 @@ mod tests {
             cfg,
             &GlobalCfg::default(),
             store,
-            Arc::new(Semaphore::new(8)),
+            Arc::new(PriorityGate::new(8)),
             Arc::new(TokenBucket::unlimited()),
             None,
             &DestDeps::default(),
@@ -1172,7 +1272,7 @@ mod tests {
             cfg,
             &GlobalCfg::default(),
             store,
-            Arc::new(Semaphore::new(8)),
+            Arc::new(PriorityGate::new(8)),
             Arc::new(TokenBucket::unlimited()),
             None,
             &DestDeps::default(),
@@ -1197,7 +1297,7 @@ mod tests {
             cfg,
             &GlobalCfg::default(),
             store,
-            Arc::new(Semaphore::new(8)),
+            Arc::new(PriorityGate::new(8)),
             Arc::new(TokenBucket::unlimited()),
             None,
             &DestDeps::default(),
@@ -1247,6 +1347,111 @@ mod tests {
         }
     }
 
+    // ---- Feature A: INGRESS runtime dedup + event wiring (`report_scan_issues`) ------------------
+    //
+    // The engine-level counterpart of `permission.rs`'s isolated `PermissionLog` unit tests and the
+    // worker's egress dedup test: these drive `Instance::report_scan_issues` directly (a `ScanIssue`
+    // with a deterministic `PermissionDenied` kind — dodging the platform-dependent kind a real
+    // unreadable dir yields) to prove the exact "log once, not per rescan; re-arm on recovery" wiring
+    // that replaces the watcher's old silent per-rescan `debug!`.
+
+    fn build_with_events(cfg: InstanceCfg, store: Arc<dyn StateStore>, events: Events) -> Instance {
+        Instance::build(
+            cfg,
+            &GlobalCfg::default(),
+            store,
+            Arc::new(PriorityGate::new(8)),
+            Arc::new(TokenBucket::unlimited()),
+            None,
+            &DestDeps::default(),
+            events,
+        )
+        .expect("instance builds")
+    }
+
+    #[tokio::test]
+    async fn ingress_permission_denied_logs_once_and_re_arms_on_recovery() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let (fake, events) = recording_events();
+        let inst = build_with_events(instance_cfg("iperm", src.path(), dst.path(), true), store, events);
+
+        let bad = ScanIssue {
+            path: src.path().join("locked-subdir"),
+            kind: std::io::ErrorKind::PermissionDenied,
+        };
+        // Two rescans' worth of the SAME still-erroring ingress issue → exactly one event.
+        inst.report_scan_issues(std::slice::from_ref(&bad), 1_000).await;
+        inst.report_scan_issues(std::slice::from_ref(&bad), 2_000).await;
+        assert_eq!(
+            fake.events_named("PermissionDenied").len(),
+            1,
+            "ingress permission denial is emitted once, not once per rescan"
+        );
+
+        // A clean pass (the path no longer errors) evicts + re-arms the dedup; a later re-break emits
+        // a fresh event (the "re-log on state change" half of the contract).
+        inst.report_scan_issues(&[], 3_000).await;
+        inst.report_scan_issues(std::slice::from_ref(&bad), 4_000).await;
+        assert_eq!(
+            fake.events_named("PermissionDenied").len(),
+            2,
+            "recovery re-arms the dedup, so a subsequent re-break emits again"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_non_permission_scan_issue_dedups_without_emitting_an_event() {
+        // A non-permission unreadable-dir kind (e.g. a watched subdir removed → NotFound) still gets the
+        // dedup treatment (no per-rescan spam) but is NOT a PermissionDenied event.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let (fake, events) = recording_events();
+        let inst = build_with_events(instance_cfg("inf", src.path(), dst.path(), true), store, events);
+
+        let gone = ScanIssue {
+            path: src.path().join("vanished"),
+            kind: std::io::ErrorKind::NotFound,
+        };
+        inst.report_scan_issues(std::slice::from_ref(&gone), 1_000).await;
+        inst.report_scan_issues(std::slice::from_ref(&gone), 2_000).await;
+        assert!(
+            fake.events_named("PermissionDenied").is_empty(),
+            "a NotFound scan issue is deduped but not a permission event"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_permission_log_suppresses_the_first_rescan_reemit_for_a_retain_instance() {
+        // Mirrors app.rs: for a `retain` instance the startup path already emitted one PermissionDenied
+        // per violation; seeding the runtime ingress dedup-log makes the first rescan stay quiet for the
+        // same (path, kind), so the "emitted once per distinct (path, error kind)" guarantee holds across
+        // the startup→runtime boundary.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let (fake, events) = recording_events();
+        let inst = build_with_events(instance_cfg("iseed", src.path(), dst.path(), true), store, events);
+
+        let ingress_path = src.path().join("locked");
+        let violations = vec![crate::permission::Violation {
+            path: ingress_path.clone(),
+            role: Role::Ingress,
+            kind: std::io::ErrorKind::PermissionDenied,
+            msg: "denied".into(),
+        }];
+        inst.seed_permission_log(&violations, 1_000);
+
+        let issue = ScanIssue { path: ingress_path, kind: std::io::ErrorKind::PermissionDenied };
+        inst.report_scan_issues(std::slice::from_ref(&issue), 1_001).await;
+        assert!(
+            fake.events_named("PermissionDenied").is_empty(),
+            "the seeded startup violation suppresses the first-rescan re-emit"
+        );
+    }
+
     #[tokio::test]
     async fn tick_emits_discovery_lifecycle_and_state_events() {
         let src = tempfile::tempdir().unwrap();
@@ -1258,7 +1463,7 @@ mod tests {
             instance_cfg("evt", src.path(), dst.path(), true),
             &GlobalCfg::default(),
             store.clone(),
-            Arc::new(Semaphore::new(8)),
+            Arc::new(PriorityGate::new(8)),
             Arc::new(TokenBucket::unlimited()),
             None,
             &DestDeps::default(),
@@ -1307,7 +1512,7 @@ mod tests {
             instance_cfg("dd", src.path(), dst.path(), true),
             &GlobalCfg::default(),
             store.clone(),
-            Arc::new(Semaphore::new(8)),
+            Arc::new(PriorityGate::new(8)),
             Arc::new(TokenBucket::unlimited()),
             None,
             dest,
@@ -1346,7 +1551,7 @@ mod tests {
                 instance_cfg("cc", src.path(), dst.path(), true),
                 &GlobalCfg::default(),
                 store.clone(),
-                Arc::new(Semaphore::new(8)),
+                Arc::new(PriorityGate::new(8)),
                 Arc::new(TokenBucket::unlimited()),
                 None,
                 dest,
@@ -1389,7 +1594,7 @@ mod tests {
             instance_cfg("off", src.path(), dst.path(), false),
             &GlobalCfg::default(),
             store.clone(),
-            Arc::new(Semaphore::new(8)),
+            Arc::new(PriorityGate::new(8)),
             Arc::new(TokenBucket::unlimited()),
             None,
             &DestDeps::default(),
@@ -1513,7 +1718,7 @@ mod tests {
             instance_cfg_scheduled("cronevt", src.path(), dst.path(), cron_schedule("0 * * * *")),
             &GlobalCfg::default(),
             store.clone(),
-            Arc::new(Semaphore::new(8)),
+            Arc::new(PriorityGate::new(8)),
             Arc::new(TokenBucket::unlimited()),
             None,
             &DestDeps::default(),
@@ -1614,7 +1819,7 @@ mod tests {
             ),
             &GlobalCfg::default(),
             store.clone(),
-            Arc::new(Semaphore::new(8)),
+            Arc::new(PriorityGate::new(8)),
             Arc::new(TokenBucket::unlimited()),
             None,
             &DestDeps::default(),
@@ -1749,7 +1954,7 @@ mod tests {
             cfg,
             &GlobalCfg::default(),
             store.clone(),
-            Arc::new(Semaphore::new(8)),
+            Arc::new(PriorityGate::new(8)),
             Arc::new(TokenBucket::unlimited()),
             None,
             dest,
@@ -1838,7 +2043,7 @@ mod tests {
             cfg,
             &GlobalCfg::default(),
             store.clone(),
-            Arc::new(Semaphore::new(8)),
+            Arc::new(PriorityGate::new(8)),
             Arc::new(TokenBucket::unlimited()),
             None,
             dest,
@@ -1880,7 +2085,7 @@ mod tests {
             cfg,
             &GlobalCfg::default(),
             store.clone(),
-            Arc::new(Semaphore::new(8)),
+            Arc::new(PriorityGate::new(8)),
             Arc::new(TokenBucket::unlimited()),
             None,
             dest,

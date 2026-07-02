@@ -98,6 +98,23 @@ pub trait InstanceControl: Send + Sync {
     fn reset_activation(&self, now: i64) -> anyhow::Result<bool>;
 }
 
+/// One instance that never started because of a startup permission/access violation (Feature A,
+/// `src/permission.rs`), under an `onPermissionError: disableInstance` (the default) policy. Kept so
+/// `get-status` reflects it (with its reason) instead of reporting "unknown instance" for an id that
+/// was legitimately configured but could not run — DESIGN §16's status surface must not lie about why
+/// an expected instance is absent.
+#[derive(Debug, Clone)]
+pub struct DisabledInstanceInfo {
+    pub id: String,
+    /// Human-readable summary of why it was disabled (joined violation messages).
+    pub reason: String,
+    /// The [`crate::permission::Role`] of the first violation (`"ingress"`/`"egress"`/`"archive"`/
+    /// `"failed"`) — the primary offending directory role, for a compact status doc.
+    pub role: String,
+    /// The path of the first violation.
+    pub path: String,
+}
+
 /// The inbound control-message dispatcher (DESIGN §16).
 pub struct ControlPlane {
     msg: Option<Arc<dyn MessagingService>>,
@@ -108,6 +125,9 @@ pub struct ControlPlane {
     events: Events,
     legacy_enabled: bool,
     legacy_topic: String,
+    /// Instances that never started (Feature A `onPermissionError: disableInstance`) — see
+    /// [`DisabledInstanceInfo`]. Empty unless [`with_disabled`](Self::with_disabled) was called.
+    disabled: Vec<DisabledInstanceInfo>,
 }
 
 impl ControlPlane {
@@ -132,7 +152,17 @@ impl ControlPlane {
             events,
             legacy_enabled,
             legacy_topic,
+            disabled: Vec::new(),
         }
+    }
+
+    /// Attach the set of instances that never started (Feature A, `onPermissionError:
+    /// disableInstance`), so `get-status` reflects them instead of reporting "unknown instance".
+    /// Consumes and returns `self` (composes like [`with_events`](Events)'s builder siblings) so
+    /// existing `ControlPlane::new`/`build` call sites are unaffected when there is nothing disabled.
+    pub fn with_disabled(mut self, disabled: Vec<DisabledInstanceInfo>) -> Self {
+        self.disabled = disabled;
+        self
     }
 
     /// Build the dispatcher from the component config + parsed `component.global` (the wiring path).
@@ -241,14 +271,19 @@ impl ControlPlane {
         self.reply(req, json!({ "ok": true, "config": self.config.raw })).await;
     }
 
-    /// `get-status` → per-instance (scoped) or component-wide statistics (DESIGN §16).
+    /// `get-status` → per-instance (scoped) or component-wide statistics (DESIGN §16). A scoped request
+    /// for a disabled instance id (Feature A) returns its disabled doc, not "unknown instance" — it was
+    /// legitimately configured, just never started.
     async fn on_get_status(&self, req: &Message, scope: Scope) {
         let now = now_ms();
         let body = match scope {
             Scope::All => self.component_status_json(now),
             Scope::Instance(id) => match self.find(&id) {
                 Some(inst) => self.instance_status(inst.as_ref(), now),
-                None => unknown_instance(&id),
+                None => match self.find_disabled(&id) {
+                    Some(info) => disabled_status_json(info),
+                    None => unknown_instance(&id),
+                },
             },
         };
         self.reply(req, body).await;
@@ -411,6 +446,15 @@ impl ControlPlane {
             );
             self.events.publish_instance_state(inst.id(), snapshot).await;
         }
+        // Feature A: a disabled instance never ticks (never republishes its own state), so without
+        // this its retained `state/instances/{id}` topic would simply never exist — a UI/cloud
+        // subscriber would see nothing at all for an id it knows was configured, rather than the
+        // `disabled: true` + reason DESIGN §16 promises.
+        for info in &self.disabled {
+            self.events
+                .publish_instance_state(&info.id, disabled_status_json(info))
+                .await;
+        }
         self.events
             .publish_component_state(self.component_status_json(now))
             .await;
@@ -418,19 +462,26 @@ impl ControlPlane {
 
     // ---- status assembly ------------------------------------------------------------------------
 
-    /// Component-wide status: every instance's snapshot plus a summary.
+    /// Component-wide status: every LIVE instance's snapshot, plus every DISABLED instance's doc
+    /// (Feature A), plus a summary. A disabled instance is never counted `active`, but it IS counted in
+    /// the roster total so the summary accounts for every configured instance, running or not.
     fn component_status_json(&self, now: i64) -> Value {
-        let instances: Vec<Value> = self
+        let mut instances: Vec<Value> = self
             .instances
             .iter()
             .map(|i| self.instance_status(i.as_ref(), now))
             .collect();
+        instances.extend(self.disabled.iter().map(disabled_status_json));
         let active = self.instances.iter().filter(|i| i.is_active()).count();
         json!({
             "component": self.config.component_name,
             "thing": self.config.thing_name,
             "instances": instances,
-            "summary": { "instances": self.instances.len(), "active": active },
+            "summary": {
+                "instances": self.instances.len() + self.disabled.len(),
+                "active": active,
+                "disabled": self.disabled.len(),
+            },
         })
     }
 
@@ -473,6 +524,33 @@ impl ControlPlane {
     fn find(&self, id: &str) -> Option<&Arc<dyn InstanceControl>> {
         self.instances.iter().find(|i| i.id() == id)
     }
+
+    /// Look up a disabled instance's info by id (Feature A).
+    fn find_disabled(&self, id: &str) -> Option<&DisabledInstanceInfo> {
+        self.disabled.iter().find(|d| d.id == id)
+    }
+}
+
+/// Build the compact status doc for an instance that never started (Feature A, `onPermissionError:
+/// disableInstance`) — the disabled-instance counterpart of [`instance_status_json`], shaped so a
+/// consumer parsing `get-status`/`state/…` doesn't need a separate schema for the disabled case: same
+/// top-level keys, `active`/`awaiting`/`inProgress`/`replicated`/`failed` all zeroed/empty, plus
+/// `disabled: true` and `disabledReason` so the "why" is never lost.
+fn disabled_status_json(info: &DisabledInstanceInfo) -> Value {
+    json!({
+        "instance": info.id,
+        "active": false,
+        "configuredEnabled": false,
+        "disabled": true,
+        "disabledReason": info.reason,
+        "disabledRole": info.role,
+        "disabledPath": info.path,
+        "schedule": { "mode": "disabled" },
+        "awaiting": { "count": 0, "bytes": 0, "files": [] },
+        "inProgress": [],
+        "replicated": { "count": 0, "bytes": 0 },
+        "failed": { "count": 0, "items": [] },
+    })
 }
 
 /// Coerce a JSON value to a bool, tolerating a Greengrass numeric double (`0`/`0.0` → false, any
@@ -1169,6 +1247,92 @@ mod tests {
         let body = fake.only_reply().1.body;
         assert_eq!(body["ok"], json!(false));
         assert_eq!(body["error"], json!("unknown instance"));
+    }
+
+    // ---- Feature A: disabled-instance visibility in get-status (`src/permission.rs`) ---------------
+
+    fn disabled_info(id: &str) -> DisabledInstanceInfo {
+        DisabledInstanceInfo {
+            id: id.to_string(),
+            reason: "permission denied: /data/in".to_string(),
+            role: "ingress".to_string(),
+            path: "/data/in".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_status_scoped_reports_disabled_instance_with_reason() {
+        let fake = FakeMsg::new();
+        let cp = plane(fake.clone(), mem_store(), vec![], false).with_disabled(vec![disabled_info("bad")]);
+        cp.handle(
+            "gw-01/file-replicator/cmd/instances/bad/status".into(),
+            req("GetStatus", json!({})),
+        )
+        .await;
+        let body = fake.only_reply().1.body;
+        assert_eq!(body["instance"], json!("bad"));
+        assert_eq!(body["active"], json!(false));
+        assert_eq!(body["disabled"], json!(true));
+        assert_eq!(body["disabledReason"], json!("permission denied: /data/in"));
+        assert_eq!(body["disabledRole"], json!("ingress"));
+        assert_eq!(body["awaiting"]["count"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn get_status_scoped_still_errors_for_a_truly_unknown_id() {
+        // A disabled-instance entry for "bad" must not make every OTHER unknown id resolve too.
+        let fake = FakeMsg::new();
+        let cp = plane(fake.clone(), mem_store(), vec![], false).with_disabled(vec![disabled_info("bad")]);
+        cp.handle(
+            "gw-01/file-replicator/cmd/instances/nope/status".into(),
+            req("GetStatus", json!({})),
+        )
+        .await;
+        let body = fake.only_reply().1.body;
+        assert_eq!(body["error"], json!("unknown instance"));
+    }
+
+    #[tokio::test]
+    async fn get_status_component_roster_includes_disabled() {
+        let store = mem_store();
+        seed_status(&store);
+        let fake = FakeMsg::new();
+        let cp = plane(fake.clone(), store, vec![FakeInstance::new("i1", true, true)], false)
+            .with_disabled(vec![disabled_info("bad")]);
+
+        cp.handle("gw-01/file-replicator/cmd/status".into(), req("GetStatus", json!({})))
+            .await;
+
+        let body = fake.only_reply().1.body;
+        assert_eq!(body["instances"].as_array().unwrap().len(), 2, "live + disabled");
+        assert_eq!(body["summary"]["instances"], json!(2));
+        assert_eq!(body["summary"]["active"], json!(1), "the disabled instance is never active");
+        assert_eq!(body["summary"]["disabled"], json!(1));
+        let disabled_doc = body["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["instance"] == json!("bad"))
+            .expect("disabled instance present in the roster");
+        assert_eq!(disabled_doc["disabled"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn live_instance_status_shape_unchanged_by_the_disabled_feature() {
+        // Regression: a live instance's status doc must not grow a `disabled` field just because
+        // OTHER instances in the component are disabled.
+        let store = mem_store();
+        seed_status(&store);
+        let fake = FakeMsg::new();
+        let cp = plane(fake.clone(), store, vec![FakeInstance::new("i1", true, true)], false)
+            .with_disabled(vec![disabled_info("bad")]);
+        cp.handle(
+            "gw-01/file-replicator/cmd/instances/i1/status".into(),
+            req("GetStatus", json!({})),
+        )
+        .await;
+        let body = fake.only_reply().1.body;
+        assert!(body.get("disabled").is_none(), "a live instance's doc has no `disabled` key at all");
     }
 
     // ---- trigger --------------------------------------------------------------------------------

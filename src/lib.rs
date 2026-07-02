@@ -10,6 +10,7 @@
 //!
 //! Scope: P1 (local destination, immediate mode). See `DESIGN.md` for the phase plan.
 
+pub mod admission;
 pub mod app;
 pub mod config;
 pub mod control;
@@ -19,6 +20,7 @@ pub mod error;
 pub mod events;
 pub mod instance;
 pub mod integrity;
+pub mod permission;
 pub mod ratelimit;
 pub mod readiness;
 pub mod schedule;
