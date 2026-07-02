@@ -29,6 +29,38 @@ cloudwatch = ["ggcommons/cloudwatch"]
 # egress `{"$secret":"..."}` resolves through `gg.credentials()` → `get_aws_credentials`. Joins the
 # default feature set per DESIGN §22.2 (batteries-included; immature backends stay off).
 dest-s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:base64", "ggcommons/credentials"]
+# P5 — SFTP destination (DESIGN §10.3, §22.2). Pure-Rust SSH (`russh`/`russh-sftp` — no C toolchain),
+# so it stays Windows-clean like the rest of the P5 backends. Off by default (joins the build only when
+# asked); the ggcommons credentials subsystem resolves an optional `{"$secret":"..."}` egress override.
+dest-sftp = ["dep:russh", "dep:russh-sftp", "ggcommons/credentials"]
+# P5 — FTPS destination (DESIGN §10.3, §22.2). `suppaftp` pinned to the `=6` line (the `10.x` line needs
+# rustc 1.88, above this crate's 1.85 MSRV) with the rustls TLS feature — no OpenSSL/C toolchain.
+dest-ftps = ["dep:suppaftp", "dep:rustls", "dep:rustls-native-certs", "ggcommons/credentials"]
+# P5 — HTTP(S) destination (DESIGN §10.2/§10.3, §22.2). `reqwest` with rustls (no OpenSSL/C toolchain);
+# resume is a sequence of ranged `PUT`s (`Content-Range`), so no streaming-body/extra async-stream crate
+# is needed — see `dest/http/mod.rs`. The ggcommons credentials subsystem resolves an optional
+# `{"$secret":"..."}` egress override (bearer token or basic auth).
+dest-http = ["dep:reqwest", "ggcommons/credentials"]
+# P5 — Azure Blob destination (DESIGN §10.2/§10.3, §22.2). `azure_storage_blobs`/`azure_storage`/
+# `azure_core` — a younger SDK line (the "legacy" azure-sdk-for-rust track), so kept OFF by default
+# (crate-maturity risk contained behind the `dest-azure` feature + `dest/azure/client.rs` coverage
+# seam, DESIGN §22.2). `enable_reqwest_rustls`+`hmac_rust` keep it pure-Rust (no OpenSSL/C toolchain),
+# matching the rest of this crate's TLS story. The ggcommons credentials subsystem resolves an optional
+# `{"$secret":"..."}` egress override (account key or connection string).
+dest-azure = ["dep:azure_storage_blobs", "dep:azure_storage", "dep:azure_core", "dep:futures", "ggcommons/credentials"]
+# P5 — GCS destination (DESIGN §10.2/§10.3, §22.2). GCS's resumable-upload protocol is plain HTTP
+# (initiate a session → chunked `PUT`s with `Content-Range`, checkpointed by persisting the session
+# URI), so this backend drives it directly over the same `reqwest` (rustls) client `dest-http` already
+# uses rather than pulling in the `google-cloud-storage`/`object_store` crates — avoiding a second
+# immature SDK's auth/dependency surface while still keeping every network call isolated behind
+# `dest/gcs/client.rs` (crate-maturity risk containment, DESIGN §22.2). `dep:reqwest`/`dep:base64` are
+# shared with `dest-http`/`dest-s3`'s optional deps (Cargo allows one optional dep gated by several
+# features). `reqwest/json` (a weak-dependency feature, only enabled when `dest-gcs` itself is — it
+# does not affect a `dest-http`-only build) turns on typed JSON responses for the object-metadata
+# `verify` call. Off by default (crate-maturity posture, matching `dest-azure`). The ggcommons
+# credentials subsystem resolves an optional `{"$secret":"..."}` egress override (an OAuth2 access
+# token).
+dest-gcs = ["dep:reqwest", "reqwest/json", "dep:base64", "ggcommons/credentials"]
 
 [dependencies]
 # ggcommons Rust library, pinned to a commit on edgecommons/ggcommons (private). Building standalone needs
@@ -77,6 +109,45 @@ aws-config = { version = "1", optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
 # S3 flexible-checksum header codec (4-byte-BE CRC32C / 32-byte SHA-256 → base64).
 base64 = { version = "0.22", optional = true }
+
+# --- P5 SFTP destination deps (optional; gated by `dest-sftp`, DESIGN §22.2) ---------------------
+# Pure-Rust SSH client + SFTP subsystem — no C toolchain, builds clean on Windows/MSVC like the rest
+# of this crate. `russh`'s default crypto backend (`aws-lc-rs`) is already resolved in this workspace
+# via the S3 SDK's rustls stack, so it adds no new native build surface.
+russh = { version = "0.61", optional = true }
+russh-sftp = { version = "2", optional = true }
+
+# --- P5 FTPS destination deps (optional; gated by `dest-ftps`, DESIGN §22.2) ---------------------
+# Pinned to the `=6` line: `suppaftp` 10.x raises the MSRV above this crate's 1.85 floor. The crate's
+# `async` feature runs on `async-std`, not `tokio` — pulling in a second executor is the wrong tradeoff
+# for one backend, so `dest/ftps/client.rs` uses the **synchronous** `rustls` feature (pure-Rust TLS,
+# no OpenSSL) through `tokio::task::spawn_blocking`, the same pattern `local.rs`/`s3` use for blocking
+# hash work (bandwidth-governor waits are driven back in via `Handle::block_on` from that blocking
+# thread, so throttling stays correct without an async suppaftp API).
+suppaftp = { version = "=6.3.0", default-features = false, features = ["rustls"], optional = true }
+# Same rustls line already resolved via the S3 SDK's stack; used directly to build the `ClientConfig`
+# suppaftp's `RustlsConnector` wraps (system trust roots via `rustls-native-certs`).
+rustls = { version = "0.23", optional = true, features = ["ring"] }
+rustls-native-certs = { version = "0.8", optional = true }
+
+# --- P5 HTTP(S) destination deps (optional; gated by `dest-http`, DESIGN §22.2) ------------------
+# `default-features = false` + `rustls-tls` keeps this off OpenSSL (pure-Rust TLS, Windows/MSVC-clean
+# like the rest of this crate); resume streams a sequence of whole-chunk `Vec<u8>` bodies (mirrors
+# `dest/s3::read_range`), so no `stream`/`multipart` feature is needed.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
+
+# --- P5 Azure Blob destination deps (optional; gated by `dest-azure`, DESIGN §22.2) --------------
+# Legacy `azure-sdk-for-rust` track (0.21 line); `default-features = false` + `enable_reqwest_rustls`/
+# `hmac_rust` keeps it pure-Rust (no OpenSSL/C toolchain), like the rest of this crate's TLS story.
+# `azurite_workaround` fixes known Azurite-emulator response-parsing quirks (the simulator this
+# backend's integration test runs against) at zero cost against real Azure.
+azure_storage_blobs = { version = "0.21", default-features = false, features = ["enable_reqwest_rustls", "hmac_rust", "azurite_workaround"], optional = true }
+azure_storage = { version = "0.21", default-features = false, features = ["enable_reqwest_rustls", "hmac_rust"], optional = true }
+azure_core = { version = "0.21", default-features = false, features = ["enable_reqwest_rustls", "hmac_rust"], optional = true }
+# `StreamExt` to consume the Azure SDK's `Pageable`/`ResponseBody` streams so `verify`'s download hashes
+# in bounded per-range chunks (NFR-3) instead of buffering the whole blob (already resolved transitively
+# via the azure SDK; taken as a direct dep only to use it, gated with `dest-azure`).
+futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

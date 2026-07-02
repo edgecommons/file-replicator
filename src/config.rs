@@ -10,8 +10,9 @@
 //! `DESIGN.md` §7 (and, once authored, `docs/reference/configuration.md` — the canonical spec
 //! validated against THIS module).
 //!
-//! Scope note: `local` and `s3` egress are fully typed; `sftp`/`http`/`azure`/`gcs` are recognized
-//! but their fields are not yet modeled (P5). Every numeric field accepts a JSON integer **or** an
+//! Scope note: `local`/`s3`/`sftp`/`ftps`/`http`/`azure`/`gcs` are all fully typed (P5 complete);
+//! each backend's fields are only *read* once its `dest-*` feature is compiled in. Every numeric field
+//! accepts a JSON integer **or** an
 //! integer-valued float via [`lenient_u64`] / [`lenient_opt_u64`] etc., because Greengrass delivers
 //! config numbers as doubles (FR-CFG-3); human byte-rate parsing for `maxBandwidth` (FR-REL-6) lives
 //! in [`ratelimit::parse_byte_rate`](crate::ratelimit::parse_byte_rate).
@@ -65,6 +66,11 @@ fn lenient_opt_u64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Er
 /// As [`lenient_opt_u64`], narrowed to `Option<u32>`.
 fn lenient_opt_u32<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
     Ok(lenient_opt_u64(d)?.map(|v| v as u32))
+}
+
+/// As [`lenient_opt_u64`], narrowed to `Option<u16>` (TCP port fields).
+fn lenient_opt_u16<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u16>, D::Error> {
+    Ok(lenient_opt_u64(d)?.map(|v| v as u16))
 }
 
 /// As [`lenient_opt_u64`], narrowed to `Option<usize>`.
@@ -175,12 +181,20 @@ pub enum EgressCfg {
     // `dest-s3` backend lands.
     #[allow(dead_code)]
     S3(Box<S3Egress>),
-    /// Recognized future backends (DESIGN §10.2, phase P5). Their fields are ignored at P0.
-    Sftp,
-    Ftps,
-    Http,
-    Azure,
-    Gcs,
+    /// P5 (SFTP destination): the factory matches this variant but only reads its payload when the
+    /// `dest-sftp` backend is compiled in.
+    Sftp(Box<SftpEgress>),
+    /// P5 (FTPS destination): read once the `dest-ftps` backend lands.
+    Ftps(Box<FtpsEgress>),
+    /// P5 (HTTP(S) destination): the factory matches this variant but only reads its payload when the
+    /// `dest-http` backend is compiled in.
+    Http(Box<HttpEgress>),
+    /// P5 (Azure Blob destination): the factory matches this variant but only reads its payload when
+    /// the `dest-azure` backend is compiled in.
+    Azure(Box<AzureEgress>),
+    /// P5 (GCS destination): the factory matches this variant but only reads its payload when the
+    /// `dest-gcs` backend is compiled in.
+    Gcs(Box<GcsEgress>),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -234,6 +248,277 @@ pub struct MultipartCfg {
     pub part_size_bytes: Option<u64>,
     #[serde(default, deserialize_with = "lenient_opt_usize")]
     pub max_concurrent_parts: Option<usize>,
+}
+
+// P5 (SFTP destination): the whole SFTP egress model is parsed at P0 but only read once the
+// `dest-sftp` backend lands. Narrow, reason-tagged allow (removed once `dest/sftp` consumes it).
+// `Debug` is hand-written (below) to redact the ambient secret fields — FR-CFG-5: a `?egress`/panic/
+// config-dump must never surface the raw `password`/`passphrase` (mirrors `SftpAuth`'s redacted Debug).
+#[allow(dead_code)]
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpEgress {
+    pub host: String,
+    /// Default 22.
+    #[serde(default, deserialize_with = "lenient_opt_u16")]
+    pub port: Option<u16>,
+    /// Remote root; the remote path is `pathmap(base_dir, item.relpath)` (DESIGN §10.2 subtree
+    /// preservation, same traversal-safe join as the S3 `prefix`/key mapping).
+    #[serde(default)]
+    pub base_dir: String,
+    pub username: Option<String>,
+    /// Ambient password (discouraged in favor of `credentials.$secret`).
+    pub password: Option<String>,
+    /// Ambient path to a private key file on local disk.
+    pub private_key: Option<String>,
+    pub passphrase: Option<String>,
+    /// Optional `{"$secret": "..."}` ref resolving to `{username,password}` or
+    /// `{username,privateKey,passphrase}` JSON (DESIGN §11.5-equivalent).
+    pub credentials: Option<serde_json::Value>,
+    /// Pinned host public key (OpenSSH `algo base64[ comment]` line). Absent = no pinning; then the
+    /// connection is REJECTED (fail-closed) unless `insecure_accept_any_host_key` is set (NFR-7).
+    pub host_key: Option<String>,
+    /// Accept ANY server host key when no `host_key` is pinned (fail-OPEN). Default `false`
+    /// (fail-closed): with no pinned `host_key` and this unset, the SSH handshake is refused with an
+    /// actionable error. Set `true` only as an explicit, documented escape hatch — it disables
+    /// man-in-the-middle protection (an attacker presenting its own host key would be accepted, and
+    /// under password auth could capture the credential). NFR-7.
+    #[serde(default)]
+    pub insecure_accept_any_host_key: bool,
+    /// Upload-in-progress suffix appended to a hidden temp filename before the publish rename.
+    /// Default `.part`.
+    pub temp_suffix: Option<String>,
+    /// Best-effort `fsync@openssh.com` before the publish rename, when the server supports it.
+    #[serde(default)]
+    pub fsync: bool,
+    /// Local re-hash checksum algorithm (SFTP has no native content-checksum echo); default CRC32C.
+    pub checksum_algorithm: Option<String>,
+}
+
+/// Redaction marker shown in a config struct's `Debug` in place of a present secret (absent → `None`),
+/// so a diagnostic dump reveals *whether* a secret is set without ever printing it (FR-CFG-5).
+fn redacted(present: bool) -> Option<&'static str> {
+    present.then_some("***redacted***")
+}
+
+impl std::fmt::Debug for SftpEgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SftpEgress")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("base_dir", &self.base_dir)
+            .field("username", &self.username)
+            .field("password", &redacted(self.password.is_some()))
+            // `private_key` is a filesystem PATH (not key material — the inline PEM only ever lives in
+            // the `$secret` vault), so it stays visible for diagnostics like `SftpKeySource::Path` does.
+            .field("private_key", &self.private_key)
+            .field("passphrase", &redacted(self.passphrase.is_some()))
+            .field("credentials", &self.credentials)
+            .field("host_key", &self.host_key)
+            .field("insecure_accept_any_host_key", &self.insecure_accept_any_host_key)
+            .field("temp_suffix", &self.temp_suffix)
+            .field("fsync", &self.fsync)
+            .field("checksum_algorithm", &self.checksum_algorithm)
+            .finish()
+    }
+}
+
+// P5 (FTPS destination): parsed at P0, read once the `dest-ftps` backend lands. `Debug` hand-written
+// (below) to redact `password` (FR-CFG-5).
+#[allow(dead_code)]
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FtpsEgress {
+    pub host: String,
+    /// Default 21 (explicit AUTH TLS) — implicit FTPS conventionally uses 990.
+    #[serde(default, deserialize_with = "lenient_opt_u16")]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub base_dir: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    /// Optional `{"$secret": "..."}` ref resolving to `{username,password}` JSON.
+    pub credentials: Option<serde_json::Value>,
+    /// `true` (default) = explicit AUTH TLS on the plain control port; `false` = implicit TLS.
+    pub explicit_tls: Option<bool>,
+    /// PASV (default `true`) vs active mode.
+    pub passive: Option<bool>,
+    pub temp_suffix: Option<String>,
+    pub checksum_algorithm: Option<String>,
+}
+
+impl std::fmt::Debug for FtpsEgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FtpsEgress")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("base_dir", &self.base_dir)
+            .field("username", &self.username)
+            .field("password", &redacted(self.password.is_some()))
+            .field("credentials", &self.credentials)
+            .field("explicit_tls", &self.explicit_tls)
+            .field("passive", &self.passive)
+            .field("temp_suffix", &self.temp_suffix)
+            .field("checksum_algorithm", &self.checksum_algorithm)
+            .finish()
+    }
+}
+
+// P5 (HTTP(S) destination): the whole HTTP egress model is parsed at P0 but only read once the
+// `dest-http` backend lands. Narrow, reason-tagged allow (removed once `dest/http` consumes it).
+// `Debug` hand-written (below) to redact `bearer_token`/`password` (FR-CFG-5).
+#[allow(dead_code)]
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpEgress {
+    /// Base URL the file is PUT/POSTed to; `item.relpath` is joined onto its path (DESIGN §10.2
+    /// subtree preservation), e.g. `https://host/upload` + `a/b.csv` → `https://host/upload/a/b.csv`.
+    pub url: String,
+    /// `PUT` (default, resumable) or `POST` (single-shot; resume is forced off — DESIGN §10.2).
+    pub method: Option<String>,
+    /// Static headers sent on every request (e.g. a fixed API key header).
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// Ambient bearer token (discouraged in favor of `credentials.$secret`).
+    pub bearer_token: Option<String>,
+    /// Ambient HTTP Basic auth username/password (discouraged in favor of `credentials.$secret`).
+    pub username: Option<String>,
+    pub password: Option<String>,
+    /// Optional `{"$secret": "..."}` ref resolving to `{"bearerToken":"..."}` or
+    /// `{"username":"...","password":"..."}` JSON (DESIGN §11.5-equivalent).
+    pub credentials: Option<serde_json::Value>,
+    /// `true` (default) = resumable ranged `PUT` in `chunkBytes`-sized segments with a persisted
+    /// checkpoint; forced `false` for `method: POST` (DESIGN §10.2/§10.3).
+    pub resumable: Option<bool>,
+    /// Ranged-`PUT` chunk size; default 8 MiB. A smaller value makes resume tests/fixtures cheap.
+    #[serde(default, deserialize_with = "lenient_opt_u64")]
+    pub chunk_bytes: Option<u64>,
+    /// Local re-hash checksum algorithm (generic HTTP has no universal content-checksum echo);
+    /// default CRC32C.
+    pub checksum_algorithm: Option<String>,
+}
+
+impl std::fmt::Debug for HttpEgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpEgress")
+            .field("url", &self.url)
+            .field("method", &self.method)
+            .field("headers", &self.headers)
+            .field("bearer_token", &redacted(self.bearer_token.is_some()))
+            .field("username", &self.username)
+            .field("password", &redacted(self.password.is_some()))
+            .field("credentials", &self.credentials)
+            .field("resumable", &self.resumable)
+            .field("chunk_bytes", &self.chunk_bytes)
+            .field("checksum_algorithm", &self.checksum_algorithm)
+            .finish()
+    }
+}
+
+// P5 (Azure Blob destination): the whole Azure egress model is parsed at P0 but only read once the
+// `dest-azure` backend lands. Narrow, reason-tagged allow (removed once `dest/azure` consumes it).
+// `Debug` hand-written (below) to redact `account_key`/`connection_string` (the connection string
+// embeds `AccountKey=…`) — FR-CFG-5.
+#[allow(dead_code)]
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AzureEgress {
+    /// Storage account name (also the default `CloudLocation` — overridden by `endpointUrl`).
+    pub account: String,
+    pub container: String,
+    #[serde(default)]
+    pub prefix: String,
+    /// Custom blob-service endpoint (Azurite / a sovereign cloud), e.g.
+    /// `http://127.0.0.1:10000/devstoreaccount1`. Absent = the public Azure cloud for `account`.
+    pub endpoint_url: Option<String>,
+    /// Ambient storage account key (discouraged in favor of `credentials.$secret`).
+    pub account_key: Option<String>,
+    /// Ambient connection string (only `AccountKey` is extracted; `account`/`endpointUrl` above stay
+    /// authoritative for the account/endpoint, discouraged in favor of `credentials.$secret`).
+    pub connection_string: Option<String>,
+    /// Optional `{"$secret": "..."}` ref resolving to `{"accountKey":"..."}` or
+    /// `{"connectionString":"..."}` JSON (DESIGN §11.5-equivalent).
+    pub credentials: Option<serde_json::Value>,
+    #[serde(default)]
+    pub blocks: AzureBlockCfg,
+    /// Local re-hash checksum algorithm (Azure's per-block MD5/CRC64 is not a whole-object echo
+    /// comparable to S3's flexible checksum); default CRC32C.
+    pub checksum_algorithm: Option<String>,
+}
+
+impl std::fmt::Debug for AzureEgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AzureEgress")
+            .field("account", &self.account)
+            .field("container", &self.container)
+            .field("prefix", &self.prefix)
+            .field("endpoint_url", &self.endpoint_url)
+            .field("account_key", &redacted(self.account_key.is_some()))
+            .field("connection_string", &redacted(self.connection_string.is_some()))
+            .field("credentials", &self.credentials)
+            .field("blocks", &self.blocks)
+            .field("checksum_algorithm", &self.checksum_algorithm)
+            .finish()
+    }
+}
+
+// P5 (Azure Blob destination): staged-block tuning, read by the Azure backend only.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AzureBlockCfg {
+    /// Files larger than this use staged blocks; smaller use a single `Put Blob`.
+    #[serde(default, deserialize_with = "lenient_opt_u64")]
+    pub threshold_bytes: Option<u64>,
+    #[serde(default, deserialize_with = "lenient_opt_u64")]
+    pub block_size_bytes: Option<u64>,
+}
+
+// P5 (GCS destination): the whole GCS egress model is parsed at P0 but only read once the `dest-gcs`
+// backend lands. Narrow, reason-tagged allow (removed once `dest/gcs` consumes it). `Debug`
+// hand-written (below) to redact `access_token` (FR-CFG-5).
+#[allow(dead_code)]
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GcsEgress {
+    pub bucket: String,
+    #[serde(default)]
+    pub prefix: String,
+    /// Custom JSON/upload API endpoint (fake-gcs-server), e.g. `http://127.0.0.1:4443`. Absent = the
+    /// public GCS JSON API (`https://storage.googleapis.com`).
+    pub endpoint_url: Option<String>,
+    /// Ambient OAuth2 access token (discouraged in favor of `credentials.$secret`).
+    pub access_token: Option<String>,
+    /// No `Authorization` header at all — the fake-gcs-server, or an `allUsers`-public bucket.
+    #[serde(default)]
+    pub anonymous: bool,
+    /// Optional `{"$secret": "..."}` ref resolving to `{"accessToken":"..."}` JSON (DESIGN
+    /// §11.5-equivalent). Full service-account JWT signing / Application Default Credentials
+    /// discovery is a documented follow-up (see `dest/gcs/mod.rs`'s module doc) — this backend
+    /// authenticates via a bearer access token only.
+    pub credentials: Option<serde_json::Value>,
+    /// Resumable-upload chunk size; default 8 MiB, rounded down to the nearest 256 KiB (GCS's
+    /// required alignment for every chunk but the final one).
+    #[serde(default, deserialize_with = "lenient_opt_u64")]
+    pub chunk_bytes: Option<u64>,
+    /// Local re-hash checksum algorithm; default CRC32C, also compared directly against the object's
+    /// `crc32c` metadata field on `verify` (no re-download needed for that algorithm — DESIGN §10.2).
+    pub checksum_algorithm: Option<String>,
+}
+
+impl std::fmt::Debug for GcsEgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GcsEgress")
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("endpoint_url", &self.endpoint_url)
+            .field("access_token", &redacted(self.access_token.is_some()))
+            .field("anonymous", &self.anonymous)
+            .field("credentials", &self.credentials)
+            .field("chunk_bytes", &self.chunk_bytes)
+            .field("checksum_algorithm", &self.checksum_algorithm)
+            .finish()
+    }
 }
 
 /// Schedule — when ready work is released (DESIGN §12).
@@ -648,5 +933,102 @@ mod tests {
         fn readiness_default(&self) -> &ReadinessCfg {
             &self.ingress.readiness
         }
+    }
+
+    // ---- Debug redaction of ambient secrets in the P5 egress structs (FR-CFG-5) -----------------
+
+    #[test]
+    fn p5_egress_debug_redacts_ambient_secrets() {
+        // Every ambient plaintext secret carried in these config structs must be redacted in `Debug`
+        // so a `?egress`, panic message, or config dump can never leak it (mirrors the resolved-auth
+        // types' redaction). Non-secret fields (host, url, username, paths) stay visible for diagnostics.
+
+        let sftp = SftpEgress {
+            host: "h".into(),
+            port: Some(2222),
+            base_dir: "/upload".into(),
+            username: Some("alice".into()),
+            password: Some("PW_SECRET".into()),
+            private_key: Some("/home/a/.ssh/id_ed25519".into()),
+            passphrase: Some("PP_SECRET".into()),
+            credentials: None,
+            host_key: None,
+            insecure_accept_any_host_key: false,
+            temp_suffix: None,
+            fsync: false,
+            checksum_algorithm: None,
+        };
+        let dbg = format!("{sftp:?}");
+        assert!(!dbg.contains("PW_SECRET"), "sftp password leaked: {dbg}");
+        assert!(!dbg.contains("PP_SECRET"), "sftp passphrase leaked: {dbg}");
+        assert!(dbg.contains("alice") && dbg.contains("id_ed25519"), "non-secrets visible: {dbg}");
+        assert!(dbg.contains("***redacted***"));
+
+        let ftps = FtpsEgress {
+            host: "h".into(),
+            port: None,
+            base_dir: "/".into(),
+            username: Some("bob".into()),
+            password: Some("FTPS_SECRET".into()),
+            credentials: None,
+            explicit_tls: None,
+            passive: None,
+            temp_suffix: None,
+            checksum_algorithm: None,
+        };
+        let dbg = format!("{ftps:?}");
+        assert!(!dbg.contains("FTPS_SECRET"), "ftps password leaked: {dbg}");
+        assert!(dbg.contains("bob") && dbg.contains("***redacted***"));
+
+        let http = HttpEgress {
+            url: "https://h/upload".into(),
+            method: None,
+            headers: Default::default(),
+            bearer_token: Some("BEARER_SECRET".into()),
+            username: Some("carol".into()),
+            password: Some("HTTP_PW_SECRET".into()),
+            credentials: None,
+            resumable: None,
+            chunk_bytes: None,
+            checksum_algorithm: None,
+        };
+        let dbg = format!("{http:?}");
+        assert!(!dbg.contains("BEARER_SECRET"), "http bearer leaked: {dbg}");
+        assert!(!dbg.contains("HTTP_PW_SECRET"), "http password leaked: {dbg}");
+        assert!(dbg.contains("carol") && dbg.contains("https://h/upload"));
+
+        let azure = AzureEgress {
+            account: "acct".into(),
+            container: "c".into(),
+            prefix: String::new(),
+            endpoint_url: None,
+            account_key: Some("ACCT_KEY_SECRET".into()),
+            connection_string: Some("AccountName=a;AccountKey=CS_SECRET;".into()),
+            credentials: None,
+            blocks: AzureBlockCfg::default(),
+            checksum_algorithm: None,
+        };
+        let dbg = format!("{azure:?}");
+        assert!(!dbg.contains("ACCT_KEY_SECRET"), "azure account key leaked: {dbg}");
+        assert!(!dbg.contains("CS_SECRET"), "azure connection string leaked: {dbg}");
+        assert!(dbg.contains("acct") && dbg.contains("***redacted***"));
+
+        let gcs = GcsEgress {
+            bucket: "b".into(),
+            prefix: String::new(),
+            endpoint_url: None,
+            access_token: Some("TOKEN_SECRET".into()),
+            anonymous: false,
+            credentials: None,
+            chunk_bytes: None,
+            checksum_algorithm: None,
+        };
+        let dbg = format!("{gcs:?}");
+        assert!(!dbg.contains("TOKEN_SECRET"), "gcs access token leaked: {dbg}");
+        assert!(dbg.contains("b") && dbg.contains("***redacted***"));
+
+        // The `redacted` marker helper: present → marker, absent → None.
+        assert_eq!(redacted(true), Some("***redacted***"));
+        assert_eq!(redacted(false), None);
     }
 }

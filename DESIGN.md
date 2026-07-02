@@ -531,13 +531,64 @@ multi-destination fan-out uniform.
 |---|---|---|---|---|---|---|
 | **local** | ✅ ship | temp + atomic rename; offset-append | single stream | re-hash | std/`tokio::fs` | always |
 | **s3** | ✅ ship | multipart parts persisted | parallel parts + prefix | S3 flexible checksum + ETag | `aws-sdk-s3` | `dest-s3` (default) |
-| **sftp/ftps** | phase | `APPE`/offset | single | size + hash | `russh`/`russh-sftp` | `dest-sftp` |
-| **http(s)** | phase | `Content-Range`/resumable PUT | single/presigned | 2xx + `Content-MD5` | `reqwest` | `dest-http` |
-| **azure blob** | phase | staged blocks | parallel blocks | MD5/CRC64 | `azure_storage_blobs` | `dest-azure` (off) |
+| **sftp** | ✅ ship (P5) | offset seek/append (temp file + rename) | single | size + re-hash (download) | `russh`/`russh-sftp` | `dest-sftp` |
+| **ftps** | ⚠️ ship (P5, no live test) | `REST` offset + `STOR` (temp file + rename) | single | size + re-hash (download) | `suppaftp` (sync + rustls) | `dest-ftps` |
+| **http(s)** | ✅ ship (P5) | ranged `PUT`s (`Content-Range`), checkpointed | single (chunked, sequential) | size + re-hash (download) | `reqwest` (rustls) | `dest-http` |
+| **azure blob** | ✅ ship (P5) | staged blocks, contiguous prefix (checkpointed) | single (sequential) | size + re-hash (download) | `azure_storage_blobs` | `dest-azure` (off) |
 | **gcs** | phase | resumable session URI | chunked | CRC32C/MD5 | `google-cloud-storage` | `dest-gcs` (off) |
 
 Batteries-included default = `local` + `dest-s3`; immature crates off default (the `telemetry-processor`
-pattern).
+pattern). `sftp`/`ftps` split into two features (not the single `dest-sftp` sketched above) since they
+land as separately-toggleable, separately-crated backends (`russh`+`russh-sftp` vs `suppaftp`).
+
+> **SECURITY — network-backend transport authentication (NFR-7).**
+> - **SFTP** is **fail-closed** on the SSH host key. Pin the server's public key with `egress.hostKey`
+>   (an OpenSSH `algo base64[ comment]` known-hosts line): the presented key must match exactly or the
+>   handshake is refused (a mismatch is a permanent error — possible MITM). If no `hostKey` is pinned,
+>   the connection is **refused by default** with an actionable error; accepting any key on trust is an
+>   explicit, discouraged opt-in via `egress.insecureAcceptAnyHostKey: true` (logs a loud warning — it
+>   disables MITM protection and, under password auth, risks credential capture).
+> - **FTPS** enforces **TLS certificate + hostname verification**: the rustls client uses the default
+>   WebPKI verifier (validates the chain against the system trust roots AND the certificate identity
+>   against the configured `egress.host` as the TLS `ServerName`). There is no accept-invalid-certs
+>   escape hatch — verification is always in effect.
+
+> **P5 follow-up — FTPS live integration test.** `dest-ftps` is fully wired and unit-tested
+> (`dest/ftps/mod.rs`), but has no simulator-backed integration test: no clean containerized FTPS image
+> was available alongside the pre-pulled `atmoz/sftp`/azurite/fake-gcs-server set (FTPS-in-docker needs
+> implicit/explicit TLS + a self-signed cert + a pinned passive-port range, which is notoriously flaky to
+> stand up unattended). SFTP — the priority backend of this family — has the live test
+> (`tests/sftp_atmoz.rs`). Candidate follow-up images: `fauria/vsftpd` or `garethflowers/ftp-server` with
+> TLS enabled and `PASV_MIN_PORT`/`PASV_MAX_PORT` pinned; a `tests/ftps_*.rs` in the same self-skipping
+> shape as `tests/sftp_atmoz.rs` would close this gap. `dest-ftps` also currently rejects implicit TLS
+> (`egress.explicitTls: false`) as a permanent config error rather than half-implementing the deprecated
+> mode — see `dest/ftps/mod.rs`'s module doc.
+
+> **P5 note — HTTP(S) resume model.** Generic HTTP has no stateful upload-id (S3) or seek/append
+> connection (SFTP/FTPS), so `dest-http` resumes as a sequence of **ranged `PUT`s**: the source is split
+> into `egress.chunkBytes`-sized segments (default 8 MiB), each sent with `Content-Range: bytes
+> {start}-{end}/{total}` and checkpointed after it succeeds. `verify` re-hashes the downloaded object
+> (like SFTP/FTPS) rather than the sketched `Content-MD5` (no MD5 hasher in this crate — CRC32C/SHA-256
+> only, DESIGN §13.1). `method: POST` has no natural partial-append semantics, so resume is forced off
+> for it (a fresh single-shot request every attempt). Live-tested against an in-process HTTP/1.1 server
+> (`tests/http_inprocess.rs`, no simulator/Docker needed, so it always runs) — see `dest/http/mod.rs`'s
+> module doc.
+
+> **P5 note — Azure Blob concurrency + resume model.** `dest-azure` (off by default — younger SDK line,
+> the "legacy" `azure-sdk-for-rust` track, DESIGN §22.2) uses staged blocks (**Put Block**/**Put Block
+> List**, the multipart-equivalent) but stages them **sequentially**, not the "parallel blocks" this
+> table originally sketched — matching `dest-http`/`dest-sftp`/`dest-ftps`, not `dest-s3`'s bounded-
+> `JoinSet` parallel parts. Sequential staging keeps the already-staged set always a contiguous byte
+> prefix, so a resume re-hashes that prefix **locally** (no re-send, mirrors `dest-http`'s
+> `hash_local_prefix`) to keep the whole-file checksum correct — the same trick S3 does not need because
+> it verifies via the server-echoed object checksum instead of a local rehash. Verify is local re-hash
+> of a downloaded blob (like SFTP/FTPS/HTTP), not the sketched `MD5/CRC64` (no MD5 hasher in this crate).
+> Azure has no API to drop staged-but-uncommitted blocks (unlike S3's `AbortMultipartUpload`), so
+> `abort` is a documented no-op — they are simply garbage-collected ~7 days after their last Put Block if
+> never committed. Live-tested against Azurite (`tests/azure_azurite.rs`, self-skipping) — note Azurite
+> needs `--loose` mode for the SDK's chunked-download range-integrity header
+> (`x-ms-range-get-content-crc64`); real Azure Blob Storage supports it natively. See `dest/azure/mod.rs`'s
+> module doc for the full rationale, including the parallel-blocks follow-up.
 
 ### 10.3 Additional destination suggestions
 
