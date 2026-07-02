@@ -12,8 +12,19 @@
 //! restart-on-`NoSuchUpload`), the lazy client builder ([`S3Dest::s3`]), and the
 //! `impl Destination for S3Dest` delegation glue all live here so [`super::S3Dest`] stays on the
 //! coverage-counted side with only pure/decision logic. Helpers this file calls (`plan_upload`,
-//! `object_key`, `hash_range`, `RangeBody`, `checksum_to_b64`, `S3ResumeToken`, `classify_s3`,
-//! `compare_object_checksum`, `build_handle`) are the unit-tested pure functions in [`super`].
+//! `object_key`, `RangeBody`, `S3ResumeToken`, `classify_s3`, `compare_object_checksum`,
+//! `build_handle`) are the unit-tested pure functions in [`super`].
+//!
+//! ## Single-pass trailing checksum
+//! `put_single`/`upload_part` set only `.checksum_algorithm(..)` on the request (no precomputed
+//! `x-amz-checksum-*` header) and hand the SDK a **streaming** body ([`RangeBody`], `bytes() == None`).
+//! That combination makes aws-sdk-s3's `RequestChecksumInterceptor` take the trailer branch instead of
+//! the header branch: it wraps the body in `ChecksumBody`, which computes the digest over exactly the
+//! bytes streamed and emits it as an `x-amz-trailer` (aws-chunked). One disk read per range — no
+//! separate precompute pass, and no header/body desync window, since the checksum is derived from the
+//! same bytes that go out on the wire. The object/part checksum for our own bookkeeping (resume
+//! completion list, `verify`) is read back off the **response** (`resp.checksum_crc32_c()`/
+//! `checksum_sha256()`), which S3 echoes once it has validated the trailer server-side.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,9 +50,9 @@ use crate::integrity::Algorithm;
 use crate::ratelimit::Bandwidth;
 
 use super::{
-    build_handle, checksum_to_b64, classify_s3, compare_object_checksum, hash_range, handle_key,
-    handle_s3_checksum, missing_parts, object_key, part_len, plan_upload, source_changed, RangeBody,
-    S3ClientParams, S3CompletedPart, S3Dest, S3ResumeToken, UploadPlan,
+    build_handle, classify_s3, compare_object_checksum, handle_key, handle_s3_checksum, missing_parts,
+    object_key, part_len, plan_upload, source_changed, RangeBody, S3ClientParams, S3CompletedPart,
+    S3Dest, S3ResumeToken, UploadPlan,
 };
 
 /// Wrap a range of `path` into a retryable, streamed `ByteStream` for `PutObject`/`UploadPart`: a
@@ -202,14 +213,16 @@ fn file_mtime_ms(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-/// Single `PutObject` with a precomputed flexible checksum. Two disk passes over the same range: pass 1
-/// ([`hash_range`]) computes the flexible-checksum header that must precede the body; pass 2 (a streamed
-/// [`RangeBody`]) is the throttled/progress-reported egress. This doubles the source read versus the old
-/// whole-range `Vec` buffer — the deliberate memory-for-I/O tradeoff that bounds peak transfer RSS to a
-/// single [`READ_CHUNK`](super) regardless of file size (DESIGN §11.4/NFR-3). Because the two passes are
-/// independent reads, a post-send size+mtime re-check ([`source_changed`]) rejects a source mutated
-/// mid-upload (`Transient` → re-plan) so the stored object can never silently desync from the sent
-/// checksum.
+/// Single `PutObject` with a single-pass **trailing** flexible checksum: only `.checksum_algorithm(..)`
+/// is set on the request (no precomputed `x-amz-checksum-*` header) and the body is the streamed
+/// [`RangeBody`], so the SDK's flexible-checksum machinery computes the digest over exactly the bytes
+/// streamed and sends it as an aws-chunked trailer (see the module doc). One disk read total — no
+/// separate precompute pass — which bounds peak transfer RSS to a single [`READ_CHUNK`](super)
+/// regardless of file size (DESIGN §11.4/NFR-3), strictly better than the old two-pass precomputed
+/// -header approach. Even though the checksum can no longer itself desync from the sent bytes, a
+/// post-send size+mtime re-check ([`source_changed`]) still rejects a source rewritten mid-upload
+/// (`Transient` → re-plan): a mid-stream rewrite yields a self-consistent-but-torn snapshot whose
+/// checksum S3 would accept.
 #[allow(clippy::too_many_arguments)]
 async fn put_single(
     dest: &S3Dest,
@@ -221,11 +234,6 @@ async fn put_single(
     progress: &ProgressSink,
     bw: &Bandwidth,
 ) -> Result<Delivered> {
-    // Pass 1 (local disk, no throttle/no progress): precompute the flexible-checksum header that must
-    // precede the body. Pass 2 (below) is the throttled/progress-reported streamed send.
-    let checksum = hash_range(&item.abs_source, 0, size, dest.algo).await?;
-    let ck_b64 = checksum_to_b64(&checksum);
-
     let path: Arc<Path> = item.abs_source.clone().into();
     let total = Arc::new(AtomicU64::new(0));
     let p = progress.clone();
@@ -240,13 +248,12 @@ async fn put_single(
             p.report((total.fetch_add(d, Ordering::Relaxed) + d).min(size));
         }),
     );
-    let mut req = client.put_object().bucket(&dest.bucket).key(key).body(body);
-    if let Some(b64) = &ck_b64 {
-        req = match dest.algo {
-            Algorithm::Crc32c => req.checksum_crc32_c(b64),
-            Algorithm::Sha256 => req.checksum_sha256(b64),
-        };
-    }
+    let mut req = client
+        .put_object()
+        .bucket(&dest.bucket)
+        .key(key)
+        .body(body)
+        .checksum_algorithm(checksum_algorithm(dest.algo));
     if let Some(sc) = &dest.storage_class {
         req = req.storage_class(StorageClass::from(sc.as_str()));
     }
@@ -257,10 +264,15 @@ async fn put_single(
         req = req.ssekms_key_id(k);
     }
 
-    // UNSIGNED-PAYLOAD (DESIGN §11.2): skip the SigV4 payload-hash pass for simple PUTs. Integrity is
-    // still guaranteed by TLS plus the precomputed flexible checksum sent alongside. This is the SDK's
-    // first-class `disable_payload_signing` knob (not a no-op). Multipart parts are already streamed,
-    // so it applies to the single-PUT path only, matching §11.2 ("off for multipart").
+    // UNSIGNED-PAYLOAD (DESIGN §11.2): skip the SigV4 payload-hash pass for simple PUTs. This is the
+    // SDK's first-class `disable_payload_signing` knob. NOTE: over the trailing-checksum path the SDK's
+    // `AwsChunkedContentEncodingInterceptor` already forces `StreamingUnsignedPayloadTrailer` on its own
+    // for an `https://` endpoint (unconditionally — see the aws-chunked interceptor source), so this knob
+    // is redundant-but-harmless there; the interceptor's chunked-trailer override sits in a config layer
+    // above the plugin's and wins regardless. It still matters for a plain-`http://` endpoint (floci),
+    // where the interceptor instead forces a *signed* trailer and this knob is likewise overridden. Kept
+    // for the config surface (§11.2) and because it is genuinely a no-op, never a correctness hazard, on
+    // both paths. Multipart parts are already streamed, so this applies to the single-PUT path only.
     let resp = if dest.unsigned_payload {
         req.customize()
             .disable_payload_signing()
@@ -271,17 +283,14 @@ async fn put_single(
         req.send().await.map_err(map_sdk)?
     };
 
+    // The object checksum is read back off the response, not recomputed locally: S3 validated the
+    // trailing checksum server-side against exactly the bytes it received, so this is the authority
+    // (not a value we compare against a local precompute — there is none anymore).
     let obj_ck = response_checksum(dest.algo, resp.checksum_crc32_c(), resp.checksum_sha256());
-    // Server-side echo must match what we computed (defence in depth over TLS).
-    if let (Some(local), Some(remote)) = (&ck_b64, &obj_ck) {
-        compare_object_checksum(local, remote)?;
-    }
-    // The object is stored. Because the checksum (pass 1) and the streamed body (pass 2) are two
-    // independent disk reads, re-stat the source: a same-length OR resized in-place rewrite during the
-    // (throttled) send desyncs the stored bytes from the sent checksum. A checksum-validating endpoint
-    // already rejected such a send (BadDigest → transient); this additionally covers non-validating
-    // S3-compatible endpoints (MinIO/floci) whose verify downgrades to size-only. Transient → the next
-    // attempt re-hashes the now-stable bytes and overwrites the object (self-heals, DESIGN §11.4/§13.2).
+    // The object is stored. The trailing checksum is provably over the bytes sent, but a source
+    // rewritten *mid-stream* still yields a self-consistent-but-torn snapshot (early bytes from the old
+    // content, later bytes from the new) whose checksum S3 accepts — re-stat and reject that case so the
+    // next attempt re-reads metadata and re-streams the now-stable bytes (self-heals, DESIGN §11.4/§13.2).
     let after = tokio::fs::metadata(&item.abs_source)
         .await
         .map_err(ReplError::classify_io)?;
@@ -290,10 +299,10 @@ async fn put_single(
             "s3 source changed during upload of {key}; re-planning against the current bytes"
         )));
     }
-    let handle = build_handle(key, obj_ck.as_deref().or(ck_b64.as_deref()), dest.algo, false);
+    let handle = build_handle(key, obj_ck.as_deref(), dest.algo, false);
     Ok(Delivered {
         bytes: size,
-        checksum,
+        checksum: Checksum::None,
         handle,
     })
 }
@@ -475,12 +484,9 @@ async fn run_multipart_attempt(
             let relpath = item.relpath.clone();
 
             set.spawn(async move {
-                // Pass 1 (local disk, no throttle/no progress): precompute the part's checksum header.
-                let part_ck = hash_range(&path, offset, len, algo)
-                    .await
-                    .map_err(MpuError::Fatal)?;
-                let b64 = checksum_to_b64(&part_ck);
-                // Pass 2: the throttled/progress-reported streamed send.
+                // Single-pass trailing checksum (see the module doc): only `.checksum_algorithm(..)` is
+                // set, the body is the streamed `RangeBody`, and the SDK computes+sends the part's
+                // digest as an aws-chunked trailer over exactly the bytes streamed below.
                 let t = total.clone();
                 let p = progress.clone();
                 let body = streaming_body(
@@ -495,19 +501,14 @@ async fn run_multipart_attempt(
                         p.report((t.fetch_add(d, Ordering::Relaxed) + d).min(size));
                     }),
                 );
-                let mut req = client
+                let req = client
                     .upload_part()
                     .bucket(&bucket)
                     .key(&key)
                     .upload_id(&upload_id)
                     .part_number(part_number as i32)
-                    .body(body);
-                if let Some(b) = &b64 {
-                    req = match algo {
-                        Algorithm::Crc32c => req.checksum_crc32_c(b),
-                        Algorithm::Sha256 => req.checksum_sha256(b),
-                    };
-                }
+                    .body(body)
+                    .checksum_algorithm(checksum_algorithm(algo));
                 let resp = match req.send().await {
                     Ok(r) => r,
                     Err(e) if is_no_such_upload(&e) => return Err(MpuError::Gone),
@@ -524,11 +525,13 @@ async fn run_multipart_attempt(
                         ))))
                     }
                 };
+                // Read the part's checksum back off the response (S3 validated the trailer server-side
+                // against exactly the bytes it received) for the completed-part list `CompleteMultipartUpload`
+                // needs; a non-echoing endpoint (floci) simply omits it, same as before.
                 let cp = S3CompletedPart {
                     part_number,
                     e_tag: etag,
-                    checksum: response_checksum(algo, resp.checksum_crc32_c(), resp.checksum_sha256())
-                        .or(b64),
+                    checksum: response_checksum(algo, resp.checksum_crc32_c(), resp.checksum_sha256()),
                 };
                 // Record the part AND persist the durable checkpoint UNDER the same lock, so a slower
                 // task's older snapshot can never overwrite a newer one (out-of-order clobber). The
@@ -608,11 +611,12 @@ async fn run_multipart_attempt(
         Err(e) => return Err(MpuError::Fatal(map_sdk(e))),
     };
 
-    // Same source-stability re-check as the single-PUT path: each part's checksum header was computed
-    // in a pass separate from that part's streamed body, so a source rewritten mid-upload leaves the
-    // assembled object desynced from those checksums (invisible to a size-only verify on a non-validating
-    // endpoint). Transient → the next attempt sees a changed mtime, discards the resume token, and
-    // re-uploads a fresh, consistent object (DESIGN §11.4/§13.2).
+    // Same source-stability re-check as the single-PUT path: each part's trailing checksum is provably
+    // over that part's own streamed bytes, but a source rewritten mid-upload can still splice old/new
+    // content across different parts' boundaries — a self-consistent-per-part but torn-overall object
+    // (invisible to a size-only verify on a non-validating endpoint). Transient → the next attempt sees
+    // a changed mtime, discards the resume token, and re-uploads a fresh, consistent object (DESIGN
+    // §11.4/§13.2).
     let after = tokio::fs::metadata(&item.abs_source)
         .await
         .map_err(|e| MpuError::Fatal(ReplError::classify_io(e)))?;

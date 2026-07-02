@@ -35,7 +35,7 @@
 //! ## Where the code lives (coverage seam, NFR-2)
 //! Everything in **this file** is pure decision logic (blob-path mapping, block-size/count planning,
 //! block-id derivation, credential selection, connection-string parsing, resume bookkeeping, error
-//! classification) plus the streaming *local* file read (no network — mirrors `dest/s3::{hash_range,RangeBody}` /
+//! classification) plus the streaming *local* file read (no network — mirrors `dest/s3::RangeBody` /
 //! `dest/http::read_source_range`) — all unit-tested with no network. Every line that opens an Azure
 //! Storage connection or sends a request lives in [`client`], excluded from the coverage gate (mirrors
 //! `dest/{s3,sftp,ftps,http}/client.rs`). The self-skipping integration test (`tests/azure_azurite.rs`)
@@ -351,7 +351,7 @@ pub fn classify_azure(status: Option<u16>, transport: bool) -> ReplError {
 
 /// Read `len` bytes from `path` starting at `offset` into memory, throttling every chunk through the
 /// bandwidth governor and reporting the **delta** of each chunk via `on_progress` (mirrors
-/// `dest/s3::{hash_range,RangeBody}`/`dest/http::read_source_range`). The in-memory buffer is bounded by `len`
+/// `dest/s3::RangeBody`/`dest/http::read_source_range`). The in-memory buffer is bounded by `len`
 /// (≤ `blocks.blockSizeBytes`).
 pub async fn read_source_range(
     path: &Path,

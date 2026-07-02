@@ -38,7 +38,7 @@
 //! ## Where the code lives (coverage seam, NFR-2)
 //! Everything in **this file** is pure decision logic (URL/path mapping, method/auth/resume
 //! bookkeeping, chunk-range math, error classification) plus the streaming *local* file read (no
-//! network — mirrors `dest/s3::{hash_range,RangeBody}`) — all unit-tested with no network. Every line that opens
+//! network — mirrors `dest/s3::RangeBody`) — all unit-tested with no network. Every line that opens
 //! an HTTP connection or sends a request lives in [`client`], excluded from the coverage gate (mirrors
 //! `dest/{s3,sftp,ftps}/{mod.rs,client.rs}`). The in-process integration test (`tests/http_inprocess.rs`)
 //! always runs (no simulator container to skip), exercising `client.rs` live end to end.

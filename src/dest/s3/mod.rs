@@ -8,9 +8,12 @@
 //! ## Where the code lives (coverage seam, NFR-2)
 //! Everything in **this file** is either pure decision logic (part planning, key mapping, checksum
 //! codecs, resume bookkeeping, credential selection, client-param derivation, error classification)
-//! or the streaming file reads (a checksum-only pass, [`hash_range`], and the throttled/progress
-//! -reported egress body, [`RangeBody`]) — all unit-tested with no network, and bounded to one
-//! [`READ_CHUNK`] at a time (no whole-part/whole-file buffer). Every line that makes an actual AWS
+//! or the streaming, throttled/progress-reported egress body ([`RangeBody`]) — all unit-tested with no
+//! network, and bounded to one [`READ_CHUNK`] at a time (no whole-part/whole-file buffer). The object's
+//! flexible checksum is a **single-pass trailing checksum**: [`client`] sets `.checksum_algorithm(..)`
+//! and the streaming body only, so the aws-sdk-s3 flexible-checksum machinery (`ChecksumBody`) computes
+//! the digest over exactly the bytes [`RangeBody`] streams and emits it as an aws-chunked trailer — one
+//! disk read per range, not two. Every line that makes an actual AWS
 //! SDK round-trip lives in [`client`], which is excluded from the coverage gate (it is unreachable in
 //! CI/unit runs; the floci integration tests in `tests/s3_floci.rs` self-skip when floci is down, so
 //! they never gate). The lazy client builder and the whole `impl Destination for S3Dest` delegation
@@ -43,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{MultipartCfg, S3Egress};
 use crate::domain::{Checksum, ResumeState};
 use crate::error::{ReplError, Result};
-use crate::integrity::{Algorithm, Hasher};
+use crate::integrity::Algorithm;
 use crate::ratelimit::Bandwidth;
 use crate::state::StateStore;
 
@@ -150,20 +153,33 @@ pub fn object_key(prefix: &str, relpath: &str) -> String {
 }
 
 // ---- checksum codecs (DESIGN §11.4) -------------------------------------------------------------
+//
+// NOTE (single-pass conversion): these encoders are no longer on the S3 *delivery* path. The old
+// two-pass upload precomputed the checksum locally and sent it as an `x-amz-checksum-*` header (that
+// header value came from [`checksum_to_b64`]); the single-pass trailing checksum instead lets the SDK
+// compute the digest over the streamed body and reads the resulting object/part checksum back off the
+// response as an opaque base64 string (see [`client::response_checksum`]), so nothing in
+// deliver/verify calls these anymore. They are retained deliberately as small, unit-tested pure codecs
+// and are exercised end-to-end by the real-S3 integration test (`tests/s3_real.rs`), which independently
+// recomputes the expected base64 CRC32C of the source and asserts it equals the checksum stored in the
+// delivery handle — the assertion that guards against the response silently ceasing to echo a checksum.
 
 use base64::Engine as _;
 
-/// Base64 of the 4-byte big-endian CRC32C — the S3 flexible-checksum header value.
+/// Base64 of the 4-byte big-endian CRC32C — the S3 flexible-checksum value for a CRC32C digest.
 pub fn crc32c_to_b64(v: u32) -> String {
     base64::engine::general_purpose::STANDARD.encode(v.to_be_bytes())
 }
 
-/// Base64 of a 32-byte SHA-256 digest — the S3 flexible-checksum header value.
+/// Base64 of a 32-byte SHA-256 digest — the S3 flexible-checksum value for a SHA-256 digest.
 pub fn sha256_to_b64(b: &[u8; 32]) -> String {
     base64::engine::general_purpose::STANDARD.encode(b)
 }
 
-/// The S3 header value for a [`Checksum`], or `None` when no checksum was computed.
+/// The S3 flexible-checksum base64 value for a [`Checksum`], or `None` when no checksum was computed.
+/// Retained as a tested pure codec (see the section note): the delivery path no longer sends a
+/// precomputed checksum header, but the real-S3 test uses this to derive the expected value it compares
+/// against the response-derived object checksum.
 pub fn checksum_to_b64(c: &Checksum) -> Option<String> {
     match c {
         Checksum::Crc32c(v) => Some(crc32c_to_b64(*v)),
@@ -455,15 +471,14 @@ fn is_permanent_code(code: &str) -> bool {
 }
 
 /// True for S3 error codes worth retrying (throttling / capacity / transient server faults) — plus the
-/// flexible-checksum / digest **mismatch** codes. Because the object's flexible-checksum header is
-/// computed in a separate [`hash_range`] pass from the throttled [`RangeBody`] egress, a source
-/// rewritten in place during the (bandwidth-capped, possibly minutes-long) send desyncs the sent
-/// checksum from the sent body, which a checksum-validating endpoint rejects with `BadDigest` /
-/// `XAmzContentChecksumMismatch` / `XAmzContentSHA256Mismatch`. Classifying those transient lets the
-/// next attempt re-read the source metadata and re-hash the now-stable bytes (self-healing) instead of
-/// permanently quarantining a legitimately-changing source (DESIGN §11.4/§13.2). `InvalidDigest` — a
-/// *malformed* digest value — is deliberately NOT here: that is a client-side bug, not a content race,
-/// so it stays permanent (via the 4xx path).
+/// flexible-checksum / digest **mismatch** codes. With the single-pass trailing checksum (the digest is
+/// computed over exactly the bytes [`RangeBody`] streams, by the same pass that sends them) a mismatch
+/// can no longer be caused by *our own* precompute-vs-stream desync — that race is structurally
+/// eliminated. `BadDigest` / `XAmzContentChecksumMismatch` / `XAmzContentSHA256Mismatch` are kept
+/// transient anyway as a defensible "retry a genuine in-transit corruption" (a bit-flip on the wire is
+/// rare but real, and one extra retry is cheap); they are no longer load-bearing for our integrity
+/// story. `InvalidDigest` — a *malformed* digest value — is deliberately NOT here: that is a
+/// client-side bug, not a content race, so it stays permanent (via the 4xx path).
 fn is_transient_code(code: &str) -> bool {
     matches!(
         code,
@@ -526,64 +541,36 @@ pub fn classify_s3(code: Option<&str>, status: Option<u16>, transport: bool) -> 
 
 // ---- streaming read (pure, no network) ----------------------------------------------------------
 
-/// The truncation message shared between [`hash_range`]'s (`ReplError`) and [`RangeBody`]'s
-/// (`io::Error`, surfaced through the SDK's dispatch-failure → [`client::map_sdk`] transport
-/// classification) short-read guards, so both passes fail the same way for the same reason.
+/// The truncation message for [`RangeBody`]'s short-read guard (`io::Error`, surfaced through the
+/// SDK's dispatch-failure → [`client::map_sdk`] transport classification).
 fn truncated_msg(path: &Path, offset: u64, len: u64, read: u64) -> String {
     format!("source truncated: read {read} of {len} bytes at offset {offset} from {}", path.display())
 }
 
 /// Whether the source changed under an in-flight upload: its size or mtime differs from what the
-/// upload path captured before it hashed. Because the flexible-checksum header is computed in a
-/// separate [`hash_range`] pass from the throttled [`RangeBody`] egress, a same-length OR resized
-/// in-place rewrite during the (potentially minutes-long, bandwidth-capped) send would leave the stored
-/// object's bytes desynced from the sent checksum. The single-PUT and multipart paths re-stat the
+/// upload path captured before it started sending. The single-pass **trailing** checksum is computed
+/// over exactly the bytes streamed, so it can never itself desync from the sent body — but a source
+/// rewritten *mid-stream* still produces a self-consistent-but-**torn** snapshot (early chunks from the
+/// old content, later chunks from the new) whose checksum S3 happily accepts: the bytes shipped are
+/// simply not a coherent point-in-time copy of the file. The single-PUT and multipart paths re-stat the
 /// source after the send and, if this returns `true`, fail `Transient` so the next attempt re-reads
-/// metadata + re-hashes the now-stable bytes (self-healing). On checksum-validating endpoints S3 also
-/// rejects the desynced send itself (`BadDigest`, classified transient by [`is_transient_code`]); this
-/// guard additionally protects the explicitly-supported non-validating S3-compatible endpoints
-/// (MinIO/floci) whose `verify` downgrades to size-only and would otherwise silently accept the mismatch
-/// then release the source (DESIGN §11.4/§13.2).
+/// metadata and re-streams the now-stable bytes (self-healing). This guard is orthogonal to checksum
+/// integrity and remains necessary even though the trailing checksum eliminated the old two-pass
+/// precompute-vs-stream race (DESIGN §11.4/§13.2).
+///
+/// Residual window (unchanged by the single-pass conversion, but now the *only* torn-read detector on
+/// every endpoint): the old two-pass code hashed the *old* content in the precompute pass while the
+/// stream sent the *new* content after an in-place rewrite, so on a checksum-validating endpoint (real
+/// S3) that specific race also surfaced as a `BadDigest` regardless of mtime. The single-pass trailing
+/// checksum is always self-consistent with the exact bytes streamed, so a torn snapshot now carries a
+/// checksum S3 accepts on every endpoint and size+mtime is the sole detector. The one case it cannot
+/// see is a *same-length in-place rewrite whose mtime is unchanged across the whole upload* — possible
+/// only with coarse filesystem mtime granularity plus a writer that preserves/resets mtime. Realistic
+/// throttled uploads span far more than mtime granularity, so a mid-stream content change virtually
+/// always bumps mtime and is caught; this matches the pre-existing floci/MinIO size-only gap (DESIGN
+/// §11.3/§11.4). A stronger guarantee would need an opt-in post-send read-back verify (not implemented).
 pub fn source_changed(orig_size: u64, orig_mtime_ms: i64, now_size: u64, now_mtime_ms: i64) -> bool {
     orig_size != now_size || orig_mtime_ms != now_mtime_ms
-}
-
-/// Hash `len` bytes of `path` starting at `offset` in a single streaming pass (DESIGN §11.4/§13.1) —
-/// **no** bandwidth throttle, **no** progress report: this is a local disk read (computing the S3
-/// flexible-checksum header that must precede the body) not egress, so it must not consume the
-/// governor's budget or move the [`ProgressSink`]. [`range_byte_stream`] is the throttled/progress
-/// -reported egress pass over the same range. Bounded 64 KiB working buffer regardless of `len`
-/// (DESIGN NFR-3) — this replaces the old whole-range `Vec<u8>` buffer entirely; hashing never
-/// materializes more than one chunk.
-pub async fn hash_range(path: &Path, offset: u64, len: u64, algo: Algorithm) -> Result<Checksum> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
-    let mut file = tokio::fs::File::open(path).await.map_err(ReplError::classify_io)?;
-    if offset > 0 {
-        file.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(ReplError::classify_io)?;
-    }
-    let mut hasher = Hasher::new(algo);
-    let mut remaining = len;
-    let mut chunk = vec![0u8; READ_CHUNK];
-    while remaining > 0 {
-        let want = remaining.min(READ_CHUNK as u64) as usize;
-        let n = file
-            .read(&mut chunk[..want])
-            .await
-            .map_err(ReplError::classify_io)?;
-        if n == 0 {
-            // EOF before `len`: the source shrank/was truncated since `deliver` read its metadata
-            // (or a producer is still rewriting it). Fail as Transient so the next attempt re-reads
-            // metadata and re-plans against the current size (self-healing) rather than hashing (and
-            // then shipping) a partial object.
-            return Err(ReplError::Transient(truncated_msg(path, offset, len, len - remaining)));
-        }
-        hasher.update(&chunk[..n]);
-        remaining -= n as u64;
-    }
-    Ok(hasher.finish())
 }
 
 /// A `Send + Sync` streaming egress body over one byte range of `path`: reads bounded [`READ_CHUNK`]
@@ -594,9 +581,12 @@ pub async fn hash_range(path: &Path, offset: u64, len: u64, algo: Algorithm) -> 
 /// `UploadPart` without ever materializing more than one chunk of the range at a time (peak transfer
 /// memory ≈ `max_concurrent × READ_CHUNK`, independent of part/file size).
 ///
-/// A short read before the range is exhausted yields an `io::Error` (mirrors [`hash_range`]'s
-/// truncation guard); the SDK surfaces that as a dispatch failure, which [`client::map_sdk`] classifies
-/// as `Transient` — same self-healing re-plan behavior as before.
+/// This is the **only** disk read per range: [`client`] hands this body straight to the SDK's flexible
+/// -checksum machinery, which wraps it to compute the object/part's trailing checksum over exactly the
+/// bytes read here as they are streamed — a single pass, not a precompute-then-resend.
+///
+/// A short read before the range is exhausted yields an `io::Error`; the SDK surfaces that as a
+/// dispatch failure, which [`client::map_sdk`] classifies as `Transient` — self-healing re-plan.
 pub struct RangeBody {
     // A boxed `dyn Stream` is `Send` but not (in general) `Sync`, and `http_body::Body` requires
     // `Sync`. `poll_data` is handed `Pin<&mut Self>` (this struct is `Unpin`, so `get_mut()` recovers
@@ -608,7 +598,7 @@ pub struct RangeBody {
 
 impl RangeBody {
     /// Build the streaming body for `[offset, offset+len)` of `path`. `on_progress` receives each
-    /// chunk's length (a delta, like [`hash_range`]'s caller pattern) as it streams.
+    /// chunk's length (a delta) as it streams.
     pub fn new(
         path: Arc<Path>,
         offset: u64,
@@ -667,8 +657,13 @@ impl http_body::Body for RangeBody {
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
-        // Exact (lower == upper) so the SDK derives a real `Content-Length` (S3 `PutObject`/
-        // `UploadPart` need it; this is not `aws-chunked` transfer-encoded).
+        // Exact (lower == upper) = the *decoded* content length of this range. On the trailing-checksum
+        // path the request IS `aws-chunked` content-encoded (`STREAMING-…-TRAILER`), and the SDK's
+        // aws-chunked/trailing-checksum interceptor consumes this exact hint to derive both the framed
+        // `Content-Length` (decoded length + the chunk/trailer framing overhead) and
+        // `x-amz-decoded-content-length`. A non-exact hint would leave it unable to size the framed body
+        // (S3 `PutObject`/`UploadPart` require a length up front — the body is not chunked
+        // transfer-encoded at the HTTP layer).
         http_body::SizeHint::with_exact(self.len)
     }
 }
@@ -735,6 +730,7 @@ impl S3Dest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrity::Hasher;
     // The `Destination` trait impl lives in `client`; bring the trait into scope so the
     // construction tests can call `kind()`/`supports_resume()`.
     use crate::dest::Destination;
@@ -1248,9 +1244,9 @@ mod tests {
 
     #[test]
     fn classify_checksum_mismatch_is_transient_for_self_heal() {
-        // A precomputed-checksum-vs-streamed-body desync (source rewritten in place between the
-        // hash_range pass and the throttled egress) must retry + re-plan against the now-stable bytes,
-        // not permanently quarantine the file (DESIGN §11.4).
+        // No longer load-bearing for our own precompute-vs-stream desync (the trailing checksum is
+        // computed over exactly the bytes sent, eliminating that race structurally); kept transient as
+        // a defensible retry of a genuine in-transit corruption (DESIGN §11.4).
         for c in ["BadDigest", "XAmzContentChecksumMismatch", "XAmzContentSHA256Mismatch"] {
             assert!(
                 classify_s3(Some(c), Some(400), false).is_transient(),
@@ -1280,58 +1276,6 @@ mod tests {
         assert!(source_changed(100, 42, 99, 42), "shrank");
         assert!(source_changed(100, 42, 100, 43), "same-length in-place rewrite (mtime bumped)");
         assert!(source_changed(100, 42, 101, 43), "both changed");
-    }
-
-    // ---- hash_range (streaming, no network, no throttle/progress) --------------------------------
-
-    #[tokio::test]
-    async fn hash_range_hashes_whole_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("f.bin");
-        let data = vec![7u8; READ_CHUNK * 2 + 100];
-        std::fs::write(&path, &data).unwrap();
-
-        let ck = hash_range(&path, 0, data.len() as u64, Algorithm::Crc32c)
-            .await
-            .unwrap();
-        // Checksum equals the one-pass integrity hash of the same bytes.
-        let mut r = data.as_slice();
-        let (_, expect) = crate::integrity::hash_reader(&mut r, Algorithm::Crc32c).unwrap();
-        assert_eq!(ck, expect);
-    }
-
-    #[tokio::test]
-    async fn hash_range_hashes_an_offset_slice() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("f.bin");
-        let data: Vec<u8> = (0..30_000u32).map(|i| (i % 256) as u8).collect();
-        std::fs::write(&path, &data).unwrap();
-
-        let ck = hash_range(&path, 10_000, 5_000, Algorithm::Crc32c).await.unwrap();
-        let mut slice = &data[10_000..15_000];
-        let (_, expect) = crate::integrity::hash_reader(&mut slice, Algorithm::Crc32c).unwrap();
-        assert_eq!(ck, expect, "per-part checksum is over the part bytes only");
-    }
-
-    #[tokio::test]
-    async fn hash_range_short_read_is_transient_not_a_silent_truncation() {
-        // If the source shrank since `deliver` planned the transfer, hash_range must FAIL (so no
-        // truncated object is later delivered + the source deleted under verify:none), not return a
-        // short hash. Transient so the next attempt re-plans against the smaller size (self-healing).
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("short.bin");
-        std::fs::write(&path, vec![9u8; 1000]).unwrap();
-        let err = hash_range(&path, 0, 5000, Algorithm::Crc32c).await.unwrap_err();
-        assert!(err.is_transient(), "short read must be transient (re-plan), got {err:?}");
-        assert!(err.to_string().contains("truncated"), "diagnostic mentions truncation: {err}");
-    }
-
-    #[tokio::test]
-    async fn hash_range_missing_file_is_permanent() {
-        let err = hash_range(std::path::Path::new("/no/such/file.bin"), 0, 10, Algorithm::Crc32c)
-            .await
-            .unwrap_err();
-        assert!(err.is_permanent(), "NotFound source classifies permanent: {err:?}");
     }
 
     // ---- range_byte_stream / RangeBody (streaming egress body, no network) -----------------------
@@ -1457,7 +1401,7 @@ mod tests {
     async fn range_byte_stream_short_read_is_transient_after_sdk_mapping() {
         // A short read surfaces as an io::Error from the body; `client::map_sdk` classifies the
         // resulting SDK dispatch failure as Transient (unit-tested directly here on the io::Error
-        // path, mirroring hash_range's guard so both passes fail the same way for the same reason).
+        // path — this is now the *only* short-read guard on the upload path).
         let dir = tempfile::tempdir().unwrap();
         let path: Arc<Path> = dir.path().join("short.bin").into();
         std::fs::write(&path, vec![9u8; 1000]).unwrap();
@@ -1477,9 +1421,10 @@ mod tests {
 
     #[tokio::test]
     async fn range_byte_stream_poll_trailers_is_always_empty() {
-        // `poll_trailers` is on the coverage-counted side; exercise it so it is not dead-to-tests. A
-        // RangeBody carries a *precomputed* flexible-checksum header, never a trailing checksum, so it
-        // yields no trailers — `poll_trailers` must resolve immediately to `Ok(None)`.
+        // `poll_trailers` is on the coverage-counted side; exercise it so it is not dead-to-tests.
+        // RangeBody itself never owns trailer bytes — the SDK's `ChecksumBody` wrapper computes and
+        // emits the trailing checksum around this body — so `RangeBody::poll_trailers` must resolve
+        // immediately to `Ok(None)`.
         use http_body::Body as _;
         let dir = tempfile::tempdir().unwrap();
         let path: Arc<Path> = dir.path().join("f.bin").into();

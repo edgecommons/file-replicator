@@ -17,8 +17,10 @@ use std::sync::{Arc, OnceLock};
 use file_replicator::config::{
     Collision, CompletionCfg, EgressCfg, MultipartCfg, OnExhausted, OnSuccess, S3Egress, Verify,
 };
+use file_replicator::dest::s3::{checksum_to_b64, handle_s3_checksum};
 use file_replicator::dest::{build_destination, DestDeps, SharedDestination};
 use file_replicator::domain::{ItemState, ProgressSink, WorkItem};
+use file_replicator::integrity::{Algorithm, Hasher};
 use file_replicator::instance::worker::{RetryPolicy, Worker};
 use file_replicator::ratelimit::{Bandwidth, TokenBucket};
 use file_replicator::state::{SqliteStore, StateStore};
@@ -38,6 +40,36 @@ fn real_egress(bucket: &str, prefix: &str, multipart: MultipartCfg) -> S3Egress 
         checksum_algorithm: None, // CRC32C default
         multipart,
     }
+}
+
+/// The base64 CRC32C that real S3 stores as the whole-object flexible checksum for a *single-PUT*
+/// object of `content`, computed independently of the delivery path. Asserting the delivery handle
+/// carries exactly this (rather than only that `verify()` returns `Ok`) is what makes these tests guard
+/// the single-pass regression class: if the `PutObject` response ever stopped echoing a checksum,
+/// `build_handle` would store `s3Checksum: None` and `verify(Checksum)` would silently downgrade to
+/// size+existence and still pass — but this equality would fail.
+fn expected_crc32c_b64(content: &[u8]) -> String {
+    let mut h = Hasher::new(Algorithm::Crc32c);
+    h.update(content);
+    checksum_to_b64(&h.finish()).expect("crc32c digest encodes to base64")
+}
+
+/// Assert a *multipart* delivery handle carries S3's composite `<base64>-N` object checksum with the
+/// expected part count and a non-empty base64 component (the multipart analogue of
+/// [`expected_crc32c_b64`]: the composite is not the whole-file CRC32C, so we check its shape, not an
+/// exact value). A silent `s3Checksum: None` would fail the initial `expect`.
+fn assert_composite_checksum(handle: &serde_json::Value, expected_parts: u32) {
+    let stored = handle_s3_checksum(handle)
+        .expect("multipart delivery handle must carry the S3 composite object checksum");
+    let (b64, n) = stored
+        .rsplit_once('-')
+        .unwrap_or_else(|| panic!("multipart checksum must be the composite '<base64>-N' shape: {stored}"));
+    assert!(!b64.is_empty(), "composite checksum must carry a non-empty base64 part: {stored}");
+    assert_eq!(
+        n,
+        expected_parts.to_string(),
+        "composite checksum part count must match the plan ({expected_parts} parts): {stored}"
+    );
 }
 
 fn work_item(root: &Path, rel: &str) -> WorkItem {
@@ -104,10 +136,79 @@ async fn real_s3_checksum_verify_roundtrip() {
         delivered.bytes, delivered.handle
     );
 
+    // Guard the single-pass regression class directly: the handle must carry the actual S3 object
+    // checksum, equal to the independently computed base64 CRC32C — not merely let verify() pass (which
+    // would also pass on a silent `s3Checksum: None` downgrade to size+existence).
+    let stored = handle_s3_checksum(&delivered.handle)
+        .expect("single-PUT delivery handle must carry the S3 object checksum");
+    assert_eq!(
+        stored,
+        expected_crc32c_b64(&content),
+        "single-PUT stored object checksum must equal the independently computed base64 CRC32C"
+    );
+
     let vr = dest.verify(&item, &delivered, Verify::Checksum).await;
     eprintln!("VERIFY(Checksum) => {vr:?}");
     vr.expect("verify(Checksum) against REAL S3 must pass");
-    eprintln!("PASS: real-S3 checksum verify round-trip");
+    eprintln!("PASS: real-S3 checksum verify round-trip (handle checksum {stored})");
+}
+
+/// The single-pass **trailing** checksum's riskiest composition (DESIGN §11.2/§11.4): unsigned-PUT
+/// (`disable_payload_signing`) combined with a flexible-checksum request over a *streaming* body, which
+/// the SDK sends as `STREAMING-UNSIGNED-PAYLOAD-TRAILER` on a real `https://` endpoint. Confirms the
+/// combination is not just "not rejected" but produces a checksum `verify(Checksum)` actually accepts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_s3_unsigned_payload_trailer_checksum_verify_roundtrip() {
+    let Ok(bucket) = std::env::var("FR_S3_REAL_BUCKET") else {
+        eprintln!("skipping real-S3 unsigned-trailer test: set FR_S3_REAL_BUCKET to run");
+        return;
+    };
+    let _serial = real_s3_serial().lock().await;
+    let prefix =
+        std::env::var("FR_S3_REAL_PREFIX").unwrap_or_else(|_| "file-replicator-verify-test/".into());
+
+    let dir = tempfile::tempdir().unwrap();
+    let rel = "unsigned-trailer-probe.bin";
+    let content: Vec<u8> = (0..1_048_576u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dir.path().join(rel), &content).unwrap();
+
+    let mut egress = real_egress(&bucket, &prefix, MultipartCfg::default());
+    egress.unsigned_payload = true;
+    let dest: SharedDestination = build_destination(
+        &EgressCfg::S3(Box::new(egress)),
+        &DestDeps::default(),
+    )
+    .expect("build real S3 dest (unsigned payload)");
+    let item = work_item(dir.path(), rel);
+    let bw = Bandwidth::new(
+        Arc::new(TokenBucket::unlimited()),
+        Arc::new(TokenBucket::unlimited()),
+    );
+
+    let delivered = dest
+        .deliver(&item, None, &ProgressSink::noop(), &bw)
+        .await
+        .expect("unsigned-payload deliver to real S3");
+    eprintln!(
+        "DELIVERED (unsigned-payload trailer) bytes={} handle={}",
+        delivered.bytes, delivered.handle
+    );
+
+    // Same regression guard for the unsigned-PUT (STREAMING-UNSIGNED-PAYLOAD-TRAILER) composition: the
+    // trailing checksum the SDK sends over the streamed body must round-trip into the handle as the exact
+    // base64 CRC32C of the source, not just satisfy a downgradeable verify().
+    let stored = handle_s3_checksum(&delivered.handle)
+        .expect("unsigned-payload single-PUT delivery handle must carry the S3 object checksum");
+    assert_eq!(
+        stored,
+        expected_crc32c_b64(&content),
+        "unsigned-payload single-PUT object checksum must equal the independently computed base64 CRC32C"
+    );
+
+    let vr = dest.verify(&item, &delivered, Verify::Checksum).await;
+    eprintln!("VERIFY(Checksum) (unsigned-payload trailer) => {vr:?}");
+    vr.expect("verify(Checksum) against REAL S3 must pass for unsigned-payload + trailing checksum");
+    eprintln!("PASS: real-S3 unsigned-payload trailing-checksum round-trip (handle checksum {stored})");
 }
 
 /// The full engine path the Greengrass device runs: Worker::process_item = deliver → verify(Checksum)
@@ -315,6 +416,11 @@ async fn real_s3_multipart_upload_peak_rss_is_bounded_not_part_buffered() {
         .deliver(&item, None, &ProgressSink::noop(), &bw)
         .await
         .expect("deliver large multipart file to real S3");
+
+    // Guard the multipart single-pass regression class: each part's trailing checksum must round-trip
+    // into the handle as S3's composite `<base64>-N` object checksum (a silent per-part `None` would
+    // leave the handle without one and downgrade verify()). 256 MiB / 16 MiB parts → 16 parts.
+    assert_composite_checksum(&delivered.handle, (FILE_SIZE / PART_SIZE) as u32);
 
     stop.store(true, Ordering::Relaxed);
     sampler.join().expect("rss sampler thread");
