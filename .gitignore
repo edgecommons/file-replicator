@@ -14,6 +14,10 @@
 /data
 *.redb
 vault.json
+# Durable SQLite state written to the process CWD when run locally (+ WAL/SHM sidecars)
+file-replicator-state.db*
+# Local run logs (e.g. the metricEmission log sink's default output)
+/logs/
 
 # OS / editor
 .DS_Store
