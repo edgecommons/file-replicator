@@ -64,6 +64,13 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # message-envelope timestamp, so features unify with no lock churn.
 time = { version = "0.3", features = ["formatting"] }
 
+# --- P4 scheduling deps (non-optional; DESIGN §12) ----------------------------------------------
+# Cron-first scheduling: croner is generic over `chrono::TimeZone`, so cron fires are computed IN
+# the configured tz (DST-aware) via chrono-tz, then mapped back to Utc. Pure-Rust, Windows-clean.
+croner = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+
 # --- P2 S3 destination deps (optional; gated by `dest-s3`, DESIGN §22.2) ------------------------
 # Same 1.x line ggcommons uses for kinesis/cloudwatch; pure-Rust (rustls) — no extra toolchain.
 aws-config = { version = "1", optional = true }

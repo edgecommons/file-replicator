@@ -17,11 +17,12 @@
 //! in [`ratelimit::parse_byte_rate`](crate::ratelimit::parse_byte_rate).
 //!
 //! The P0 module-level `allow(dead_code)` is gone now the P1 engine consumes the P1 field set
-//! (ingress/egress-local/completion/retry/limits/schedule-immediate/activation). What remains
-//! unconsumed is genuinely future scope, so the few types it covers carry a **narrow, reason-tagged**
-//! `allow(dead_code)`: the S3 egress model (`S3Egress`/`MultipartCfg`, P2), the cron/window schedule
-//! payloads (`CronSchedule`/`WindowSchedule`/`WindowClose`, P4), and the UNS topic override
-//! (`TopicsCfg` + `InstanceCfg::topics`, P3). They are removed as each phase wires them in.
+//! (ingress/egress-local/completion/retry/limits/schedule-immediate/activation), and P4
+//! (`file_replicator::schedule`) consumes the cron/window schedule payloads
+//! (`CronSchedule`/`WindowSchedule`/`WindowClose`). What remains unconsumed is genuinely future
+//! scope, so the few types it covers carry a **narrow, reason-tagged** `allow(dead_code)`: the S3
+//! egress model (`S3Egress`/`MultipartCfg`, P2) and the UNS topic override (`TopicsCfg` +
+//! `InstanceCfg::topics`, P3). They are removed as each phase wires them in.
 
 use std::path::PathBuf;
 
@@ -243,29 +244,21 @@ pub enum ScheduleCfg {
     #[default]
     Immediate,
     /// Point trigger: release all ready work at each cron fire.
-    // P4 (scheduling): the P1 engine matches only the discriminant (immediate vs not); the cron
-    // payload is read once the scheduler lands.
-    #[allow(dead_code)]
     Cron(CronSchedule),
     /// Continuous flow gated to an `open`→`close` window.
-    // P4 (scheduling): see `Cron` — payload read only once the window scheduler lands.
-    #[allow(dead_code)]
     Window(WindowSchedule),
 }
 
-// P4 (scheduling & windows): cron payload; the P1 engine treats any non-immediate schedule as
-// immediate (with a TODO), so these fields are only read once the cron scheduler lands.
-#[allow(dead_code)]
+/// Cron payload for [`ScheduleCfg::Cron`]; consumed by [`crate::schedule::Schedule::from_cfg`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CronSchedule {
-    /// Standard cron expression (evaluated tz/DST-aware; DESIGN §12.2).
+    /// Standard cron expression, or an English sugar phrase (evaluated tz/DST-aware; DESIGN §12.2).
     pub expression: String,
     pub timezone: Option<String>,
 }
 
-// P4 (scheduling & windows): window payload; see [`CronSchedule`] — unread until the scheduler lands.
-#[allow(dead_code)]
+/// Window payload for [`ScheduleCfg::Window`]; see [`CronSchedule`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WindowSchedule {
@@ -279,8 +272,7 @@ pub struct WindowSchedule {
     pub on_window_close: WindowClose,
 }
 
-// P4 (scheduling & windows): window-close behavior, read by the window scheduler only.
-#[allow(dead_code)]
+/// Window-close behavior (DESIGN §12.4); consumed by [`crate::schedule`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum WindowClose {
@@ -406,8 +398,8 @@ pub struct GlobalCfg {
 pub struct GlobalDefaults {
     /// Fallback retry policy (an instance's own `retry` wins field-by-field).
     pub retry: Option<RetryCfg>,
-    /// Default schedule timezone. P4 (scheduling): read by the cron/window scheduler only.
-    #[allow(dead_code)]
+    /// Default schedule timezone, consumed by [`crate::instance::Instance::build_with_dest`] as the
+    /// `Schedule::from_cfg` fallback when a schedule sets none of its own (DESIGN §12).
     pub timezone: Option<String>,
 }
 

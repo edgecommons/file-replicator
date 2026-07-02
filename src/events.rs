@@ -135,12 +135,20 @@ pub enum Event {
     InstanceDeactivated { source: String },
     /// The component finished initializing (`set_ready(true)`). Component-level (no `instance`).
     ComponentReady { instances: u64, version: String },
-    /// A trigger command forced a scan/replication. `scope` = `"all"` or the instance id.
+    /// A trigger command forced a scan/replication, or a `cron` schedule fired (DESIGN §12.2: cron
+    /// mode releases all ready work at each fire, reusing the same "the schedule released work now"
+    /// semantics as the control-plane `trigger` command). `scope` = `"all"` or the instance id.
     ScheduleTriggered { scope: String },
-    /// **Deferred (P4 scheduler)**: a replication window opened.
+    /// A replication window opened (DESIGN §12.3/§17.1). `window` is the schedule's human-readable
+    /// label (e.g. `"0 22 * * * -> 0 6 * * *"`).
     WindowOpened { window: String },
-    /// **Deferred (P4 scheduler)**: a replication window closed.
+    /// A replication window closed (DESIGN §12.3/§17.1); see [`Event::ScheduleComplete`] for the
+    /// paired "wrap-up finished" signal (pause or finish-current).
     WindowClosed { window: String },
+    /// A schedule-gated release cycle finished (DESIGN §12.4): either a `cron` fire has claimed and
+    /// processed everything it could this fire, or a `window`'s close-time wrap-up (pause-resume or
+    /// finish-current) has completed. `mode` = `"cron"` | `"window"`.
+    ScheduleComplete { mode: String },
     /// **Deferred (circuit-breaker, §13.4)**: the destination link went down.
     Disconnected { link: String },
     /// **Deferred (circuit-breaker, §13.4)**: the destination link recovered.
@@ -168,6 +176,7 @@ impl Event {
             Event::ScheduleTriggered { .. } => "ScheduleTriggered",
             Event::WindowOpened { .. } => "WindowOpened",
             Event::WindowClosed { .. } => "WindowClosed",
+            Event::ScheduleComplete { .. } => "ScheduleComplete",
             Event::Disconnected { .. } => "Disconnected",
             Event::Reconnected { .. } => "Reconnected",
         }
@@ -271,6 +280,7 @@ impl Event {
             Event::WindowOpened { window } | Event::WindowClosed { window } => {
                 obj(json!({ "window": window }))
             }
+            Event::ScheduleComplete { mode } => obj(json!({ "mode": mode })),
             Event::Disconnected { link } | Event::Reconnected { link } => {
                 obj(json!({ "link": link }))
             }
@@ -814,6 +824,10 @@ mod tests {
         );
         assert_eq!(Event::WindowOpened { window: "w".into() }.name(), "WindowOpened");
         assert_eq!(Event::WindowClosed { window: "w".into() }.name(), "WindowClosed");
+        assert_eq!(
+            Event::ScheduleComplete { mode: "window".into() }.name(),
+            "ScheduleComplete"
+        );
         assert_eq!(Event::Disconnected { link: "s3".into() }.name(), "Disconnected");
         assert_eq!(Event::Reconnected { link: "s3".into() }.name(), "Reconnected");
         assert_eq!(
@@ -866,6 +880,10 @@ mod tests {
         assert_eq!(
             event_body(&Event::ScanComplete { discovered: 4, awaiting: 12 }, Some("i"), 0)["discovered"],
             json!(4)
+        );
+        assert_eq!(
+            event_body(&Event::ScheduleComplete { mode: "cron".into() }, Some("i"), 0)["mode"],
+            json!("cron")
         );
     }
 

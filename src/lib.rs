@@ -21,5 +21,6 @@ pub mod instance;
 pub mod integrity;
 pub mod ratelimit;
 pub mod readiness;
+pub mod schedule;
 pub mod state;
 pub mod uns;

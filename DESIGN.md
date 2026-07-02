@@ -969,8 +969,8 @@ ggcommons `Message`; `header.name = "FileReplicatorEvent"`, `version = "1.0"`; `
 
 `FileDiscovered`, `FileReady`, `ReplicationStarted`, `ReplicationProgress`, `ReplicationCompleted`,
 `ReplicationFailed`, `FileArchived`, `FileDeleted`, `FileQuarantined`, `RetriesExhausted`,
-`ScheduleTriggered`, `WindowOpened`, `WindowClosed`, `ScanComplete`, `Disconnected`, `Reconnected`,
-**`InstanceActivated`**, **`InstanceDeactivated`**, `ComponentReady`.
+`ScheduleTriggered`, `WindowOpened`, `WindowClosed`, `ScheduleComplete`, `ScanComplete`, `Disconnected`,
+`Reconnected`, **`InstanceActivated`**, **`InstanceDeactivated`**, `ComponentReady`.
 
 ### 17.2 Example — progress event
 

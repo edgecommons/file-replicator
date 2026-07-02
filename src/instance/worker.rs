@@ -643,7 +643,12 @@ impl Worker {
     ///
     /// On success, complete (delete/archive the source); on failure, requeue to `Ready` for
     /// idempotent re-delivery and clear the stale checkpoint — never delete the only copy (FR-CMP-3).
-    async fn recover_verified(&self, it: &WorkItem, now: i64) -> Result<()> {
+    ///
+    /// Also invoked outside crash recovery by a window-close **pauseResume** abort
+    /// ([`crate::instance::Instance::run_batch_windowed`]): if the abort lands in the
+    /// `Verified → Completed` gap, the item is driven to completion here rather than being stranded
+    /// non-terminal until the next process restart (the abort only reverts still-`InProgress` rows).
+    pub(crate) async fn recover_verified(&self, it: &WorkItem, now: i64) -> Result<()> {
         let resume = self
             .store
             .load_resume(&self.instance, &it.relpath, self.dest.kind())?;

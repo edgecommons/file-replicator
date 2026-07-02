@@ -76,10 +76,13 @@ pub trait InstanceControl: Send + Sync {
     /// `get-status`/state so an instance an operator set to a window is not misrepresented as
     /// `immediate` (cron/window execution is P4; the *reported* mode reflects config today).
     fn schedule_mode(&self) -> &str;
-    /// Force one scan/replication pass **now** (FR-CTL-3). `ignoreWindow` is accepted upstream but a
-    /// no-op until the P4 scheduler lands. The control plane runs this as a detached task so a
-    /// long-running batch never blocks the reply or holds a command-subscription slot.
-    async fn trigger_scan(&self, now: i64);
+    /// Force one scan/replication pass **now** (FR-CTL-3). With `ignore_window = true` the forced tick
+    /// **bypasses the schedule gate** and drains all ready work regardless of cron/window state (the
+    /// operator override); with `false` it respects the gate (a `cron` instance between fires or a
+    /// `window` instance while closed discovers/enqueues but replicates nothing). The control plane
+    /// runs this as a detached task so a long-running batch never blocks the reply or holds a
+    /// command-subscription slot.
+    async fn trigger_scan(&self, now: i64, ignore_window: bool);
     /// Activate/deactivate (FR-CTL-4). When `persist` is true the override is written to durable
     /// state (survives restart, DESIGN §7.5); when false it is a runtime-only flip. Returns the new
     /// effective active state.
@@ -258,6 +261,13 @@ impl ControlPlane {
     /// upload), so awaiting it here would time out the request/reply client AND hold a command
     /// subscription slot for the whole transfer, starving get-status / an emergency set-activation. An
     /// inactive instance is **skipped** (its `tick` is a no-op), not falsely reported as triggered.
+    ///
+    /// `ignoreWindow` (default `false`) is threaded into [`InstanceControl::trigger_scan`]: when `true`
+    /// the forced tick bypasses the P4 schedule gate and replicates all ready work regardless of the
+    /// instance's cron/window state; when `false` the trigger respects the gate (a cron/window instance
+    /// between its open spans discovers/enqueues but replicates nothing this tick). `triggered` counts
+    /// the instances whose scan was **dispatched**, not files sent (the async batch's outcome is not
+    /// known at reply time).
     async fn on_trigger(&self, req: &Message, scope: Scope) {
         let now = now_ms();
         let ignore_window = lenient_bool(req.body.get("ignoreWindow")).unwrap_or(false);
@@ -268,7 +278,7 @@ impl ControlPlane {
                 let mut skipped: Vec<String> = Vec::new();
                 for inst in &self.instances {
                     if inst.is_active() {
-                        spawn_trigger(inst.clone(), now);
+                        spawn_trigger(inst.clone(), now, ignore_window);
                         triggered.push(inst.id().to_string());
                     } else {
                         skipped.push(inst.id().to_string());
@@ -291,7 +301,7 @@ impl ControlPlane {
                             "ignoreWindow": ignore_window
                         })
                     } else {
-                        spawn_trigger(inst.clone(), now);
+                        spawn_trigger(inst.clone(), now, ignore_window);
                         self.events
                             .instance_event(&id, Event::ScheduleTriggered { scope: id.clone() }, now)
                             .await;
@@ -484,9 +494,10 @@ fn lenient_bool(v: Option<&Value>) -> Option<bool> {
 /// Spawn a detached task that runs one forced scan for `inst`. Keeps the trigger handler from
 /// awaiting a full (possibly multi-GB) replication batch, so the reply returns promptly and no
 /// command-subscription slot is held for a transfer's duration (DESIGN §16 / FR-CTL-3).
-fn spawn_trigger(inst: Arc<dyn InstanceControl>, now: i64) {
+/// `ignore_window` is threaded through so a forced trigger can bypass the P4 schedule gate.
+fn spawn_trigger(inst: Arc<dyn InstanceControl>, now: i64, ignore_window: bool) {
     tokio::spawn(async move {
-        inst.trigger_scan(now).await;
+        inst.trigger_scan(now, ignore_window).await;
     });
 }
 
@@ -807,6 +818,8 @@ mod tests {
         dest: String,
         schedule_mode: &'static str,
         triggers: AtomicUsize,
+        /// The `ignore_window` flag of the most recent `trigger_scan` (verifies FR-CTL-3 threading).
+        last_ignore_window: AtomicBool,
         last_apply: Mutex<Option<(bool, bool)>>,
         resets: AtomicUsize,
         fail: bool,
@@ -829,6 +842,7 @@ mod tests {
                 dest: "s3".to_string(),
                 schedule_mode,
                 triggers: AtomicUsize::new(0),
+                last_ignore_window: AtomicBool::new(false),
                 last_apply: Mutex::new(None),
                 resets: AtomicUsize::new(0),
                 fail: false,
@@ -842,6 +856,7 @@ mod tests {
                 dest: "s3".to_string(),
                 schedule_mode: "immediate",
                 triggers: AtomicUsize::new(0),
+                last_ignore_window: AtomicBool::new(false),
                 last_apply: Mutex::new(None),
                 resets: AtomicUsize::new(0),
                 fail: true,
@@ -866,8 +881,9 @@ mod tests {
         fn schedule_mode(&self) -> &str {
             self.schedule_mode
         }
-        async fn trigger_scan(&self, _now: i64) {
+        async fn trigger_scan(&self, _now: i64, ignore_window: bool) {
             self.triggers.fetch_add(1, Ordering::SeqCst);
+            self.last_ignore_window.store(ignore_window, Ordering::SeqCst);
         }
         fn apply_activation(
             &self,
@@ -1189,6 +1205,9 @@ mod tests {
             i1.triggers.load(Ordering::SeqCst) == 1 && i2.triggers.load(Ordering::SeqCst) == 1
         })
         .await;
+        // FR-CTL-3: `ignoreWindow: true` from the request is threaded down to each instance's scan.
+        assert!(i1.last_ignore_window.load(Ordering::SeqCst));
+        assert!(i2.last_ignore_window.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -1212,6 +1231,8 @@ mod tests {
             .contains(&"gw-01/file-replicator/evt/instances/i1/ScheduleTriggered".to_string()));
         eventually(|| i1.triggers.load(Ordering::SeqCst) == 1).await;
         assert_eq!(i2.triggers.load(Ordering::SeqCst), 0, "only i1 triggered");
+        // No `ignoreWindow` in the request → the scan respects the schedule gate (default false).
+        assert!(!i1.last_ignore_window.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
