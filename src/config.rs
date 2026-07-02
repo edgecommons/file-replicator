@@ -89,7 +89,10 @@ pub struct InstanceCfg {
     pub enabled: bool,
     /// Source directory + readiness + include/exclude.
     pub ingress: IngressCfg,
-    /// Destination(s). An ordered list; v1 validates exactly one (multi = future, DESIGN §20-B).
+    /// Destination(s). An ordered list; `N >= 1` entries fan out independently — a file completes
+    /// (source deleted/archived) only once EVERY entry has delivered and been verified (P6, DESIGN
+    /// §20-B). Cardinality itself isn't validated here; [`crate::instance::Instance::build`] rejects an
+    /// empty list.
     #[serde(default)]
     pub egress: Vec<EgressCfg>,
     /// When replication runs (default: immediate).

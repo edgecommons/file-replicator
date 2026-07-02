@@ -2,7 +2,8 @@
 //!
 //! A thin coordinator over the durable [`StateStore`]: it enqueues ready files, atomically claims the
 //! oldest-ready batch (write-ahead `Ready → InProgress`, gated by each item's backoff clock), and
-//! hands out concurrency **slots**. Two semaphores bound in-flight transfers — a **per-instance** one
+//! hands out concurrency **slots**. Two semaphores bound in-flight **items** (files — one slot per item,
+//! held across its fan-out to N destinations; see [`SlotGuard`]) — a **per-instance** one
 //! (`limits.maxConcurrentFiles`) so one instance can't monopolize the process, and a **global** one
 //! (`component.global.limits.maxConcurrentFiles`) shared across every instance (FR-REL-5). The
 //! durable state machine itself lives in [`state`](crate::state) (the transitions) and
@@ -34,7 +35,15 @@ pub struct Queue {
 }
 
 /// A held concurrency slot: one global permit and one per-instance permit. Both release on drop, so a
-/// worker simply keeps the guard alive for the duration of a transfer.
+/// worker simply keeps the guard alive for the duration of an item's processing.
+///
+/// The slot is acquired **once per item** (per file), not per transfer: a multi-destination fan-out
+/// item delivers to its N destinations concurrently under this single slot (DESIGN §20-B), so
+/// `maxConcurrentFiles` bounds in-flight FILES, not in-flight per-destination transfers (which can reach
+/// `maxConcurrentFiles × N`). This is deliberate — nesting a second slot acquisition inside the
+/// per-destination fan-out could deadlock against the very cap it holds. Aggregate bytes stay bounded
+/// independently by the global bandwidth token bucket regardless of task count, and one hung destination
+/// pins only its own item's slot (never the whole cap).
 pub struct SlotGuard {
     _global: OwnedSemaphorePermit,
     _per_instance: OwnedSemaphorePermit,

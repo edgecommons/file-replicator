@@ -100,6 +100,59 @@ pub struct WorkItem {
     pub updated_at: i64,
 }
 
+/// Per-destination completion phase (P6, DESIGN §20-B). Tracked independently of the aggregate
+/// [`ItemState`]: a file's source is only released once every configured destination reaches
+/// [`Verified`](Self::Verified). Persisted as TEXT via [`as_str`](Self::as_str) /
+/// [`from_str`](Self::from_str), mirroring [`ItemState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestPhase {
+    /// Not yet delivered+verified to this destination (or a retry is pending backoff).
+    Pending,
+    /// Delivered + integrity-verified at this destination — write-ahead before the aggregate
+    /// completion transition; idempotent recovery/re-delivery skips a `Verified` destination.
+    Verified,
+    /// This destination's retry budget (`maxAttempts`/`giveUpAfter`) is exhausted; the file can
+    /// never complete even though other destinations may already be `Verified`.
+    Exhausted,
+}
+
+impl DestPhase {
+    /// Stable lowercase token used as the persisted TEXT value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DestPhase::Pending => "pending",
+            DestPhase::Verified => "verified",
+            DestPhase::Exhausted => "exhausted",
+        }
+    }
+
+    /// Inverse of [`as_str`](Self::as_str); `None` for an unrecognized token.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "pending" => DestPhase::Pending,
+            "verified" => DestPhase::Verified,
+            "exhausted" => DestPhase::Exhausted,
+            _ => return None,
+        })
+    }
+}
+
+/// A single destination's independent completion bookkeeping for one tracked file (P6). Identity =
+/// `(instance, relpath, dest)`, where `dest` is [`Destination::kind()`](crate::dest::Destination::kind).
+/// Each destination retries with its own backoff clock (`attempts`/`next_attempt_at`) — this is what
+/// lets destinations succeed, fail, and retry independently while the source is only released once
+/// every configured destination reaches [`DestPhase::Verified`].
+#[derive(Debug, Clone)]
+pub struct DestState {
+    pub dest: String,
+    pub phase: DestPhase,
+    pub attempts: u32,
+    /// Unix ms — this destination's own backoff gate for re-attempt.
+    pub next_attempt_at: i64,
+    pub last_error: Option<String>,
+}
+
 /// Opaque per-`(item, dest)` resume checkpoint. For the local destination the `token` holds the
 /// temp-file name and `bytes_committed` the append offset; stored as a JSON blob so the S3 backend
 /// (P2) can reuse the same column for `{uploadId, completedParts}` with no schema change.
@@ -179,6 +232,19 @@ mod tests {
         ] {
             assert_eq!(ItemState::from_str(s.as_str()), Some(s));
         }
+    }
+
+    #[test]
+    fn dest_phase_round_trips() {
+        for p in [DestPhase::Pending, DestPhase::Verified, DestPhase::Exhausted] {
+            assert_eq!(DestPhase::from_str(p.as_str()), Some(p));
+        }
+    }
+
+    #[test]
+    fn dest_phase_unknown_is_none() {
+        assert_eq!(DestPhase::from_str("bogus"), None);
+        assert_eq!(DestPhase::from_str(""), None);
     }
 
     #[test]

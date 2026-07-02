@@ -1,24 +1,37 @@
-//! # file-replicator — per-file worker (DESIGN §8.1/§13)
+//! # file-replicator — per-file worker (DESIGN §8.1/§13/§20-B)
 //!
-//! Drives one claimed [`WorkItem`] through the crash-safe pipeline and owns the retry/backoff and
-//! completion-action policy:
+//! Drives one claimed [`WorkItem`] through the crash-safe pipeline, fanning out to every configured
+//! destination **independently**, and owns the retry/backoff and completion-action policy:
 //!
 //! ```text
-//! deliver → verify → persist Verified (write-ahead) → completion (delete|archive) → persist Completed
-//!                 └─ error → record attempt + backoff → Failed (retry) | Exhausted → quarantine|retain
+//! for each destination (concurrently, independent retry/backoff):
+//!   deliver → verify → persist DestPhase::Verified (write-ahead)
+//!                   └─ error → record per-dest attempt + backoff → retry | dest Exhausted
+//!
+//! once EVERY destination is DestPhase::Verified:
+//!   persist ItemState::Verified (write-ahead) → completion (delete|archive) → persist Completed
+//!
+//! if ANY destination permanently exhausts its retry budget:
+//!   the item can never complete (even though other destinations already succeeded) →
+//!   Exhausted → quarantine|retain, leaving already-`Verified` destinations' data intact
 //! ```
 //!
-//! The **write-ahead** ordering is load-bearing (DESIGN §13.2): `Verified` is persisted *before* the
-//! source side effect and `Completed` *after*, so a crash at any point is recovered idempotently by
-//! [`recover`](Worker::recover) — the destination object already matches (stable key → idempotent
-//! overwrite), so completion simply re-runs; a file is never re-uploaded and never lost.
+//! The **write-ahead** ordering is load-bearing (DESIGN §13.2/§20-B): each destination's
+//! `DestPhase::Verified` is persisted *before* the aggregate item is promoted to `ItemState::Verified`,
+//! which itself is persisted *before* the source side effect, and `Completed` *after* — so a crash at
+//! any point is recovered idempotently by [`recover`](Worker::recover): an already-`Verified`
+//! destination is never re-delivered (the destination object already matches — stable key → idempotent
+//! overwrite), and the completion action (delete/archive) fires **exactly once**, only after the last
+//! destination verifies.
 //!
 //! Failures are classified by [`ReplError`](crate::error::ReplError): *permanent* errors fail fast to
-//! `Exhausted`; *transient*/*integrity* errors back off with **full-jitter exponential** delay capped
-//! at `maxDelayMs`, retrying until the **time-based** `giveUpAfter` budget (default 7 days) or an
-//! optional `maxAttempts` cap — built for hours-to-days offline (DESIGN §13.4/§13.6).
+//! that destination's `Exhausted`; *transient*/*integrity* errors back off with **full-jitter
+//! exponential** delay capped at `maxDelayMs`, retrying until the **time-based** `giveUpAfter` budget
+//! (default 7 days) or an optional `maxAttempts` cap — built for hours-to-days offline
+//! (DESIGN §13.4/§13.6). Every destination retries on its **own** clock (its own `attempts` and
+//! `next_attempt_at`), so a slow/flaky destination never blocks — or is blocked by — another.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,10 +39,11 @@ use std::sync::{Arc, Mutex};
 use ggcommons::metrics::MetricService;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use tokio::task::JoinSet;
 
 use crate::config::{Collision, CompletionCfg, OnExhausted, OnSuccess, RetryCfg, Verify};
 use crate::dest::SharedDestination;
-use crate::domain::{Checksum, Delivered, ItemState, ProgressSink, ResumeState, WorkItem};
+use crate::domain::{Checksum, Delivered, DestPhase, ItemState, ProgressSink, ResumeState, WorkItem};
 use crate::error::{ReplError, Result};
 use crate::events::{Event, Events, ProgressThrottle};
 use crate::ratelimit::Bandwidth;
@@ -186,18 +200,58 @@ pub fn parse_duration_ms(input: &str) -> Option<u64> {
     Some((v * mult as f64).round() as u64)
 }
 
+/// One configured destination, as the worker sees it: the [`SharedDestination`] handle plus its
+/// stable **label** — the `dest` key under which per-destination [`ResumeState`]/[`DestState`]
+/// (DESIGN §20-B) is persisted. The label is [`Destination::kind()`](crate::dest::Destination::kind)
+/// when it is unique among the instance's configured destinations (the N=1 case, and the common N>1
+/// case of distinct backend kinds); when two-or-more destinations share a `kind()` (e.g. two `s3`
+/// egresses to different buckets) it is disambiguated as `"{kind}#{n}"` (1-based occurrence order) so
+/// their resume/completion bookkeeping never collides. See [`label_destinations`].
+#[derive(Clone)]
+struct DestSlot {
+    label: String,
+    dest: SharedDestination,
+}
+
+/// Assign each destination its stable [`DestSlot::label`] (see there for the disambiguation rule).
+/// Order-preserving; `N=1` always yields exactly `[kind()]`, identical to the pre-P6 single-destination
+/// resume/completion key.
+fn label_destinations(dests: &[SharedDestination]) -> Vec<String> {
+    let mut counts: HashMap<&'static str, usize> = HashMap::new();
+    for d in dests {
+        *counts.entry(d.kind()).or_insert(0) += 1;
+    }
+    let mut seen: HashMap<&'static str, usize> = HashMap::new();
+    dests
+        .iter()
+        .map(|d| {
+            let kind = d.kind();
+            if counts[kind] == 1 {
+                kind.to_string()
+            } else {
+                let n = seen.entry(kind).or_insert(0);
+                *n += 1;
+                format!("{kind}#{n}")
+            }
+        })
+        .collect()
+}
+
 /// The per-file driver for one instance. Shared (`Arc<Worker>`) across the instance's worker tasks.
+/// Fans a claimed item out to every configured [`DestSlot`] (DESIGN §20-B): each destination retries
+/// independently, and the source completion action fires exactly once, after the last one verifies.
 pub struct Worker {
     instance: String,
     store: Arc<dyn StateStore>,
-    dest: SharedDestination,
+    dests: Vec<DestSlot>,
     completion: CompletionCfg,
     /// Source root — used to rebuild each item's absolute path (the store keeps only `relpath`).
     ingress_root: PathBuf,
     bw: Bandwidth,
     retry: RetryPolicy,
-    /// Backoff jitter source (seedable for deterministic tests).
-    rng: Mutex<StdRng>,
+    /// Backoff jitter source (seedable for deterministic tests); shared (`Arc`) so it can be cloned
+    /// into the per-destination fan-out tasks ([`run_one_dest`]) without borrowing `self`.
+    rng: Arc<Mutex<StdRng>>,
     /// Optional metric emitter (`filesReplicated`/`bytesReplicated`/`filesFailed`).
     metrics: Option<Arc<dyn MetricService>>,
     /// UNS event emitter for the per-file lifecycle events (`ReplicationStarted`/`…Progress`/
@@ -208,8 +262,10 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Build a worker. `ingress_root` is the instance's source directory; `bw` is the per-instance ∩
-    /// global bandwidth governor; `retry` is the resolved policy.
+    /// Build a single-destination worker. `ingress_root` is the instance's source directory; `bw` is
+    /// the per-instance ∩ global bandwidth governor; `retry` is the resolved policy. A thin wrapper
+    /// over [`new_multi`](Self::new_multi) with a one-element destination list — by construction this
+    /// is byte-for-byte the N=1 case of the fan-out pipeline (DESIGN §20-B "preserve N=1 exactly").
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         instance: String,
@@ -221,15 +277,47 @@ impl Worker {
         retry: RetryPolicy,
         metrics: Option<Arc<dyn MetricService>>,
     ) -> Self {
-        Worker {
+        Self::new_multi(
             instance,
             store,
-            dest,
+            vec![dest],
             completion,
             ingress_root,
             bw,
             retry,
-            rng: Mutex::new(StdRng::from_entropy()),
+            metrics,
+        )
+    }
+
+    /// Build a worker that fans a claimed item out to every destination in `dests` (P6, DESIGN §20-B).
+    /// `dests` must be non-empty (an empty instance-level egress list is rejected earlier, at config
+    /// validation — see [`crate::instance::Instance::build`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_multi(
+        instance: String,
+        store: Arc<dyn StateStore>,
+        dests: Vec<SharedDestination>,
+        completion: CompletionCfg,
+        ingress_root: PathBuf,
+        bw: Bandwidth,
+        retry: RetryPolicy,
+        metrics: Option<Arc<dyn MetricService>>,
+    ) -> Self {
+        let labels = label_destinations(&dests);
+        let dests = labels
+            .into_iter()
+            .zip(dests)
+            .map(|(label, dest)| DestSlot { label, dest })
+            .collect();
+        Worker {
+            instance,
+            store,
+            dests,
+            completion,
+            ingress_root,
+            bw,
+            retry,
+            rng: Arc::new(Mutex::new(StdRng::from_entropy())),
             metrics,
             events: Events::disabled(),
         }
@@ -241,6 +329,16 @@ impl Worker {
     pub fn with_events(mut self, events: Events) -> Self {
         self.events = events;
         self
+    }
+
+    /// This worker's configured destination labels, joined for diagnostics (error sidecars, logs) —
+    /// e.g. `"local"` (N=1) or `"local+s3"` (N=2). See [`DestSlot::label`].
+    fn dest_labels_joined(&self) -> String {
+        self.dests
+            .iter()
+            .map(|s| s.label.as_str())
+            .collect::<Vec<_>>()
+            .join("+")
     }
 
     /// The absolute source path for `item`, rebuilt from the ingress root and the stored `relpath`
@@ -256,20 +354,10 @@ impl Worker {
         let mut item = item.clone();
         item.abs_source = self.abs_source(&item);
 
-        // The item was claimed (`Ready → InProgress`) by the queue before it reached us — emit the
-        // start-of-transfer lifecycle event (DESIGN §17.1). `attempt` is 1-based (attempts so far + 1).
-        self.events
-            .instance_event(
-                &self.instance,
-                Event::ReplicationStarted {
-                    path: item.relpath.clone(),
-                    size: item.size,
-                    destination: self.dest.kind().to_string(),
-                    attempt: item.attempts + 1,
-                },
-                now,
-            )
-            .await;
+        // Per-destination `ReplicationStarted` events are emitted from `run_one_dest`, right before
+        // that destination's own attempt (DESIGN §17.1) — an already-`Verified` destination this round
+        // (a partial-fan-out re-claim) is skipped and emits nothing, so `attempt` always reflects that
+        // ONE destination's own attempt count, not the aggregate item's.
 
         let state = match self.run_pipeline(&item, now).await {
             Ok(s) => s,
@@ -285,94 +373,238 @@ impl Worker {
         state
     }
 
-    /// The deliver → verify → completion pipeline (write-ahead ordering per DESIGN §13.2). Returns the
-    /// terminal state; `Err` is a durable-store fault only (transfer errors are handled internally).
+    /// The fan-out deliver → verify → completion pipeline (DESIGN §13.2/§20-B). Every not-yet-
+    /// [`DestPhase::Verified`] destination whose OWN backoff clock is due (its `next_attempt_at ≤ now`) is
+    /// attempted concurrently, independently retried/backed off; a destination still waiting on its own
+    /// gate is left untouched this round. The aggregate item completes exactly once, after the LAST
+    /// destination verifies. Returns the terminal (or `Failed`-awaiting-retry) state; `Err` is a
+    /// durable-store fault only (destination transfer errors are handled internally, per destination).
+    ///
+    /// **Concurrency:** the caller already holds ONE queue concurrency slot for this item (acquired per
+    /// file in [`crate::instance::Instance::run_batch`]); the per-destination attempts here run
+    /// concurrently under that single slot, so `maxConcurrentFiles` bounds in-flight FILES, not
+    /// per-destination transfers (up to `maxConcurrentFiles × N`). Aggregate throughput stays bounded
+    /// regardless by the global bandwidth token bucket (DESIGN §13.5), and a hung destination pins only
+    /// its own item's slot.
     async fn run_pipeline(&self, item: &WorkItem, now: i64) -> Result<ItemState> {
-        let resume = self
-            .store
-            .load_resume(&self.instance, &item.relpath, self.dest.kind())?;
-        let (progress, drainer) = self.make_progress(item);
-
-        let outcome = async {
-            let delivered = self.dest.deliver(item, resume, &progress, &self.bw).await?;
-            self.dest
-                .verify(item, &delivered, self.completion.verify)
-                .await?;
-            Ok::<Delivered, ReplError>(delivered)
-        }
-        .await;
-
-        // Drop our sink handle so the progress channel closes once every destination-held clone is
-        // gone (deliver has returned), then flush any still-queued `ReplicationProgress` events.
-        drop(progress);
-        if let Some(d) = drainer {
-            let _ = d.await;
-        }
-
-        match outcome {
-            Ok(delivered) => {
-                // Write-ahead the FULL expected result at the Verified point (DESIGN §13.2): persist
-                // the delivered checksum + handle as the resume checkpoint BEFORE marking Verified and
-                // BEFORE the source side effect, so crash recovery re-verifies the destination by
-                // re-hash (not just size) before deleting/archiving the source. This overwrites any
-                // mid-transfer resume token (e.g. an S3 uploadId) — the transfer is complete.
-                self.save_verified_checkpoint(item, &delivered);
-                self.store
-                    .set_state(&self.instance, &item.relpath, ItemState::Verified, now)?;
-                self.complete_verified(item, delivered.bytes, now).await
-            }
-            Err(e) => self.handle_failure(item, e, now).await,
-        }
-    }
-
-    /// Persist the delivered result as the `Verified` write-ahead checkpoint (DESIGN §13.2). The
-    /// whole [`Delivered`] rides in [`ResumeState::token`] under `"verified"`, reusing the resume row
-    /// (single blob per `(instance, relpath, dest)`) across lifecycle phases — no schema change.
-    /// Best-effort: a store fault here only costs recovery its checksum-precision (it falls back to a
-    /// size check), so it must not fail the transfer that already succeeded.
-    fn save_verified_checkpoint(&self, item: &WorkItem, delivered: &Delivered) {
-        let token = match serde_json::to_value(delivered) {
-            Ok(v) => serde_json::json!({ "verified": v }),
-            Err(e) => {
-                tracing::warn!(relpath = %item.relpath, error = %e, "serialize verified checkpoint failed");
-                return;
-            }
+        let existing = self.store.dest_states(&self.instance, &item.relpath)?;
+        let phase_of = |label: &str| -> DestPhase {
+            existing
+                .iter()
+                .find(|d| d.dest == label)
+                .map(|d| d.phase)
+                .unwrap_or(DestPhase::Pending)
         };
-        let checkpoint = ResumeState {
-            bytes_committed: delivered.bytes,
-            token,
+        let attempts_of = |label: &str| -> u32 {
+            existing
+                .iter()
+                .find(|d| d.dest == label)
+                .map(|d| d.attempts)
+                .unwrap_or(0)
         };
-        if let Err(e) =
+        // Each destination's OWN backoff gate (`0` when it has no row yet → never attempted → always
+        // due). Honoring this per-destination is what makes retries independent (FR-EGR-3 / DESIGN
+        // §20-B): a destination in a long backoff must NOT be re-attempted just because a faster
+        // sibling's shorter gate elapsed and re-claimed the aggregate item.
+        let next_attempt_of = |label: &str| -> i64 {
+            existing
+                .iter()
+                .find(|d| d.dest == label)
+                .map(|d| d.next_attempt_at)
+                .unwrap_or(0)
+        };
+
+        let mut verified: HashSet<String> = self
+            .dests
+            .iter()
+            .filter(|s| phase_of(&s.label) == DestPhase::Verified)
+            .map(|s| s.label.clone())
+            .collect();
+
+        // Split the not-yet-`Verified` destinations by whether their own backoff clock is DUE this
+        // round. Only the `due` ones are (re-)attempted; a `not_due` destination is left exactly as it
+        // is so its independent backoff is preserved across the re-claim, and its gate still feeds the
+        // aggregate re-claim time computed below.
+        let mut due: Vec<&DestSlot> = Vec::new();
+        let mut not_due: Vec<&DestSlot> = Vec::new();
+        for slot in &self.dests {
+            if verified.contains(&slot.label) {
+                continue;
+            }
+            if next_attempt_of(&slot.label) <= now {
+                due.push(slot);
+            } else {
+                not_due.push(slot);
+            }
+        }
+
+        let mut giveups: Vec<(String, String, u32)> = Vec::new(); // (label, err, attempts)
+        let mut retries: Vec<(String, i64, String)> = Vec::new(); // (label, next_attempt_at, err)
+
+        if !due.is_empty() {
+            let mut set: JoinSet<Result<(String, DestOutcome)>> = JoinSet::new();
+            for slot in &due {
+                let ctx = DestAttemptCtx {
+                    instance: self.instance.clone(),
+                    item: item.clone(),
+                    label: slot.label.clone(),
+                    dest: slot.dest.clone(),
+                    store: self.store.clone(),
+                    bw: self.bw.clone(),
+                    retry: self.retry,
+                    verify_policy: self.completion.verify,
+                    events: self.events.clone(),
+                    now,
+                    attempts_so_far: attempts_of(&slot.label),
+                    rng: self.rng.clone(),
+                };
+                set.spawn(run_one_dest(ctx));
+            }
+            while let Some(res) = set.join_next().await {
+                match res {
+                    Ok(Ok((label, DestOutcome::Verified))) => {
+                        verified.insert(label);
+                    }
+                    Ok(Ok((label, DestOutcome::Retry { next_attempt_at, err }))) => {
+                        retries.push((label, next_attempt_at, err));
+                    }
+                    Ok(Ok((label, DestOutcome::GiveUp { err, attempts }))) => {
+                        giveups.push((label, err, attempts));
+                    }
+                    Ok(Err(e)) => return Err(e), // a store fault — leave the item as-is for recovery
+                    Err(join_err) => {
+                        tracing::error!(
+                            instance = %self.instance, relpath = %item.relpath, error = %join_err,
+                            "a destination fan-out task failed to run"
+                        );
+                        return Err(ReplError::Transient(format!(
+                            "destination task join failed: {join_err}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        if !giveups.is_empty() {
+            // One or more destinations permanently exhausted their retry budget: the item can never
+            // complete (FR-EGR-3(d)) even though other destinations may already be `Verified`. Every
+            // still-pending destination — whether it retried this round (`retries`) or is only waiting
+            // on its own backoff (`not_due`) — has no further chance now the item is going terminal, so
+            // abort its partial transfer and drop the checkpoint too (mirrors the single-destination
+            // give-up cleanup); an already-`Verified` destination's delivered data is left untouched.
+            for (label, _, _) in &retries {
+                if let Some(slot) = self.dests.iter().find(|s| &s.label == label) {
+                    self.abort_and_clear_resume(&slot.label, &slot.dest, item).await;
+                }
+            }
+            for slot in &not_due {
+                self.abort_and_clear_resume(&slot.label, &slot.dest, item).await;
+            }
+            let attempts = giveups
+                .iter()
+                .map(|(_, _, a)| *a)
+                .max()
+                .unwrap_or_else(|| item.attempts.saturating_add(1));
+            let err_str = giveups
+                .iter()
+                .map(|(label, err, _)| format!("{label}: {err}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.store.roll_up_item(
+                &self.instance,
+                &item.relpath,
+                ItemState::Exhausted,
+                attempts,
+                now,
+                Some(&err_str),
+                now,
+            )?;
+            // Count the file's failure EXACTLY ONCE (FR): only when a destination NEWLY exhausts this
+            // round (was not already `Exhausted` in the durable state). A manual re-Ready of an
+            // already-terminal item that re-attempts and re-exhausts the same destination must not
+            // re-increment `filesFailed` — the file already counted as failed on its first exhaustion.
+            let newly_exhausted = giveups.iter().any(|(label, _, _)| {
+                !existing
+                    .iter()
+                    .any(|d| &d.dest == label && d.phase == DestPhase::Exhausted)
+            });
+            if newly_exhausted {
+                self.store.bump_stats(
+                    &self.instance,
+                    StatsDelta {
+                        replicated: 0,
+                        failed: 1,
+                        bytes: 0,
+                    },
+                )?;
+            }
+            tracing::error!(
+                instance = %self.instance, relpath = %item.relpath, attempts, error = %err_str,
+                "retries exhausted on one or more destinations"
+            );
+            return self.finish_exhausted(item, &err_str, attempts, now).await;
+        }
+
+        if verified.len() == self.dests.len() {
+            // Every configured destination is verified — write-ahead the aggregate `Verified` state
+            // (DESIGN §13.2), then run the completion action exactly once.
             self.store
-                .save_resume(&self.instance, &item.relpath, self.dest.kind(), &checkpoint)
-        {
-            tracing::warn!(relpath = %item.relpath, error = %e, "persist verified checkpoint failed");
+                .set_state(&self.instance, &item.relpath, ItemState::Verified, now)?;
+            return self.complete_verified(item, now).await;
         }
+
+        // At least one destination is still pending (a retry scheduled this round, or one only skipped
+        // because its own backoff clock has not elapsed): roll up the aggregate as `Failed`, gated at
+        // the EARLIEST of EVERY still-pending destination's own next attempt — the ones retried this
+        // round AND the ones left as not-yet-due — so the item is re-claimed exactly when the soonest
+        // destination is next due (a claim re-runs the pipeline, which skips every already-`Verified`
+        // and every still-not-due destination, only attempting what is actually due).
+        let next_attempt_at = retries
+            .iter()
+            .map(|(_, t, _)| *t)
+            .chain(not_due.iter().map(|s| next_attempt_of(&s.label)))
+            .min()
+            .unwrap_or(now);
+        let last_error = retries
+            .iter()
+            .map(|(_, _, e)| e.clone())
+            .next_back()
+            .or_else(|| item.last_error.clone());
+        let attempts = item.attempts.saturating_add(1);
+        self.store.roll_up_item(
+            &self.instance,
+            &item.relpath,
+            ItemState::Failed,
+            attempts,
+            next_attempt_at,
+            last_error.as_deref(),
+            now,
+        )?;
+        Ok(ItemState::Failed)
     }
 
-    /// On give-up (terminal), abort any in-flight partial transfer (S3 → `AbortMultipartUpload`;
-    /// local → temp cleanup) so no orphaned upload lingers, then drop the resume checkpoint. The
-    /// resume is deliberately **kept** on the retry path (so the next attempt resumes) and cleared
-    /// only here at terminal give-up (DESIGN §11.3/§13.4). Idempotent + best-effort.
-    async fn abort_and_clear_resume(&self, item: &WorkItem) {
-        match self
-            .store
-            .load_resume(&self.instance, &item.relpath, self.dest.kind())
-        {
+    /// On give-up (terminal), abort any in-flight partial transfer at `dest` (S3 →
+    /// `AbortMultipartUpload`; local → temp cleanup) so no orphaned upload lingers, then drop that
+    /// destination's resume checkpoint. Resume is deliberately **kept** on the retry path (so the next
+    /// attempt resumes) and cleared only here, at that destination's terminal give-up or at the item's
+    /// aggregate give-up (DESIGN §11.3/§13.4). Idempotent + best-effort.
+    async fn abort_and_clear_resume(&self, label: &str, dest: &SharedDestination, item: &WorkItem) {
+        match self.store.load_resume(&self.instance, &item.relpath, label) {
             Ok(Some(resume)) => {
-                if let Err(e) = self.dest.abort(item, &resume).await {
+                if let Err(e) = dest.abort(item, &resume).await {
                     tracing::warn!(
-                        relpath = %item.relpath, error = %e,
+                        relpath = %item.relpath, dest = %label, error = %e,
                         "aborting partial transfer on give-up failed"
                     );
                 }
             }
             Ok(None) => {}
-            Err(e) => tracing::warn!(relpath = %item.relpath, error = %e, "load resume for give-up abort failed"),
+            Err(e) => tracing::warn!(
+                relpath = %item.relpath, dest = %label, error = %e,
+                "load resume for give-up abort failed"
+            ),
         }
-        let _ = self
-            .store
-            .clear_resume(&self.instance, &item.relpath, self.dest.kind());
+        let _ = self.store.clear_resume(&self.instance, &item.relpath, label);
     }
 
     /// Run the success completion action (`delete` | `archive`) on the source, then persist
@@ -382,7 +614,7 @@ impl Worker {
     ///
     /// The source-side filesystem work runs on the blocking pool: a cross-device archive falls back to
     /// a whole-file copy, which must not block a shared async worker thread (DESIGN §6.3).
-    async fn complete_verified(&self, item: &WorkItem, bytes: u64, now: i64) -> Result<ItemState> {
+    async fn complete_verified(&self, item: &WorkItem, now: i64) -> Result<ItemState> {
         let src = self.abs_source(item);
         let on_success = self.completion.on_success;
         let archive_dir = self.completion.archive_dir.clone();
@@ -401,33 +633,23 @@ impl Worker {
         }
         self.store
             .set_state(&self.instance, &item.relpath, ItemState::Completed, now)?;
-        // Clear the resume checkpoint only AFTER Completed is durable, so the expected-checksum
-        // checkpoint survives a crash in the Verified→Completed gap and recovery can still re-verify.
-        let _ = self
-            .store
-            .clear_resume(&self.instance, &item.relpath, self.dest.kind());
+        // Clear every destination's resume checkpoint + per-destination completion bookkeeping only
+        // AFTER Completed is durable, so a crash in the aggregate Verified→Completed gap still finds
+        // the expected-checksum checkpoints and per-dest `Verified` phases recovery needs (DESIGN §20-B).
+        let _ = self.store.clear_resume_all(&self.instance, &item.relpath);
+        let _ = self.store.clear_dest_states(&self.instance, &item.relpath);
         self.store.bump_stats(
             &self.instance,
             StatsDelta {
                 replicated: 1,
                 failed: 0,
-                bytes: bytes as i64,
+                bytes: item.size as i64,
             },
         )?;
 
-        // Lifecycle events (DESIGN §17.1): the completion, then the source side effect that ran.
-        self.events
-            .instance_event(
-                &self.instance,
-                Event::ReplicationCompleted {
-                    path: item.relpath.clone(),
-                    size: item.size,
-                    destination: self.dest.kind().to_string(),
-                    bytes,
-                },
-                now,
-            )
-            .await;
+        // Lifecycle events (DESIGN §17.1): the source side effect that ran. `ReplicationCompleted` was
+        // already emitted per destination (by `run_one_dest`, or by `recover_verified` re-verifying on
+        // recovery) — this is the aggregate/source-side event, fired exactly once.
         match self.completion.on_success {
             OnSuccess::Delete => {
                 self.events
@@ -461,87 +683,6 @@ impl Worker {
         Ok(ItemState::Completed)
     }
 
-    /// A transfer error: record the attempt with backoff, or (on give-up / a permanent error) move to
-    /// `Exhausted` and run the `onExhausted` action.
-    async fn handle_failure(&self, item: &WorkItem, err: ReplError, now: i64) -> Result<ItemState> {
-        let permanent = err.is_permanent();
-        let err_str = err.to_string();
-        let decision = {
-            let mut rng = self.rng.lock().expect("rng mutex");
-            self.retry.decide(item, permanent, now, &mut *rng)
-        };
-        match decision {
-            RetryDecision::Retry { next_attempt_at } => {
-                self.store.record_attempt(
-                    &self.instance,
-                    &item.relpath,
-                    &err_str,
-                    ItemState::Failed,
-                    next_attempt_at,
-                    now,
-                )?;
-                tracing::warn!(
-                    instance = %self.instance, relpath = %item.relpath,
-                    attempts = item.attempts + 1, retry_at = next_attempt_at, error = %err_str,
-                    "transfer failed; scheduled for retry"
-                );
-                self.events
-                    .instance_event(
-                        &self.instance,
-                        Event::ReplicationFailed {
-                            path: item.relpath.clone(),
-                            destination: self.dest.kind().to_string(),
-                            attempt: item.attempts + 1,
-                            error: err_str,
-                            next_attempt_at_ms: Some(next_attempt_at),
-                        },
-                        now,
-                    )
-                    .await;
-                Ok(ItemState::Failed)
-            }
-            RetryDecision::GiveUp => {
-                // Write-ahead Exhausted, then run the terminal onExhausted action.
-                self.store.record_attempt(
-                    &self.instance,
-                    &item.relpath,
-                    &err_str,
-                    ItemState::Exhausted,
-                    now,
-                    now,
-                )?;
-                self.store.bump_stats(
-                    &self.instance,
-                    StatsDelta {
-                        replicated: 0,
-                        failed: 1,
-                        bytes: 0,
-                    },
-                )?;
-                // Terminal give-up: release any in-flight partial upload + drop its resume checkpoint.
-                self.abort_and_clear_resume(item).await;
-                let attempts = item.attempts.saturating_add(1);
-                tracing::error!(
-                    instance = %self.instance, relpath = %item.relpath, attempts, error = %err_str,
-                    "retries exhausted"
-                );
-                self.events
-                    .instance_event(
-                        &self.instance,
-                        Event::RetriesExhausted {
-                            path: item.relpath.clone(),
-                            destination: self.dest.kind().to_string(),
-                            attempts,
-                            last_error: err_str.clone(),
-                        },
-                        now,
-                    )
-                    .await;
-                self.finish_exhausted(item, &err_str, attempts, now).await
-            }
-        }
-    }
-
     /// Terminal handling for an `Exhausted` item: `quarantine` (move to `failedDir` + an
     /// `.error.json` sidecar) or `retainInPlace` (leave it, mark `Retained`). Idempotent for recovery.
     /// The quarantine move + sidecar write run on the blocking pool (cross-device moves copy).
@@ -569,7 +710,7 @@ impl Worker {
                     attempts,
                     first_seen: item.discovered_at,
                     last_try: now,
-                    destination: self.dest.kind(),
+                    destination: self.dest_labels_joined(),
                     bytes_done: item.bytes_done,
                 };
                 if let Err(e) = tokio::task::spawn_blocking(move || {
@@ -615,6 +756,12 @@ impl Worker {
             match it.state {
                 ItemState::Verified => self.recover_verified(&it, now).await?,
                 ItemState::InProgress => {
+                    // Before re-readying, re-verify any destination a PRIOR session already marked
+                    // `DestPhase::Verified` (fan-out narrows the §13.2 crash window — see
+                    // [`reverify_persisted_verified`]): the next claim's `run_pipeline` trusts and skips
+                    // a `Verified` destination, so one whose object was lost/corrupted during downtime
+                    // must be caught here or completion would delete the only copy (FR-CMP-3/4).
+                    self.reverify_persisted_verified(&it, now).await?;
                     tracing::info!(instance = %self.instance, relpath = %it.relpath, "recovering InProgress → Ready (re-deliver)");
                     self.store
                         .set_state(&self.instance, &it.relpath, ItemState::Ready, now)?;
@@ -648,10 +795,52 @@ impl Worker {
     /// ([`crate::instance::Instance::run_batch_windowed`]): if the abort lands in the
     /// `Verified → Completed` gap, the item is driven to completion here rather than being stranded
     /// non-terminal until the next process restart (the abort only reverts still-`InProgress` rows).
+    ///
+    /// **Fan-out (DESIGN §20-B):** re-verifies **every** configured destination, independently, using
+    /// each one's own persisted per-destination checkpoint. A destination that re-verifies clean is
+    /// (re-)marked [`DestPhase::Verified`] (idempotent — also backfills a legacy pre-P6 row with no
+    /// `dest_state` history). If they ALL re-verify, completion runs exactly once; if even one fails
+    /// re-verification, that destination alone is demoted to `Pending` (its checkpoint cleared) and the
+    /// AGGREGATE item reverts to `Ready` — the next claim skips every other, already-re-verified
+    /// destination and re-delivers only the one that failed (no re-delivery, no double completion).
     pub(crate) async fn recover_verified(&self, it: &WorkItem, now: i64) -> Result<()> {
+        let mut all_ok = true;
+        for slot in &self.dests {
+            if !self.reverify_one_dest(slot, it, now).await? {
+                all_ok = false;
+            }
+        }
+
+        if all_ok {
+            tracing::info!(instance = %self.instance, relpath = %it.relpath, "recovering Verified → every destination re-verified, completing");
+            let _ = self.complete_verified(it, now).await?;
+        } else {
+            self.store
+                .set_state(&self.instance, &it.relpath, ItemState::Ready, now)?;
+        }
+        Ok(())
+    }
+
+    /// Re-verify ONE destination against its persisted checkpoint (DESIGN §13.2/§20-B) — the shared
+    /// unit of both aggregate-`Verified` recovery ([`recover_verified`](Self::recover_verified)) and the
+    /// per-destination re-check on `InProgress` recovery
+    /// ([`reverify_persisted_verified`](Self::reverify_persisted_verified)). The write-ahead `Verified`
+    /// marker was persisted *before* any source side effect, so on restart the object should already be
+    /// live at its stable key — but it could have been lost/corrupted during the downtime, and trusting
+    /// it blindly would risk deleting the only copy (FR-CMP-3). So re-verify against the persisted
+    /// expected result:
+    ///
+    /// - a full [`Delivered`] checkpoint (this build) → re-verify by **checksum** (local re-hashes the
+    ///   object, S3 compares the stored object checksum) — catches silent corruption a size check misses;
+    /// - a legacy row with no checkpoint → fall back to a **size** check.
+    ///
+    /// On a clean re-verify, (re-)mark the destination [`DestPhase::Verified`] (idempotent; also backfills
+    /// a legacy pre-P6 row) and return `true`. On failure, demote it to [`DestPhase::Pending`], clear its
+    /// stale checkpoint, and return `false` — the next claim then re-delivers ONLY that destination.
+    async fn reverify_one_dest(&self, slot: &DestSlot, it: &WorkItem, now: i64) -> Result<bool> {
         let resume = self
             .store
-            .load_resume(&self.instance, &it.relpath, self.dest.kind())?;
+            .load_resume(&self.instance, &it.relpath, &slot.label)?;
         let persisted: Option<Delivered> = resume
             .as_ref()
             .and_then(|r| r.token.get("verified").cloned())
@@ -669,100 +858,66 @@ impl Worker {
             ),
         };
 
-        match self.dest.verify(it, &expected, policy).await {
+        match slot.dest.verify(it, &expected, policy).await {
             Ok(()) => {
-                tracing::info!(instance = %self.instance, relpath = %it.relpath, "recovering Verified → re-verified, completing");
-                let _ = self.complete_verified(it, expected.bytes, now).await?;
+                tracing::info!(
+                    instance = %self.instance, relpath = %it.relpath, dest = %slot.label,
+                    "recovery: destination re-verified"
+                );
+                self.store.set_dest_phase(
+                    &self.instance,
+                    &it.relpath,
+                    &slot.label,
+                    DestPhase::Verified,
+                    now,
+                )?;
+                Ok(true)
             }
             Err(e) => {
                 tracing::warn!(
-                    instance = %self.instance, relpath = %it.relpath, error = %e,
-                    "Verified item failed destination re-verification on recovery; requeuing for re-delivery"
+                    instance = %self.instance, relpath = %it.relpath, dest = %slot.label, error = %e,
+                    "recovery: destination failed re-verification; requeuing that destination"
                 );
-                self.store
-                    .set_state(&self.instance, &it.relpath, ItemState::Ready, now)?;
+                self.store.set_dest_phase(
+                    &self.instance,
+                    &it.relpath,
+                    &slot.label,
+                    DestPhase::Pending,
+                    now,
+                )?;
                 let _ = self
                     .store
-                    .clear_resume(&self.instance, &it.relpath, self.dest.kind());
+                    .clear_resume(&self.instance, &it.relpath, &slot.label);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Re-verify every destination a PRIOR session persisted as [`DestPhase::Verified`] on an item that
+    /// crashed while still `InProgress`, BEFORE it is re-readied (DESIGN §13.2/§20-B, FR-CMP-3/4).
+    ///
+    /// Fan-out widens the crash window [`recover_verified`](Self::recover_verified) guards: a destination
+    /// can reach `DestPhase::Verified` (its own write-ahead) while the AGGREGATE item is still
+    /// `InProgress` (other destinations pending). The next claim's
+    /// [`run_pipeline`](Self::run_pipeline) SKIPS every `Verified` destination — so if such a
+    /// destination's object was lost/corrupted during downtime, the item would later complete
+    /// (delete/archive the source) trusting a stale row and silently short that destination. Re-verifying
+    /// here closes that gap for the InProgress window exactly as `recover_verified` does for the
+    /// aggregate-`Verified` window: a destination that fails is demoted to `Pending` (checkpoint cleared)
+    /// so the subsequent claim re-delivers only it; a clean one keeps its `Verified` phase and is
+    /// correctly skipped. Only destinations currently marked `Verified` are re-checked — a still-`Pending`
+    /// or `Exhausted` destination is (re-)attempted by the pipeline anyway.
+    async fn reverify_persisted_verified(&self, it: &WorkItem, now: i64) -> Result<()> {
+        let existing = self.store.dest_states(&self.instance, &it.relpath)?;
+        for slot in &self.dests {
+            let is_verified = existing
+                .iter()
+                .any(|d| d.dest == slot.label && d.phase == DestPhase::Verified);
+            if is_verified {
+                let _ = self.reverify_one_dest(slot, it, now).await?;
             }
         }
         Ok(())
-    }
-
-    /// Build the [`ProgressSink`] the destination streams byte-progress into, plus (only when the UNS
-    /// event stream is live) a drainer task that turns those checkpoints into throttled
-    /// `ReplicationProgress` events (DESIGN §17.2 / FR-EVT-2).
-    ///
-    /// The sink persists `bytes_done` to the durable store at most once per [`PROGRESS_STEP_BYTES`]
-    /// (for `get-status`/resume) and, when events are enabled, forwards a checkpoint over an unbounded
-    /// channel — a non-blocking send from the sync callback, so the transfer never awaits the broker.
-    /// The drainer applies the percent-step/interval [`ProgressThrottle`] and publishes, ending when
-    /// the transfer drops every clone of the sink (closing the channel). When events are disabled the
-    /// sink is exactly the P1/P2 store-persist sink and no task is spawned (zero overhead, identical
-    /// behavior).
-    ///
-    /// To honor the FR-EVT-2 "0%/100% always" guarantee, the events-enabled sink forwards the **first**
-    /// observation and the **terminal** (`done == size`) report unconditionally — not just the ≥4 MiB
-    /// persist checkpoints. Otherwise the sub-4 MiB head/tail is swallowed by the persist gate and the
-    /// throttle never sees percent 0 or 100 (small files would emit no progress at all).
-    fn make_progress(&self, item: &WorkItem) -> (ProgressSink, Option<tokio::task::JoinHandle<()>>) {
-        let store = self.store.clone();
-        let instance = self.instance.clone();
-        let relpath = item.relpath.clone();
-        let last = Arc::new(AtomicU64::new(0));
-
-        if !self.events.is_enabled() {
-            let sink = ProgressSink::new(move |done| {
-                persist_progress(&store, &instance, &relpath, &last, done);
-            });
-            return (sink, None);
-        }
-
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
-        let events = self.events.clone();
-        let id = self.instance.clone();
-        let path = item.relpath.clone();
-        let size = item.size;
-        let destination = self.dest.kind().to_string();
-        let attempt = item.attempts + 1;
-        let drainer = tokio::spawn(async move {
-            let mut throttle = ProgressThrottle::with_defaults();
-            while let Some(done) = rx.recv().await {
-                let pct = percent_int(done, size);
-                let now = now_ms();
-                if throttle.should_emit(pct, now) {
-                    events
-                        .instance_event(
-                            &id,
-                            Event::ReplicationProgress {
-                                path: path.clone(),
-                                size,
-                                bytes_done: done,
-                                percent: pct as f64,
-                                destination: destination.clone(),
-                                attempt,
-                            },
-                            now,
-                        )
-                        .await;
-                }
-            }
-        });
-
-        let size_bytes = item.size;
-        let first = Arc::new(AtomicBool::new(true));
-        let sink = ProgressSink::new(move |done| {
-            let checkpoint = persist_progress(&store, &instance, &relpath, &last, done);
-            // Always forward the first observation (→ the throttle's guaranteed 0%) and the terminal
-            // `done == size` report (→ the guaranteed 100%), plus every ≥4 MiB persist checkpoint in
-            // between. The drainer's [`ProgressThrottle`] then decides what actually publishes.
-            let is_first = first.swap(false, Ordering::Relaxed);
-            let is_terminal = size_bytes > 0 && done >= size_bytes;
-            if checkpoint || is_first || is_terminal {
-                let _ = tx.send(done);
-            }
-        });
-        (sink, Some(drainer))
     }
 
     /// Emit the completion/failure metric for a terminal state (best-effort).
@@ -782,6 +937,330 @@ impl Worker {
             let _ = m.emit_metric("fileReplicator", v).await;
         }
     }
+}
+
+/// The result of one destination's independent deliver→verify attempt within a fan-out round
+/// (DESIGN §20-B), returned by [`run_one_dest`].
+enum DestOutcome {
+    /// Delivered + integrity-verified; the caller write-ahead persists [`DestPhase::Verified`] before
+    /// this returns (so the caller only needs to fold the result into the aggregate rollup).
+    Verified,
+    /// A transient/integrity failure within this destination's own retry budget.
+    Retry { next_attempt_at: i64, err: String },
+    /// This destination's own retry budget (`maxAttempts`/`giveUpAfter`) is exhausted, or the error was
+    /// permanent — this destination can never complete without operator intervention.
+    GiveUp { err: String, attempts: u32 },
+}
+
+/// Owned inputs for one destination's fan-out attempt ([`run_one_dest`]) — everything a spawned,
+/// `'static` task needs, cloned out of the [`Worker`] up front so the attempt never borrows `self`
+/// (letting every pending destination run concurrently in its own [`tokio::task::JoinSet`] entry).
+struct DestAttemptCtx {
+    instance: String,
+    item: WorkItem,
+    label: String,
+    dest: SharedDestination,
+    store: Arc<dyn StateStore>,
+    bw: Bandwidth,
+    retry: RetryPolicy,
+    verify_policy: Verify,
+    events: Events,
+    now: i64,
+    /// This destination's attempts-so-far (from its [`DestState`](crate::domain::DestState), `0` if
+    /// this is its first attempt) — the per-destination analogue of [`WorkItem::attempts`].
+    attempts_so_far: u32,
+    rng: Arc<Mutex<StdRng>>,
+}
+
+/// Run one destination's independent deliver → verify attempt (DESIGN §20-B): the fan-out unit spawned
+/// concurrently, once per not-yet-`Verified` destination, by [`Worker::run_pipeline`]. Persists that
+/// destination's own write-ahead checkpoint / [`DestPhase`] / retry bookkeeping and emits that
+/// destination's own lifecycle events — mirroring, per destination, exactly what the pre-P6
+/// single-destination pipeline did for its one destination. `Err` is a durable-store fault (propagated
+/// so the caller leaves the item as-is for the next recovery pass); a destination transfer error is
+/// always resolved into a `Retry`/`GiveUp` outcome, never an `Err`.
+async fn run_one_dest(ctx: DestAttemptCtx) -> Result<(String, DestOutcome)> {
+    let DestAttemptCtx {
+        instance,
+        item,
+        label,
+        dest,
+        store,
+        bw,
+        retry,
+        verify_policy,
+        events,
+        now,
+        attempts_so_far,
+        rng,
+    } = ctx;
+
+    let resume = store.load_resume(&instance, &item.relpath, &label)?;
+    let attempt = attempts_so_far.saturating_add(1);
+
+    events
+        .instance_event(
+            &instance,
+            Event::ReplicationStarted {
+                path: item.relpath.clone(),
+                size: item.size,
+                destination: label.clone(),
+                attempt,
+            },
+            now,
+        )
+        .await;
+
+    let (progress, drainer) = build_progress(
+        store.clone(),
+        events.clone(),
+        instance.clone(),
+        item.relpath.clone(),
+        label.clone(),
+        item.size,
+        attempt,
+    );
+
+    let outcome = async {
+        let delivered = dest.deliver(&item, resume, &progress, &bw).await?;
+        dest.verify(&item, &delivered, verify_policy).await?;
+        Ok::<Delivered, ReplError>(delivered)
+    }
+    .await;
+
+    // Drop our sink handle so the progress channel closes once every destination-held clone is gone
+    // (deliver has returned), then flush any still-queued `ReplicationProgress` events.
+    drop(progress);
+    if let Some(d) = drainer {
+        let _ = d.await;
+    }
+
+    match outcome {
+        Ok(delivered) => {
+            // Write-ahead the FULL expected result at this destination's Verified point (DESIGN
+            // §13.2/§20-B): persist the delivered checksum + handle as ITS resume checkpoint BEFORE
+            // marking it `DestPhase::Verified`, so crash recovery re-verifies by re-hash (not just
+            // size). This overwrites any mid-transfer resume token (e.g. an S3 uploadId) — this
+            // destination's transfer is complete.
+            save_verified_checkpoint(&store, &instance, &item.relpath, &label, &delivered);
+            store.set_dest_phase(&instance, &item.relpath, &label, DestPhase::Verified, now)?;
+            events
+                .instance_event(
+                    &instance,
+                    Event::ReplicationCompleted {
+                        path: item.relpath.clone(),
+                        size: item.size,
+                        destination: label.clone(),
+                        bytes: delivered.bytes,
+                    },
+                    now,
+                )
+                .await;
+            Ok((label, DestOutcome::Verified))
+        }
+        Err(e) => {
+            let permanent = e.is_permanent();
+            let err_str = e.to_string();
+            // `RetryPolicy::decide` reads `attempts`/`discovered_at` off a `WorkItem` — probe with
+            // THIS destination's own attempts-so-far so the decision (and its backoff exponent) is
+            // independent per destination, while the time-based `giveUpAfter` budget still starts at
+            // the file's original discovery (shared across every destination).
+            let mut probe = item.clone();
+            probe.attempts = attempts_so_far;
+            let decision = {
+                let mut r = rng.lock().expect("rng mutex");
+                retry.decide(&probe, permanent, now, &mut *r)
+            };
+            match decision {
+                RetryDecision::Retry { next_attempt_at } => {
+                    store.record_dest_attempt(
+                        &instance,
+                        &item.relpath,
+                        &label,
+                        &err_str,
+                        DestPhase::Pending,
+                        next_attempt_at,
+                        now,
+                    )?;
+                    tracing::warn!(
+                        instance = %instance, relpath = %item.relpath, dest = %label,
+                        attempts = attempt, retry_at = next_attempt_at, error = %err_str,
+                        "destination transfer failed; scheduled for retry"
+                    );
+                    events
+                        .instance_event(
+                            &instance,
+                            Event::ReplicationFailed {
+                                path: item.relpath.clone(),
+                                destination: label.clone(),
+                                attempt,
+                                error: err_str.clone(),
+                                next_attempt_at_ms: Some(next_attempt_at),
+                            },
+                            now,
+                        )
+                        .await;
+                    Ok((label, DestOutcome::Retry { next_attempt_at, err: err_str }))
+                }
+                RetryDecision::GiveUp => {
+                    store.record_dest_attempt(
+                        &instance,
+                        &item.relpath,
+                        &label,
+                        &err_str,
+                        DestPhase::Exhausted,
+                        now,
+                        now,
+                    )?;
+                    // This destination's terminal give-up: release any in-flight partial upload and
+                    // drop its resume checkpoint (idempotent + best-effort).
+                    match store.load_resume(&instance, &item.relpath, &label) {
+                        Ok(Some(r)) => {
+                            if let Err(e) = dest.abort(&item, &r).await {
+                                tracing::warn!(
+                                    relpath = %item.relpath, dest = %label, error = %e,
+                                    "aborting partial transfer on give-up failed"
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(
+                            relpath = %item.relpath, dest = %label, error = %e,
+                            "load resume for give-up abort failed"
+                        ),
+                    }
+                    let _ = store.clear_resume(&instance, &item.relpath, &label);
+                    tracing::error!(
+                        instance = %instance, relpath = %item.relpath, dest = %label, attempts = attempt,
+                        error = %err_str, "retries exhausted on this destination"
+                    );
+                    events
+                        .instance_event(
+                            &instance,
+                            Event::RetriesExhausted {
+                                path: item.relpath.clone(),
+                                destination: label.clone(),
+                                attempts: attempt,
+                                last_error: err_str.clone(),
+                            },
+                            now,
+                        )
+                        .await;
+                    Ok((label, DestOutcome::GiveUp { err: err_str, attempts: attempt }))
+                }
+            }
+        }
+    }
+}
+
+/// Persist the delivered result as `label`'s `Verified` write-ahead checkpoint (DESIGN §13.2/§20-B).
+/// The whole [`Delivered`] rides in [`ResumeState::token`] under `"verified"`, reusing the resume row
+/// (single blob per `(instance, relpath, dest)`) across lifecycle phases — no schema change.
+/// Best-effort: a store fault here only costs recovery its checksum-precision (it falls back to a size
+/// check), so it must not fail the transfer that already succeeded.
+fn save_verified_checkpoint(
+    store: &Arc<dyn StateStore>,
+    instance: &str,
+    relpath: &str,
+    label: &str,
+    delivered: &Delivered,
+) {
+    let token = match serde_json::to_value(delivered) {
+        Ok(v) => serde_json::json!({ "verified": v }),
+        Err(e) => {
+            tracing::warn!(relpath = %relpath, dest = %label, error = %e, "serialize verified checkpoint failed");
+            return;
+        }
+    };
+    let checkpoint = ResumeState {
+        bytes_committed: delivered.bytes,
+        token,
+    };
+    if let Err(e) = store.save_resume(instance, relpath, label, &checkpoint) {
+        tracing::warn!(relpath = %relpath, dest = %label, error = %e, "persist verified checkpoint failed");
+    }
+}
+
+/// Build the [`ProgressSink`] a destination streams byte-progress into, plus (only when the UNS event
+/// stream is live) a drainer task that turns those checkpoints into throttled `ReplicationProgress`
+/// events tagged with `label` (DESIGN §17.2/§20-B / FR-EVT-2).
+///
+/// The sink persists `bytes_done` to the durable store at most once per [`PROGRESS_STEP_BYTES`] (for
+/// `get-status`/resume) and, when events are enabled, forwards a checkpoint over an unbounded channel —
+/// a non-blocking send from the sync callback, so the transfer never awaits the broker. The drainer
+/// applies the percent-step/interval [`ProgressThrottle`] and publishes, ending when the transfer drops
+/// every clone of the sink (closing the channel). When events are disabled the sink is exactly the
+/// P1/P2 store-persist sink and no task is spawned (zero overhead, identical behavior). With one
+/// destination this reproduces the pre-P6 single-destination progress pipeline exactly.
+///
+/// To honor the FR-EVT-2 "0%/100% always" guarantee, the events-enabled sink forwards the **first**
+/// observation and the **terminal** (`done == size`) report unconditionally — not just the ≥4 MiB
+/// persist checkpoints. Otherwise the sub-4 MiB head/tail is swallowed by the persist gate and the
+/// throttle never sees percent 0 or 100 (small files would emit no progress at all).
+#[allow(clippy::too_many_arguments)]
+fn build_progress(
+    store: Arc<dyn StateStore>,
+    events: Events,
+    instance: String,
+    relpath: String,
+    label: String,
+    size: u64,
+    attempt: u32,
+) -> (ProgressSink, Option<tokio::task::JoinHandle<()>>) {
+    let last = Arc::new(AtomicU64::new(0));
+
+    if !events.is_enabled() {
+        let store = store.clone();
+        let instance2 = instance.clone();
+        let relpath2 = relpath.clone();
+        let sink = ProgressSink::new(move |done| {
+            persist_progress(&store, &instance2, &relpath2, &last, done);
+        });
+        return (sink, None);
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    let drainer_events = events.clone();
+    let id = instance.clone();
+    let path = relpath.clone();
+    let destination = label.clone();
+    let drainer = tokio::spawn(async move {
+        let mut throttle = ProgressThrottle::with_defaults();
+        while let Some(done) = rx.recv().await {
+            let pct = percent_int(done, size);
+            let now = now_ms();
+            if throttle.should_emit(pct, now) {
+                drainer_events
+                    .instance_event(
+                        &id,
+                        Event::ReplicationProgress {
+                            path: path.clone(),
+                            size,
+                            bytes_done: done,
+                            percent: pct as f64,
+                            destination: destination.clone(),
+                            attempt,
+                        },
+                        now,
+                    )
+                    .await;
+            }
+        }
+    });
+
+    let first = Arc::new(AtomicBool::new(true));
+    let sink = ProgressSink::new(move |done| {
+        let checkpoint = persist_progress(&store, &instance, &relpath, &last, done);
+        // Always forward the first observation (→ the throttle's guaranteed 0%) and the terminal
+        // `done == size` report (→ the guaranteed 100%), plus every ≥4 MiB persist checkpoint in
+        // between. The drainer's [`ProgressThrottle`] then decides what actually publishes.
+        let is_first = first.swap(false, Ordering::Relaxed);
+        let is_terminal = size > 0 && done >= size;
+        if checkpoint || is_first || is_terminal {
+            let _ = tx.send(done);
+        }
+    });
+    (sink, Some(drainer))
 }
 
 /// Persist `done` bytes to the store when it advanced ≥ [`PROGRESS_STEP_BYTES`] since the last
@@ -930,7 +1409,7 @@ struct QuarantineCtx {
     attempts: u32,
     first_seen: i64,
     last_try: i64,
-    destination: &'static str,
+    destination: String,
     bytes_done: u64,
 }
 
@@ -2058,5 +2537,519 @@ mod tests {
         let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
         assert_eq!(worker.process_item(&item, 100).await, ItemState::Completed);
         // Nothing to assert on a fake — the point is it neither panics nor spawns a drainer.
+    }
+
+    // ---- P6 multi-destination fan-out (DESIGN §20-B) ---------------------------------------------
+
+    fn local_dest(dst_root: &Path) -> SharedDestination {
+        Arc::new(LocalDest::new(
+            &LocalEgress {
+                path: dst_root.to_path_buf(),
+                fsync: false,
+            },
+            Algorithm::Crc32c,
+        ))
+    }
+
+    /// A [`LocalDest`] wrapper that counts `deliver` calls — used to prove a destination is (or is
+    /// NOT) re-delivered to. `kind` is configurable so a fan-out test can pin distinct destination
+    /// labels deterministically.
+    struct CountingDest {
+        kind: &'static str,
+        inner: LocalDest,
+        deliver_calls: Arc<AtomicU32>,
+    }
+    impl CountingDest {
+        fn new(dst_root: &Path) -> Self {
+            Self::named("counting", dst_root)
+        }
+        fn named(kind: &'static str, dst_root: &Path) -> Self {
+            CountingDest {
+                kind,
+                inner: LocalDest::new(
+                    &LocalEgress {
+                        path: dst_root.to_path_buf(),
+                        fsync: false,
+                    },
+                    Algorithm::Crc32c,
+                ),
+                deliver_calls: Arc::new(AtomicU32::new(0)),
+            }
+        }
+    }
+    #[async_trait]
+    impl crate::dest::Destination for CountingDest {
+        fn kind(&self) -> &'static str {
+            self.kind
+        }
+        fn supports_resume(&self) -> bool {
+            self.inner.supports_resume()
+        }
+        async fn deliver(
+            &self,
+            item: &WorkItem,
+            resume: Option<ResumeState>,
+            progress: &ProgressSink,
+            bw: &Bandwidth,
+        ) -> ReplResult<crate::domain::Delivered> {
+            self.deliver_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner.deliver(item, resume, progress, bw).await
+        }
+        async fn verify(
+            &self,
+            item: &WorkItem,
+            delivered: &crate::domain::Delivered,
+            policy: Verify,
+        ) -> ReplResult<()> {
+            self.inner.verify(item, delivered, policy).await
+        }
+        async fn abort(&self, item: &WorkItem, resume: &crate::domain::ResumeState) -> ReplResult<()> {
+            self.inner.abort(item, resume).await
+        }
+    }
+
+    #[tokio::test]
+    async fn fan_out_completes_once_after_all_destinations_verify() {
+        let src = tempfile::tempdir().unwrap();
+        let dst_a = tempfile::tempdir().unwrap();
+        let dst_b = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "f.txt", b"fan-out payload");
+
+        let worker = Worker::new_multi(
+            INST.to_string(),
+            store.clone(),
+            vec![local_dest(dst_a.path()), local_dest(dst_b.path())],
+            completion(OnSuccess::Delete),
+            src.path().to_path_buf(),
+            Bandwidth::unlimited(),
+            RetryPolicy::default(),
+            None,
+        );
+
+        let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
+        let state = worker.process_item(&item, 100).await;
+
+        assert_eq!(state, ItemState::Completed);
+        assert_eq!(std::fs::read(dst_a.path().join("f.txt")).unwrap(), b"fan-out payload");
+        assert_eq!(std::fs::read(dst_b.path().join("f.txt")).unwrap(), b"fan-out payload");
+        assert!(!src.path().join("f.txt").exists(), "source deleted only after BOTH destinations verify");
+        assert_eq!(store.get(INST, "f.txt").unwrap().unwrap().state, ItemState::Completed);
+        // The completion action (source delete + the `replicated` counter) fires EXACTLY ONCE — not
+        // once per destination.
+        assert_eq!(store.stats(INST).unwrap().replicated, 1);
+        assert!(
+            store.dest_states(INST, "f.txt").unwrap().is_empty(),
+            "per-destination bookkeeping is cleared on completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn fan_out_one_destination_failing_keeps_item_incomplete_and_source_retained() {
+        let src = tempfile::tempdir().unwrap();
+        let dst_a = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "f.txt", b"payload");
+
+        let failing: SharedDestination = Arc::new(FailingDest {
+            err: || ReplError::Permanent("no such bucket".into()),
+        });
+        let worker = Worker::new_multi(
+            INST.to_string(),
+            store.clone(),
+            vec![local_dest(dst_a.path()), failing],
+            completion(OnSuccess::Delete), // retainInPlace on_exhausted (default)
+            src.path().to_path_buf(),
+            Bandwidth::unlimited(),
+            RetryPolicy::default(),
+            None,
+        );
+
+        let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
+        let state = worker.process_item(&item, 100).await;
+
+        assert_eq!(
+            state,
+            ItemState::Retained,
+            "one destination permanently exhausted -> the item can never complete"
+        );
+        assert!(src.path().join("f.txt").exists(), "source retained, not deleted");
+        assert_eq!(
+            std::fs::read(dst_a.path().join("f.txt")).unwrap(),
+            b"payload",
+            "the destination that DID succeed keeps its delivered data"
+        );
+        assert_eq!(store.get(INST, "f.txt").unwrap().unwrap().state, ItemState::Retained);
+        assert_eq!(store.stats(INST).unwrap().failed, 1);
+        assert_eq!(store.stats(INST).unwrap().replicated, 0);
+        let states = store.dest_states(INST, "f.txt").unwrap();
+        let local = states.iter().find(|d| d.dest == "local").expect("local dest row exists");
+        assert_eq!(local.phase, DestPhase::Verified, "the succeeded destination stays Verified");
+        let failed = states.iter().find(|d| d.dest == "failing").expect("failing dest row exists");
+        assert_eq!(failed.phase, DestPhase::Exhausted);
+    }
+
+    #[tokio::test]
+    async fn fan_out_recovery_redelivers_only_the_unverified_destination_and_completes_once() {
+        // Simulate a crash AFTER destination "local" was delivered + verified (its write-ahead
+        // DestPhase::Verified + resume checkpoint already persisted) but BEFORE destination "counting"
+        // ever ran (no dest_state row for it at all) — the item is left `InProgress`.
+        let src = tempfile::tempdir().unwrap();
+        let dst_a = tempfile::tempdir().unwrap();
+        let dst_b = tempfile::tempdir().unwrap();
+        let store = store();
+        std::fs::write(src.path().join("f.txt"), b"payload").unwrap();
+
+        let dest_a_backend = LocalDest::new(
+            &LocalEgress {
+                path: dst_a.path().to_path_buf(),
+                fsync: false,
+            },
+            Algorithm::Crc32c,
+        );
+        let seed_item = WorkItem {
+            instance: INST.into(),
+            relpath: "f.txt".into(),
+            abs_source: src.path().join("f.txt"),
+            state: ItemState::InProgress,
+            size: 7,
+            discovered_at: 0,
+            attempts: 0,
+            next_attempt_at: 0,
+            last_error: None,
+            bytes_done: 0,
+            updated_at: 0,
+        };
+        let delivered_a = dest_a_backend
+            .deliver(&seed_item, None, &ProgressSink::noop(), &Bandwidth::unlimited())
+            .await
+            .unwrap();
+
+        store.upsert_ready(INST, "f.txt", 7, 0, 1).unwrap();
+        store.set_state(INST, "f.txt", ItemState::InProgress, 2).unwrap();
+        store
+            .save_resume(
+                INST,
+                "f.txt",
+                "local",
+                &ResumeState {
+                    bytes_committed: delivered_a.bytes,
+                    token: serde_json::json!({ "verified": serde_json::to_value(&delivered_a).unwrap() }),
+                },
+            )
+            .unwrap();
+        store.set_dest_phase(INST, "f.txt", "local", DestPhase::Verified, 2).unwrap();
+        // No dest_state row at all for "counting" — implicitly Pending.
+
+        let counting = CountingDest::new(dst_b.path());
+        let delivers_b = counting.deliver_calls.clone();
+        let worker = Worker::new_multi(
+            INST.to_string(),
+            store.clone(),
+            vec![Arc::new(dest_a_backend), Arc::new(counting)],
+            completion(OnSuccess::Delete),
+            src.path().to_path_buf(),
+            Bandwidth::unlimited(),
+            RetryPolicy::default(),
+            None,
+        );
+
+        // Crash recovery: the aggregate item was InProgress → reverts to Ready. Per-destination
+        // bookkeeping (the "local" DestPhase::Verified row) is untouched by an InProgress recovery.
+        worker.recover(100).await.unwrap();
+        assert_eq!(store.get(INST, "f.txt").unwrap().unwrap().state, ItemState::Ready);
+
+        // Re-claim and process: must re-deliver ONLY to "counting" (the unverified destination) — the
+        // already-`Verified` "local" destination is skipped entirely (no re-delivery).
+        let item = store.claim_ready(INST, 10, 200).unwrap().pop().unwrap();
+        let state = worker.process_item(&item, 200).await;
+
+        assert_eq!(state, ItemState::Completed);
+        assert_eq!(
+            delivers_b.load(AtomicOrdering::SeqCst),
+            1,
+            "only the unverified destination is (re-)delivered"
+        );
+        assert_eq!(std::fs::read(dst_b.path().join("f.txt")).unwrap(), b"payload");
+        assert!(!src.path().join("f.txt").exists());
+        assert_eq!(store.stats(INST).unwrap().replicated, 1, "completes exactly once");
+    }
+
+    #[tokio::test]
+    async fn fan_out_honors_each_destinations_independent_backoff_gate() {
+        // Two not-yet-verified destinations with DIFFERENT backoff gates: only the destination whose own
+        // clock is due is (re-)attempted this round; the one still in backoff is left untouched, and the
+        // item re-claims at the earliest still-pending gate — proving retries are per-destination
+        // independent (the fix for "a slow destination retried at its fastest sibling's cadence, its
+        // attempts inflated toward premature exhaustion"), FR-EGR-3 / DESIGN §20-B.
+        let src = tempfile::tempdir().unwrap();
+        let dst_a = tempfile::tempdir().unwrap();
+        let dst_b = tempfile::tempdir().unwrap();
+        let store = store();
+        std::fs::write(src.path().join("f.txt"), b"payload").unwrap();
+
+        let a = CountingDest::named("ay", dst_a.path());
+        let b = CountingDest::named("bee", dst_b.path());
+        let a_calls = a.deliver_calls.clone();
+        let b_calls = b.deliver_calls.clone();
+        let worker = Worker::new_multi(
+            INST.to_string(),
+            store.clone(),
+            vec![Arc::new(a), Arc::new(b)],
+            completion(OnSuccess::Delete),
+            src.path().to_path_buf(),
+            Bandwidth::unlimited(),
+            RetryPolicy::default(),
+            None,
+        );
+
+        // Seed a partially-fanned-out item: both destinations Pending, but A is due (gate 0) while B is
+        // parked on a long backoff (gate 5_000). The item is claimed (InProgress).
+        store.upsert_ready(INST, "f.txt", 7, 0, 1).unwrap();
+        store
+            .record_dest_attempt(INST, "f.txt", "ay", "earlier", DestPhase::Pending, 0, 1)
+            .unwrap();
+        store
+            .record_dest_attempt(INST, "f.txt", "bee", "earlier", DestPhase::Pending, 5_000, 1)
+            .unwrap();
+        store.set_state(INST, "f.txt", ItemState::InProgress, 1).unwrap();
+
+        let item = store.get(INST, "f.txt").unwrap().unwrap();
+        assert_eq!(worker.process_item(&item, 1_000).await, ItemState::Failed);
+
+        assert_eq!(a_calls.load(AtomicOrdering::SeqCst), 1, "the due destination is attempted");
+        assert_eq!(
+            b_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "the destination still in backoff is NOT re-attempted at its sibling's cadence"
+        );
+        let it = store.get(INST, "f.txt").unwrap().unwrap();
+        assert_eq!(
+            it.next_attempt_at, 5_000,
+            "item re-claims at the earliest still-pending destination's own gate"
+        );
+        let states = store.dest_states(INST, "f.txt").unwrap();
+        let bee = states.iter().find(|d| d.dest == "bee").unwrap();
+        assert_eq!(bee.phase, DestPhase::Pending);
+        assert_eq!(bee.next_attempt_at, 5_000, "not-due destination's backoff clock untouched");
+        assert_eq!(bee.attempts, 1, "not-due destination's attempt count not inflated");
+        let ay = states.iter().find(|d| d.dest == "ay").unwrap();
+        assert_eq!(ay.phase, DestPhase::Verified, "the attempted destination delivered + verified");
+
+        // Once B's clock elapses it is attempted and the item completes exactly once; A (already
+        // Verified) is never re-delivered.
+        store.set_state(INST, "f.txt", ItemState::InProgress, 6_000).unwrap();
+        let item = store.get(INST, "f.txt").unwrap().unwrap();
+        assert_eq!(worker.process_item(&item, 6_000).await, ItemState::Completed);
+        assert_eq!(a_calls.load(AtomicOrdering::SeqCst), 1, "already-Verified destination never re-delivered");
+        assert_eq!(b_calls.load(AtomicOrdering::SeqCst), 1, "the now-due destination delivered");
+        assert_eq!(store.stats(INST).unwrap().replicated, 1);
+        assert!(!src.path().join("f.txt").exists(), "source released only after BOTH verify");
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_reverifies_prior_session_verified_destination_no_data_loss() {
+        // FR-CMP-3/4 fan-out data-loss guard: an item left `InProgress` with destination A already
+        // `DestPhase::Verified` from a PRIOR session, whose object was then CORRUPTED during downtime,
+        // must NOT complete (delete the source) trusting the stale row. Recovery re-verifies A, catches
+        // the corruption by re-hash, demotes it to Pending, and the next claim re-delivers A (healing its
+        // copy) as well as the still-pending B — completing only after BOTH truly verify. Without the
+        // re-verify, run_pipeline would skip A on trust and the source would be deleted with A corrupt.
+        let src = tempfile::tempdir().unwrap();
+        let dst_a = tempfile::tempdir().unwrap();
+        let dst_b = tempfile::tempdir().unwrap();
+        let store = store();
+        std::fs::write(src.path().join("f.txt"), b"payload").unwrap();
+
+        // Deliver to A for real to capture a genuine Verified checkpoint (checksum), then corrupt A's
+        // object in place (same length, different bytes — only a checksum re-verify catches it).
+        let a_backend = LocalDest::new(
+            &LocalEgress { path: dst_a.path().to_path_buf(), fsync: false },
+            Algorithm::Crc32c,
+        );
+        let seed_item = WorkItem {
+            instance: INST.into(),
+            relpath: "f.txt".into(),
+            abs_source: src.path().join("f.txt"),
+            state: ItemState::InProgress,
+            size: 7,
+            discovered_at: 0,
+            attempts: 0,
+            next_attempt_at: 0,
+            last_error: None,
+            bytes_done: 0,
+            updated_at: 0,
+        };
+        let delivered_a = a_backend
+            .deliver(&seed_item, None, &ProgressSink::noop(), &Bandwidth::unlimited())
+            .await
+            .unwrap();
+        std::fs::write(dst_a.path().join("f.txt"), b"CORRUPT").unwrap(); // 7 bytes, wrong content
+
+        store.upsert_ready(INST, "f.txt", 7, 0, 1).unwrap();
+        store.set_state(INST, "f.txt", ItemState::InProgress, 2).unwrap();
+        store
+            .save_resume(
+                INST,
+                "f.txt",
+                "ay",
+                &ResumeState {
+                    bytes_committed: delivered_a.bytes,
+                    token: serde_json::json!({ "verified": serde_json::to_value(&delivered_a).unwrap() }),
+                },
+            )
+            .unwrap();
+        store.set_dest_phase(INST, "f.txt", "ay", DestPhase::Verified, 2).unwrap();
+        // No dest_state row for "bee" — implicitly Pending.
+
+        let a = CountingDest::named("ay", dst_a.path());
+        let b = CountingDest::named("bee", dst_b.path());
+        let a_calls = a.deliver_calls.clone();
+        let b_calls = b.deliver_calls.clone();
+        let worker = Worker::new_multi(
+            INST.to_string(),
+            store.clone(),
+            vec![Arc::new(a), Arc::new(b)],
+            completion(OnSuccess::Delete),
+            src.path().to_path_buf(),
+            Bandwidth::unlimited(),
+            RetryPolicy::default(),
+            None,
+        );
+
+        // Recovery: InProgress → re-verify A's prior-session Verified phase. The corrupted object fails
+        // re-verification → A is demoted to Pending, its stale checkpoint cleared, item re-readied.
+        worker.recover(100).await.unwrap();
+        assert_eq!(store.get(INST, "f.txt").unwrap().unwrap().state, ItemState::Ready);
+        let ay = store
+            .dest_states(INST, "f.txt")
+            .unwrap()
+            .into_iter()
+            .find(|d| d.dest == "ay")
+            .unwrap();
+        assert_eq!(ay.phase, DestPhase::Pending, "corrupted prior-session Verified destination demoted");
+        assert!(store.load_resume(INST, "f.txt", "ay").unwrap().is_none(), "stale checkpoint cleared");
+        assert_eq!(a_calls.load(AtomicOrdering::SeqCst), 0, "recovery re-verifies, never re-delivers");
+
+        // Next claim re-delivers BOTH (A because it was demoted): completes only after both truly verify.
+        let item = store.claim_ready(INST, 10, 200).unwrap().pop().unwrap();
+        assert_eq!(worker.process_item(&item, 200).await, ItemState::Completed);
+        assert_eq!(a_calls.load(AtomicOrdering::SeqCst), 1, "the demoted destination is re-delivered (copy healed)");
+        assert_eq!(b_calls.load(AtomicOrdering::SeqCst), 1, "the pending destination delivered");
+        assert_eq!(
+            std::fs::read(dst_a.path().join("f.txt")).unwrap(),
+            b"payload",
+            "A's corrupted object replaced with the correct bytes — no silent data loss"
+        );
+        assert!(!src.path().join("f.txt").exists(), "source released only after both truly verified");
+        assert_eq!(store.stats(INST).unwrap().replicated, 1);
+    }
+
+    #[tokio::test]
+    async fn recover_verified_multi_dest_requeues_only_the_failed_destination() {
+        // The N>1 partial-re-verify branch of recover_verified: an aggregate-`Verified` item where dest A
+        // re-verifies clean but dest B's object was lost during downtime. Only B is demoted (checkpoint
+        // cleared) and the item reverts to Ready; A stays Verified and is NOT re-delivered on the next
+        // claim, which re-delivers only B and completes exactly once (FR-CMP-3/4, DESIGN §20-B).
+        let src = tempfile::tempdir().unwrap();
+        let dst_a = tempfile::tempdir().unwrap();
+        let dst_b = tempfile::tempdir().unwrap();
+        let store = store();
+        std::fs::write(src.path().join("f.txt"), b"payload").unwrap();
+
+        // A: deliver for real → genuine object + checkpoint. B: seed a Verified checkpoint but leave its
+        // object ABSENT (a wiped mount), so B's re-verify fails while A's passes.
+        let a_backend = LocalDest::new(
+            &LocalEgress { path: dst_a.path().to_path_buf(), fsync: false },
+            Algorithm::Crc32c,
+        );
+        let seed_item = WorkItem {
+            instance: INST.into(),
+            relpath: "f.txt".into(),
+            abs_source: src.path().join("f.txt"),
+            state: ItemState::InProgress,
+            size: 7,
+            discovered_at: 0,
+            attempts: 0,
+            next_attempt_at: 0,
+            last_error: None,
+            bytes_done: 0,
+            updated_at: 0,
+        };
+        let delivered_a = a_backend
+            .deliver(&seed_item, None, &ProgressSink::noop(), &Bandwidth::unlimited())
+            .await
+            .unwrap();
+        let fake_b = Delivered {
+            bytes: 7,
+            checksum: delivered_a.checksum.clone(),
+            handle: serde_json::Value::Null,
+        };
+
+        store.upsert_ready(INST, "f.txt", 7, 0, 1).unwrap();
+        store.set_state(INST, "f.txt", ItemState::Verified, 2).unwrap();
+        store
+            .save_resume(
+                INST,
+                "f.txt",
+                "ay",
+                &ResumeState {
+                    bytes_committed: delivered_a.bytes,
+                    token: serde_json::json!({ "verified": serde_json::to_value(&delivered_a).unwrap() }),
+                },
+            )
+            .unwrap();
+        store.set_dest_phase(INST, "f.txt", "ay", DestPhase::Verified, 2).unwrap();
+        store
+            .save_resume(
+                INST,
+                "f.txt",
+                "bee",
+                &ResumeState {
+                    bytes_committed: 7,
+                    token: serde_json::json!({ "verified": serde_json::to_value(&fake_b).unwrap() }),
+                },
+            )
+            .unwrap();
+        store.set_dest_phase(INST, "f.txt", "bee", DestPhase::Verified, 2).unwrap();
+
+        let a = CountingDest::named("ay", dst_a.path());
+        let b = CountingDest::named("bee", dst_b.path());
+        let a_calls = a.deliver_calls.clone();
+        let b_calls = b.deliver_calls.clone();
+        let worker = Worker::new_multi(
+            INST.to_string(),
+            store.clone(),
+            vec![Arc::new(a), Arc::new(b)],
+            completion(OnSuccess::Delete),
+            src.path().to_path_buf(),
+            Bandwidth::unlimited(),
+            RetryPolicy::default(),
+            None,
+        );
+
+        worker.recover(100).await.unwrap();
+
+        // A re-verified clean (stays Verified, checkpoint intact); B failed → demoted, checkpoint cleared;
+        // the aggregate item reverted to Ready. Neither destination was re-delivered during recovery.
+        assert_eq!(store.get(INST, "f.txt").unwrap().unwrap().state, ItemState::Ready);
+        let states = store.dest_states(INST, "f.txt").unwrap();
+        let ay = states.iter().find(|d| d.dest == "ay").unwrap();
+        assert_eq!(ay.phase, DestPhase::Verified, "the intact destination stays Verified (not re-delivered)");
+        let bee = states.iter().find(|d| d.dest == "bee").unwrap();
+        assert_eq!(bee.phase, DestPhase::Pending, "the lost destination is demoted");
+        assert!(store.load_resume(INST, "f.txt", "ay").unwrap().is_some(), "A's checkpoint preserved");
+        assert!(store.load_resume(INST, "f.txt", "bee").unwrap().is_none(), "B's stale checkpoint cleared");
+        assert_eq!(a_calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(b_calls.load(AtomicOrdering::SeqCst), 0);
+
+        // The next claim re-delivers ONLY B (A is skipped) and completes exactly once.
+        let item = store.claim_ready(INST, 10, 200).unwrap().pop().unwrap();
+        assert_eq!(worker.process_item(&item, 200).await, ItemState::Completed);
+        assert_eq!(a_calls.load(AtomicOrdering::SeqCst), 0, "already-Verified destination never re-delivered");
+        assert_eq!(b_calls.load(AtomicOrdering::SeqCst), 1, "only the requeued destination is re-delivered");
+        assert_eq!(std::fs::read(dst_b.path().join("f.txt")).unwrap(), b"payload");
+        assert!(!src.path().join("f.txt").exists());
+        assert_eq!(store.stats(INST).unwrap().replicated, 1, "completes exactly once");
     }
 }

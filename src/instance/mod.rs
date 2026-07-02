@@ -74,9 +74,11 @@ pub struct Instance {
     /// Config `enabled` — the value [`clear_activation`](Self::clear_activation) reverts to, and the
     /// `configuredEnabled` field reported by the P3 control plane's `get-status`.
     config_enabled: bool,
-    /// Short destination label (`dest.kind()`, e.g. `"local"`/`"s3"`) surfaced in `get-status`
-    /// `inProgress` rows via [`crate::control::InstanceControl::dest_label`].
-    dest_kind: &'static str,
+    /// Destination label(s) surfaced in `get-status` `inProgress` rows via
+    /// [`crate::control::InstanceControl::dest_label`] — a single `dest.kind()` (e.g. `"local"`) for
+    /// one destination, or every configured destination's label joined with `"+"` for a fan-out
+    /// instance (e.g. `"local+s3"`, DESIGN §20-B).
+    dest_kind: String,
     /// The configured schedule mode (`"immediate"`/`"cron"`/`"window"`) reported by `get-status` and
     /// the retained state snapshot (DESIGN §16), driven live by [`schedule`](Self::schedule).
     schedule_mode: &'static str,
@@ -158,23 +160,30 @@ impl Instance {
         events: Events,
     ) -> anyhow::Result<Instance> {
         anyhow::ensure!(
-            cfg.egress.len() == 1,
-            "instance '{}': exactly one egress destination is required (v1)",
+            !cfg.egress.is_empty(),
+            "instance '{}': at least one egress destination is required",
             cfg.id
         );
         // The backend may need the shared store (S3 resume checkpoints); always thread THIS instance's
         // store in (the credential handle rides in from `App::run`).
         let deps = deps.clone().with_store(store.clone());
-        let dest = build_destination(&cfg.egress[0], &deps)
-            .map_err(|e| anyhow::anyhow!("instance '{}': {e}", cfg.id))?;
-        Self::build_with_dest(cfg, global, store, global_sem, global_bw, metrics, dest, events)
+        let dests: Vec<SharedDestination> = cfg
+            .egress
+            .iter()
+            .map(|e| {
+                build_destination(e, &deps).map_err(|err| anyhow::anyhow!("instance '{}': {err}", cfg.id))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Self::build_with_dests(cfg, global, store, global_sem, global_bw, metrics, dests, events)
     }
 
     /// Assemble an instance with a **caller-supplied** [`SharedDestination`], bypassing the egress
     /// factory. This is the injection seam used by the end-to-end integration tests (a fake/failing
     /// destination for the error paths) and by future programmatic wiring; the normal path is
-    /// [`build`](Self::build), which resolves the destination from `cfg.egress`. Unlike `build`, this
-    /// does not require `cfg.egress` to be present — the destination is explicit.
+    /// [`build`](Self::build), which resolves the destination(s) from `cfg.egress`. Unlike `build`, this
+    /// does not require `cfg.egress` to be present — the destination is explicit. A thin wrapper over
+    /// [`build_with_dests`](Self::build_with_dests) with a single-element destination list — by
+    /// construction this is exactly the N=1 case of the fan-out engine (DESIGN §20-B).
     #[allow(clippy::too_many_arguments)]
     pub fn build_with_dest(
         cfg: InstanceCfg,
@@ -186,6 +195,30 @@ impl Instance {
         dest: SharedDestination,
         events: Events,
     ) -> anyhow::Result<Instance> {
+        Self::build_with_dests(cfg, global, store, global_sem, global_bw, metrics, vec![dest], events)
+    }
+
+    /// Assemble an instance that fans a claimed item out to every destination in `dests` (P6, DESIGN
+    /// §20-B): each retries independently, and the source is only released once ALL of them verify. The
+    /// injection-seam counterpart of [`build_with_dest`](Self::build_with_dest) for N>1 destinations —
+    /// used by [`build`](Self::build) (the normal, config-driven path) and directly by tests exercising
+    /// fan-out with injected/fake destinations. `dests` must be non-empty.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_dests(
+        cfg: InstanceCfg,
+        global: &GlobalCfg,
+        store: Arc<dyn StateStore>,
+        global_sem: Arc<Semaphore>,
+        global_bw: Arc<TokenBucket>,
+        metrics: Option<Arc<dyn MetricService>>,
+        dests: Vec<SharedDestination>,
+        events: Events,
+    ) -> anyhow::Result<Instance> {
+        anyhow::ensure!(
+            !dests.is_empty(),
+            "instance '{}': at least one destination is required",
+            cfg.id
+        );
         let schedule_mode = match cfg.schedule {
             ScheduleCfg::Immediate => "immediate",
             ScheduleCfg::Cron(_) => "cron",
@@ -248,14 +281,25 @@ impl Instance {
         let global_retry = global.defaults.as_ref().and_then(|d| d.retry.as_ref());
         let retry = RetryPolicy::resolve(cfg.retry.as_ref(), global_retry);
 
-        let dest_kind = dest.kind();
-        let dest_supports_resume = dest.supports_resume();
+        // Multi-destination fan-out (DESIGN §20-B): each destination retries independently, so the
+        // window-close `pauseResume` behavior is only safe when EVERY destination supports resume
+        // (cancelling a destination that can't resume would restart it from byte 0 next window — the
+        // documented `finishCurrent` fallback handles that single-destination case already, and the
+        // same fallback now covers "at least one destination can't resume"). `dest_kind` is every
+        // configured destination's label, joined (`"local"` for N=1, `"local+s3"` for N=2, …) — the
+        // short label surfaced in `get-status`/the retained state snapshot.
+        let dest_kind = dests
+            .iter()
+            .map(|d| d.kind())
+            .collect::<Vec<_>>()
+            .join("+");
+        let dest_supports_resume = dests.iter().all(|d| d.supports_resume());
         let queue = Queue::new(cfg.id.clone(), store.clone(), per_limit, global_sem);
         let worker = Arc::new(
-            Worker::new(
+            Worker::new_multi(
                 cfg.id.clone(),
                 store.clone(),
-                dest,
+                dests,
                 cfg.completion.clone(),
                 cfg.ingress.path.clone(),
                 bw,
@@ -705,7 +749,7 @@ impl Instance {
             self.is_active(),
             self.config_enabled,
             self.schedule_mode,
-            self.dest_kind,
+            &self.dest_kind,
             now,
         );
         self.events.publish_instance_state(&self.id, snapshot).await;
@@ -816,7 +860,7 @@ impl InstanceControl for Instance {
     }
 
     fn dest_label(&self) -> &str {
-        self.dest_kind
+        &self.dest_kind
     }
 
     fn schedule_mode(&self) -> &str {
@@ -1093,14 +1137,11 @@ mod tests {
     }
 
     #[test]
-    fn build_rejects_multi_egress() {
+    fn build_rejects_empty_egress() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
         let mut cfg = instance_cfg("bad", src.path(), dst.path(), true);
-        cfg.egress.push(EgressCfg::Local(LocalEgress {
-            path: dst.path().to_path_buf(),
-            fsync: false,
-        }));
+        cfg.egress.clear();
         let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
         assert!(Instance::build(
             cfg,
@@ -1113,6 +1154,32 @@ mod tests {
             Events::disabled(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn build_accepts_multi_egress_and_joins_dest_labels() {
+        // P6, DESIGN §20-B: the v1 len==1 restriction is lifted — N>=1 egress entries now build fine.
+        let src = tempfile::tempdir().unwrap();
+        let dst1 = tempfile::tempdir().unwrap();
+        let dst2 = tempfile::tempdir().unwrap();
+        let mut cfg = instance_cfg("fanout", src.path(), dst1.path(), true);
+        cfg.egress.push(EgressCfg::Local(LocalEgress {
+            path: dst2.path().to_path_buf(),
+            fsync: false,
+        }));
+        let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let inst = Instance::build(
+            cfg,
+            &GlobalCfg::default(),
+            store,
+            Arc::new(Semaphore::new(8)),
+            Arc::new(TokenBucket::unlimited()),
+            None,
+            &DestDeps::default(),
+            Events::disabled(),
+        )
+        .expect("multi-egress instance builds");
+        assert_eq!(inst.dest_label(), "local+local");
     }
 
     // ---- P3 UNS event emission (the engine-wiring slice) ----------------------------------------

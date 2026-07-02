@@ -30,7 +30,9 @@ use file_replicator::config::{
     LocalEgress, OnExhausted, OnSuccess, ReadinessCfg, RetryCfg, ScheduleCfg, Verify,
 };
 use file_replicator::dest::{DestDeps, Destination, SharedDestination};
-use file_replicator::domain::{Delivered, ItemState, ProgressSink, ResumeState, WorkItem};
+use file_replicator::domain::{
+    Delivered, DestPhase, DestState, ItemState, ProgressSink, ResumeState, WorkItem,
+};
 use file_replicator::events::Events;
 use file_replicator::error::{ReplError, Result as ReplResult};
 use file_replicator::instance::Instance;
@@ -274,6 +276,52 @@ impl StateStore for FailCompletedOnceStore {
     }
     fn clear_resume(&self, instance: &str, relpath: &str, dest: &str) -> ReplResult<()> {
         self.inner.clear_resume(instance, relpath, dest)
+    }
+    fn clear_resume_all(&self, instance: &str, relpath: &str) -> ReplResult<()> {
+        self.inner.clear_resume_all(instance, relpath)
+    }
+    fn dest_states(&self, instance: &str, relpath: &str) -> ReplResult<Vec<DestState>> {
+        self.inner.dest_states(instance, relpath)
+    }
+    fn set_dest_phase(
+        &self,
+        instance: &str,
+        relpath: &str,
+        dest: &str,
+        phase: DestPhase,
+        now: i64,
+    ) -> ReplResult<()> {
+        self.inner.set_dest_phase(instance, relpath, dest, phase, now)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn record_dest_attempt(
+        &self,
+        instance: &str,
+        relpath: &str,
+        dest: &str,
+        err: &str,
+        phase: DestPhase,
+        next_attempt_at: i64,
+        now: i64,
+    ) -> ReplResult<()> {
+        self.inner
+            .record_dest_attempt(instance, relpath, dest, err, phase, next_attempt_at, now)
+    }
+    fn clear_dest_states(&self, instance: &str, relpath: &str) -> ReplResult<()> {
+        self.inner.clear_dest_states(instance, relpath)
+    }
+    fn roll_up_item(
+        &self,
+        instance: &str,
+        relpath: &str,
+        state: ItemState,
+        attempts: u32,
+        next_attempt_at: i64,
+        last_error: Option<&str>,
+        now: i64,
+    ) -> ReplResult<()> {
+        self.inner
+            .roll_up_item(instance, relpath, state, attempts, next_attempt_at, last_error, now)
     }
     fn load_activation(&self, instance: &str) -> ReplResult<Option<Activation>> {
         self.inner.load_activation(instance)

@@ -16,7 +16,7 @@ use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
-use crate::domain::{ItemState, ResumeState, WorkItem};
+use crate::domain::{DestPhase, DestState, ItemState, ResumeState, WorkItem};
 use crate::error::{ReplError, Result};
 
 /// Durable, crash-safe state for the queue, resume checkpoints, activation, and stats.
@@ -72,6 +72,65 @@ pub trait StateStore: Send + Sync {
     fn load_resume(&self, instance: &str, relpath: &str, dest: &str)
         -> Result<Option<ResumeState>>;
     fn clear_resume(&self, instance: &str, relpath: &str, dest: &str) -> Result<()>;
+    /// Drop every resume checkpoint for an item, across all destinations (used on a genuine-new-file
+    /// [`upsert_ready`](Self::upsert_ready) reset and on completion cleanup, P6).
+    fn clear_resume_all(&self, instance: &str, relpath: &str) -> Result<()>;
+
+    // ---- per-destination completion (P6, DESIGN §20-B) ---------------------------------------------
+    //
+    // Multi-destination fan-out: a file's source is released only once EVERY configured destination
+    // is independently `Verified`. These queries let the worker track and recover that per-dest
+    // state on top of the existing per-(instance, relpath, dest) resume checkpoint.
+
+    /// All per-destination bookkeeping rows for an item (recovery / rollup). A configured destination
+    /// with no row is implicitly `Pending{attempts: 0}` — the caller supplies that default.
+    fn dest_states(&self, instance: &str, relpath: &str) -> Result<Vec<DestState>>;
+
+    /// Upsert a destination straight to `phase` (write-ahead: called once a destination's `verify`
+    /// passes, immediately after its resume checkpoint is persisted).
+    fn set_dest_phase(
+        &self,
+        instance: &str,
+        relpath: &str,
+        dest: &str,
+        phase: DestPhase,
+        now: i64,
+    ) -> Result<()>;
+
+    /// Failure path for a single destination: `attempts += 1`, record `err`, set `next_attempt_at`,
+    /// move to `phase` (`Pending` while retrying, `Exhausted` on that destination's give-up). Upserts
+    /// (the row may not exist yet on a destination's first attempt).
+    #[allow(clippy::too_many_arguments)]
+    fn record_dest_attempt(
+        &self,
+        instance: &str,
+        relpath: &str,
+        dest: &str,
+        err: &str,
+        phase: DestPhase,
+        next_attempt_at: i64,
+        now: i64,
+    ) -> Result<()>;
+
+    /// Drop every per-destination row for an item (completion cleanup, or a genuine-new-file
+    /// [`upsert_ready`](Self::upsert_ready) reset).
+    fn clear_dest_states(&self, instance: &str, relpath: &str) -> Result<()>;
+
+    /// Write the item-level rollup computed from its per-destination states in one update:
+    /// `attempts`/`next_attempt_at`/`last_error` are a summary (max attempts / earliest pending gate /
+    /// most relevant error) across destinations, `state` the aggregate [`ItemState`]. N=1 fan-out
+    /// degenerates this to exactly what [`record_attempt`](Self::record_attempt) would write.
+    #[allow(clippy::too_many_arguments)]
+    fn roll_up_item(
+        &self,
+        instance: &str,
+        relpath: &str,
+        state: ItemState,
+        attempts: u32,
+        next_attempt_at: i64,
+        last_error: Option<&str>,
+        now: i64,
+    ) -> Result<()>;
 
     // ---- activation (persisted; wins over config `enabled`, DESIGN §7.5) ------------------------
 
@@ -115,7 +174,12 @@ pub struct Stats {
 /// The DDL for the state DB. One DB per component data dir; instances share every table, keyed by
 /// `instance`. `next_attempt_at` is the P1 addition to the §14.2 schema (the backoff re-claim gate,
 /// see [`WorkItem::next_attempt_at`]). `resume.blob` is a JSON-serialized [`ResumeState`] so the S3
-/// backend (P2) reuses the column for `{uploadId, completedParts}` with no migration.
+/// backend (P2) reuses the column for `{uploadId, completedParts}` with no migration. `dest_state` is
+/// the P6 addition (DESIGN §20-B): independent per-destination completion tracking for
+/// multi-destination fan-out, keyed the same way as `resume` — `(instance, relpath, dest)`. The DB is
+/// created fresh per deployment, so `CREATE TABLE IF NOT EXISTS` is the entire migration; a legacy
+/// (pre-P6) DB simply has no `dest_state` rows, which the worker treats as "every configured
+/// destination is `Pending`" (safe: idempotent re-delivery via the stable resume key).
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS work_items(
   instance        TEXT    NOT NULL,
@@ -133,6 +197,16 @@ CREATE TABLE IF NOT EXISTS work_items(
 CREATE INDEX IF NOT EXISTS ix_ready ON work_items(instance, state, discovered_at);
 CREATE TABLE IF NOT EXISTS resume(
   instance TEXT NOT NULL, relpath TEXT NOT NULL, dest TEXT NOT NULL, blob BLOB NOT NULL,
+  PRIMARY KEY(instance, relpath, dest));
+CREATE TABLE IF NOT EXISTS dest_state(
+  instance        TEXT    NOT NULL,
+  relpath         TEXT    NOT NULL,
+  dest            TEXT    NOT NULL,
+  state           TEXT    NOT NULL DEFAULT 'pending',
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER NOT NULL DEFAULT 0,
+  last_error      TEXT,
+  updated_at      INTEGER NOT NULL,
   PRIMARY KEY(instance, relpath, dest));
 CREATE TABLE IF NOT EXISTS activation(
   instance TEXT PRIMARY KEY, active INTEGER NOT NULL, source TEXT NOT NULL, updated_at INTEGER NOT NULL);
@@ -222,6 +296,26 @@ fn row_to_item(r: &Row<'_>) -> rusqlite::Result<WorkItem> {
     })
 }
 
+/// Map a full `dest_state` row (`dest, state, attempts, next_attempt_at, last_error` order) to a
+/// [`DestState`].
+fn row_to_dest_state(r: &Row<'_>) -> rusqlite::Result<DestState> {
+    let phase_str: String = r.get(1)?;
+    let phase = DestPhase::from_str(&phase_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            format!("unknown dest phase {phase_str:?}").into(),
+        )
+    })?;
+    Ok(DestState {
+        dest: r.get(0)?,
+        phase,
+        attempts: r.get::<_, i64>(2)? as u32,
+        next_attempt_at: r.get(3)?,
+        last_error: r.get(4)?,
+    })
+}
+
 impl StateStore for SqliteStore {
     fn upsert_ready(
         &self,
@@ -241,7 +335,23 @@ impl StateStore for SqliteStore {
         //     same file) preserve the state so a completed file is never resurrected into a loop and
         //     an in-flight transfer is never yanked back to Ready.
         // `changed` is evaluated in SQL against the existing row so the decision is atomic.
-        self.lock().execute(
+        //
+        // P6: a terminal-and-changed reset ALSO must clear this item's per-destination fan-out
+        // bookkeeping (`dest_state` + every `resume` row) — otherwise a stale `Verified` dest_state
+        // row from the PRIOR file at this relpath would make the rewritten file silently skip that
+        // destination (data loss). `set_state`-driven transitions (e.g. promote-due Ready) must NOT
+        // clear these, so the wrapping transaction here is the only place this happens; the reset
+        // condition is decided in Rust (mirroring the SQL CASE below) so it composes with that clear.
+        let mut guard = self.lock();
+        let tx = guard.transaction()?;
+        let prior: Option<(String, i64, i64)> = tx
+            .query_row(
+                "SELECT state, size, mtime_ms FROM work_items WHERE instance = ?1 AND relpath = ?2",
+                params![instance, relpath],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        tx.execute(
             "INSERT INTO work_items(instance, relpath, state, size, mtime_ms, discovered_at, updated_at)
              VALUES (?1, ?2, 'ready', ?3, ?4, ?5, ?5)
              ON CONFLICT(instance, relpath) DO UPDATE SET
@@ -274,6 +384,24 @@ impl StateStore for SqliteStore {
                updated_at = excluded.updated_at",
             params![instance, relpath, size as i64, mtime_ms, now],
         )?;
+        let reset = match &prior {
+            Some((state, psize, pmtime)) => {
+                ItemState::from_str(state).is_some_and(|s| s.is_terminal())
+                    && (*psize != size as i64 || *pmtime != mtime_ms)
+            }
+            None => false,
+        };
+        if reset {
+            tx.execute(
+                "DELETE FROM dest_state WHERE instance = ?1 AND relpath = ?2",
+                params![instance, relpath],
+            )?;
+            tx.execute(
+                "DELETE FROM resume WHERE instance = ?1 AND relpath = ?2",
+                params![instance, relpath],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -421,6 +549,94 @@ impl StateStore for SqliteStore {
         self.lock().execute(
             "DELETE FROM resume WHERE instance = ?1 AND relpath = ?2 AND dest = ?3",
             params![instance, relpath, dest],
+        )?;
+        Ok(())
+    }
+
+    fn clear_resume_all(&self, instance: &str, relpath: &str) -> Result<()> {
+        self.lock().execute(
+            "DELETE FROM resume WHERE instance = ?1 AND relpath = ?2",
+            params![instance, relpath],
+        )?;
+        Ok(())
+    }
+
+    fn dest_states(&self, instance: &str, relpath: &str) -> Result<Vec<DestState>> {
+        let guard = self.lock();
+        let mut stmt = guard.prepare(
+            "SELECT dest, state, attempts, next_attempt_at, last_error FROM dest_state
+             WHERE instance = ?1 AND relpath = ?2 ORDER BY dest ASC",
+        )?;
+        let rows = stmt.query_map(params![instance, relpath], row_to_dest_state)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn set_dest_phase(
+        &self,
+        instance: &str,
+        relpath: &str,
+        dest: &str,
+        phase: DestPhase,
+        now: i64,
+    ) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO dest_state(instance, relpath, dest, state, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(instance, relpath, dest) DO UPDATE
+               SET state = excluded.state, updated_at = excluded.updated_at",
+            params![instance, relpath, dest, phase.as_str(), now],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_dest_attempt(
+        &self,
+        instance: &str,
+        relpath: &str,
+        dest: &str,
+        err: &str,
+        phase: DestPhase,
+        next_attempt_at: i64,
+        now: i64,
+    ) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO dest_state(instance, relpath, dest, state, attempts, next_attempt_at, last_error, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7)
+             ON CONFLICT(instance, relpath, dest) DO UPDATE SET
+               attempts = dest_state.attempts + 1,
+               state = excluded.state,
+               next_attempt_at = excluded.next_attempt_at,
+               last_error = excluded.last_error,
+               updated_at = excluded.updated_at",
+            params![instance, relpath, dest, phase.as_str(), next_attempt_at, err, now],
+        )?;
+        Ok(())
+    }
+
+    fn clear_dest_states(&self, instance: &str, relpath: &str) -> Result<()> {
+        self.lock().execute(
+            "DELETE FROM dest_state WHERE instance = ?1 AND relpath = ?2",
+            params![instance, relpath],
+        )?;
+        Ok(())
+    }
+
+    fn roll_up_item(
+        &self,
+        instance: &str,
+        relpath: &str,
+        state: ItemState,
+        attempts: u32,
+        next_attempt_at: i64,
+        last_error: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        self.lock().execute(
+            "UPDATE work_items
+             SET state = ?3, attempts = ?4, next_attempt_at = ?5, last_error = ?6, updated_at = ?7
+             WHERE instance = ?1 AND relpath = ?2",
+            params![instance, relpath, state.as_str(), attempts as i64, next_attempt_at, last_error, now],
         )?;
         Ok(())
     }
@@ -779,6 +995,203 @@ mod tests {
         s.save_resume(INST, "f", "s3", &mk(2)).unwrap();
         assert_eq!(s.load_resume(INST, "f", "local").unwrap().unwrap().bytes_committed, 1);
         assert_eq!(s.load_resume(INST, "f", "s3").unwrap().unwrap().bytes_committed, 2);
+    }
+
+    #[test]
+    fn clear_resume_all_drops_every_dest_but_leaves_other_items() {
+        let (s, _d) = temp_store();
+        let mk = |n: u64| ResumeState { bytes_committed: n, token: serde_json::Value::Null };
+        s.save_resume(INST, "f", "local", &mk(1)).unwrap();
+        s.save_resume(INST, "f", "s3", &mk(2)).unwrap();
+        s.save_resume(INST, "other", "local", &mk(3)).unwrap();
+        s.clear_resume_all(INST, "f").unwrap();
+        assert!(s.load_resume(INST, "f", "local").unwrap().is_none());
+        assert!(s.load_resume(INST, "f", "s3").unwrap().is_none());
+        assert_eq!(s.load_resume(INST, "other", "local").unwrap().unwrap().bytes_committed, 3);
+    }
+
+    // ---- P6: per-destination completion state -------------------------------------------------
+
+    #[test]
+    fn dest_state_round_trip_and_list() {
+        let (s, _d) = temp_store();
+        assert!(s.dest_states(INST, "f").unwrap().is_empty());
+        s.set_dest_phase(INST, "f", "local", DestPhase::Verified, 10).unwrap();
+        s.record_dest_attempt(INST, "f", "s3", "boom", DestPhase::Pending, 500, 20).unwrap();
+        let mut states = s.dest_states(INST, "f").unwrap();
+        states.sort_by(|a, b| a.dest.cmp(&b.dest));
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].dest, "local");
+        assert_eq!(states[0].phase, DestPhase::Verified);
+        assert_eq!(states[0].attempts, 0);
+        assert_eq!(states[1].dest, "s3");
+        assert_eq!(states[1].phase, DestPhase::Pending);
+        assert_eq!(states[1].attempts, 1);
+        assert_eq!(states[1].next_attempt_at, 500);
+        assert_eq!(states[1].last_error.as_deref(), Some("boom"));
+        // A different item's dest_state is isolated.
+        assert!(s.dest_states(INST, "other").unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_dest_attempt_increments_and_sets_phase() {
+        let (s, _d) = temp_store();
+        s.record_dest_attempt(INST, "f", "sftp", "err1", DestPhase::Pending, 100, 5).unwrap();
+        let states = s.dest_states(INST, "f").unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].attempts, 1);
+        assert_eq!(states[0].phase, DestPhase::Pending);
+        assert_eq!(states[0].last_error.as_deref(), Some("err1"));
+        assert_eq!(states[0].next_attempt_at, 100);
+
+        // A second attempt on the SAME dest increments rather than replacing.
+        s.record_dest_attempt(INST, "f", "sftp", "err2", DestPhase::Exhausted, 200, 6).unwrap();
+        let states = s.dest_states(INST, "f").unwrap();
+        assert_eq!(states.len(), 1, "upsert on the same (instance, relpath, dest) key");
+        assert_eq!(states[0].attempts, 2);
+        assert_eq!(states[0].phase, DestPhase::Exhausted);
+        assert_eq!(states[0].last_error.as_deref(), Some("err2"));
+        assert_eq!(states[0].next_attempt_at, 200);
+    }
+
+    #[test]
+    fn set_dest_phase_to_verified() {
+        let (s, _d) = temp_store();
+        // First transition inserts fresh (attempts stays at the column default).
+        s.set_dest_phase(INST, "f", "local", DestPhase::Verified, 42).unwrap();
+        let states = s.dest_states(INST, "f").unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].phase, DestPhase::Verified);
+        assert_eq!(states[0].attempts, 0);
+
+        // Set on top of an existing (attempted) row upserts the phase without disturbing attempts.
+        s.record_dest_attempt(INST, "g", "s3", "boom", DestPhase::Pending, 10, 1).unwrap();
+        s.set_dest_phase(INST, "g", "s3", DestPhase::Verified, 2).unwrap();
+        let states = s.dest_states(INST, "g").unwrap();
+        assert_eq!(states[0].phase, DestPhase::Verified);
+        assert_eq!(states[0].attempts, 1, "attempts preserved across the verify transition");
+    }
+
+    #[test]
+    fn clear_dest_states_drops_all_dests_for_item_only() {
+        let (s, _d) = temp_store();
+        s.set_dest_phase(INST, "f", "local", DestPhase::Verified, 1).unwrap();
+        s.set_dest_phase(INST, "f", "s3", DestPhase::Verified, 1).unwrap();
+        s.set_dest_phase(INST, "other", "local", DestPhase::Verified, 1).unwrap();
+        s.clear_dest_states(INST, "f").unwrap();
+        assert!(s.dest_states(INST, "f").unwrap().is_empty());
+        assert_eq!(s.dest_states(INST, "other").unwrap().len(), 1, "other item untouched");
+    }
+
+    #[test]
+    fn dest_state_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let s = SqliteStore::open(&path).unwrap();
+            s.set_dest_phase(INST, "f", "local", DestPhase::Verified, 1).unwrap();
+            s.record_dest_attempt(INST, "f", "s3", "boom", DestPhase::Pending, 500, 2).unwrap();
+        } // store dropped == process exit
+        let s = SqliteStore::open(&path).unwrap();
+        let mut states = s.dest_states(INST, "f").unwrap();
+        states.sort_by(|a, b| a.dest.cmp(&b.dest));
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].dest, "local");
+        assert_eq!(states[0].phase, DestPhase::Verified);
+        assert_eq!(states[1].dest, "s3");
+        assert_eq!(states[1].phase, DestPhase::Pending);
+        assert_eq!(states[1].attempts, 1);
+    }
+
+    #[test]
+    fn roll_up_item_writes_aggregate_fields() {
+        let (s, _d) = temp_store();
+        s.upsert_ready(INST, "f", 1, 0, 1).unwrap();
+        s.roll_up_item(INST, "f", ItemState::Failed, 3, 900, Some("s3: timeout"), 50).unwrap();
+        let it = s.get(INST, "f").unwrap().unwrap();
+        assert_eq!(it.state, ItemState::Failed);
+        assert_eq!(it.attempts, 3);
+        assert_eq!(it.next_attempt_at, 900);
+        assert_eq!(it.last_error.as_deref(), Some("s3: timeout"));
+        assert_eq!(it.updated_at, 50);
+
+        // N=1 degenerate case: matches what record_attempt would have written.
+        s.upsert_ready(INST, "g", 1, 0, 1).unwrap();
+        s.record_attempt(INST, "g", "boom", ItemState::Failed, 900, 50).unwrap();
+        let via_record = s.get(INST, "g").unwrap().unwrap();
+        s.upsert_ready(INST, "h", 1, 0, 1).unwrap();
+        s.roll_up_item(INST, "h", ItemState::Failed, 1, 900, Some("boom"), 50).unwrap();
+        let via_rollup = s.get(INST, "h").unwrap().unwrap();
+        assert_eq!(via_record.state, via_rollup.state);
+        assert_eq!(via_record.attempts, via_rollup.attempts);
+        assert_eq!(via_record.next_attempt_at, via_rollup.next_attempt_at);
+        assert_eq!(via_record.last_error, via_rollup.last_error);
+    }
+
+    #[test]
+    fn upsert_ready_changed_terminal_clears_dest_state_and_resume() {
+        // The P6 data-loss guard: a rewritten file at a completed relpath must not inherit a stale
+        // `Verified` dest_state from the PRIOR file, or that destination would be silently skipped.
+        let (s, _d) = temp_store();
+        s.upsert_ready(INST, "f", 10, 111, 1).unwrap();
+        s.set_dest_phase(INST, "f", "local", DestPhase::Verified, 2).unwrap();
+        s.set_dest_phase(INST, "f", "s3", DestPhase::Verified, 2).unwrap();
+        s.save_resume(
+            INST, "f", "local",
+            &ResumeState { bytes_committed: 10, token: serde_json::json!({"verified": true}) },
+        )
+        .unwrap();
+        s.set_state(INST, "f", ItemState::Completed, 3).unwrap();
+
+        // Re-discovery with a DIFFERENT mtime (new file, rotating-filename pattern) → reset.
+        s.upsert_ready(INST, "f", 10, 222, 10).unwrap();
+        let it = s.get(INST, "f").unwrap().unwrap();
+        assert_eq!(it.state, ItemState::Ready);
+        assert!(s.dest_states(INST, "f").unwrap().is_empty(), "stale dest_state cleared");
+        assert!(s.load_resume(INST, "f", "local").unwrap().is_none(), "stale resume cleared");
+        assert!(s.load_resume(INST, "f", "s3").unwrap().is_none());
+    }
+
+    #[test]
+    fn upsert_ready_unchanged_terminal_keeps_dest_state() {
+        // The negative of the above: re-discovering the SAME terminal file (no size/mtime change)
+        // must not disturb its dest_state — nothing was rewritten.
+        let (s, _d) = temp_store();
+        s.upsert_ready(INST, "f", 10, 111, 1).unwrap();
+        s.set_dest_phase(INST, "f", "local", DestPhase::Verified, 2).unwrap();
+        s.set_state(INST, "f", ItemState::Completed, 3).unwrap();
+        s.upsert_ready(INST, "f", 10, 111, 10).unwrap();
+        let it = s.get(INST, "f").unwrap().unwrap();
+        assert_eq!(it.state, ItemState::Completed);
+        assert_eq!(s.dest_states(INST, "f").unwrap().len(), 1, "unchanged file keeps dest_state");
+    }
+
+    #[test]
+    fn upsert_ready_promote_path_keeps_dest_state() {
+        // set_state (e.g. the promote-due path back to Ready) must NOT clear dest_state — only the
+        // upsert_ready terminal-and-changed reset does. A partially-fanned-out item resumed via
+        // promote must still skip its already-verified destinations.
+        let (s, _d) = temp_store();
+        s.upsert_ready(INST, "f", 10, 111, 1).unwrap();
+        s.set_dest_phase(INST, "f", "local", DestPhase::Verified, 2).unwrap();
+        s.set_state(INST, "f", ItemState::Failed, 3).unwrap();
+        s.set_state(INST, "f", ItemState::Ready, 4).unwrap();
+        assert_eq!(s.dest_states(INST, "f").unwrap().len(), 1, "promote must not clear dest_state");
+        assert_eq!(s.dest_states(INST, "f").unwrap()[0].phase, DestPhase::Verified);
+    }
+
+    #[test]
+    fn unknown_persisted_dest_phase_is_a_state_error() {
+        let (s, _d) = temp_store();
+        s.set_dest_phase(INST, "f", "local", DestPhase::Pending, 1).unwrap();
+        s.lock()
+            .execute(
+                "UPDATE dest_state SET state = 'bogus' WHERE instance = ?1 AND relpath = 'f'",
+                params![INST],
+            )
+            .unwrap();
+        let err = s.dest_states(INST, "f").unwrap_err();
+        assert!(matches!(err, ReplError::State(_)), "got {err:?}");
     }
 
     #[test]
