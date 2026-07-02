@@ -31,6 +31,7 @@ use file_replicator::config::{
 };
 use file_replicator::dest::{DestDeps, Destination, SharedDestination};
 use file_replicator::domain::{Delivered, ItemState, ProgressSink, ResumeState, WorkItem};
+use file_replicator::events::Events;
 use file_replicator::error::{ReplError, Result as ReplResult};
 use file_replicator::instance::Instance;
 use file_replicator::ratelimit::{parse_byte_rate, Clock, ManualClock, SystemClock, TokenBucket};
@@ -84,6 +85,7 @@ fn build(cfg: InstanceCfg, store: Arc<dyn StateStore>) -> Instance {
         Arc::new(TokenBucket::unlimited()),
         None,
         &DestDeps::default(),
+        Events::disabled(),
     )
     .expect("instance builds")
 }
@@ -396,6 +398,7 @@ async fn failed_delivery_retries_then_quarantines_while_other_instance_unaffecte
         Arc::new(TokenBucket::unlimited()),
         None,
         dest_a,
+        Events::disabled(),
     )
     .expect("instance A builds with injected dest");
 
@@ -617,6 +620,7 @@ async fn global_bandwidth_cap_is_shared_across_instances() {
             global_bw.clone(),
             None,
             &DestDeps::default(),
+            Events::disabled(),
         )
         .expect("instance builds with shared global bucket");
         (inst, src, dst)
@@ -688,6 +692,7 @@ async fn completion_does_not_fire_when_verify_fails() {
         Arc::new(TokenBucket::unlimited()),
         None,
         dest,
+        Events::disabled(),
     )
     .expect("instance builds with verify-failing dest");
 

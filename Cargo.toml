@@ -60,6 +60,9 @@ thiserror = "1"
 rand = "0.8"
 # CancellationToken for cooperative task shutdown.
 tokio-util = { version = "0.7", features = ["rt"] }
+# RFC3339 event/state timestamps (P3 control plane); same crate + version ggcommons uses for the
+# message-envelope timestamp, so features unify with no lock churn.
+time = { version = "0.3", features = ["formatting"] }
 
 # --- P2 S3 destination deps (optional; gated by `dest-s3`, DESIGN §22.2) ------------------------
 # Same 1.x line ggcommons uses for kinesis/cloudwatch; pure-Rust (rustls) — no extra toolchain.

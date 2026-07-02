@@ -17,10 +17,13 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{self, InstanceCfg};
+use crate::control::{ControlPlane, InstanceControl};
 use crate::dest::DestDeps;
-use crate::instance::Instance;
+use crate::events::{Event, Events};
+use crate::instance::{now_ms, Instance};
 use crate::ratelimit::{parse_byte_rate, SystemClock, TokenBucket};
 use crate::state::{SqliteStore, StateStore};
+use crate::uns::Topics;
 
 /// Split instance configs into the ones to keep (first occurrence of each id) and the ids that were
 /// dropped as duplicates. Instance identity keys every durable-state table, so a duplicate id must
@@ -134,11 +137,42 @@ impl App {
         #[cfg(feature = "dest-s3")]
         let deps = deps.with_credentials(gg.credentials());
 
-        // Build + spawn each instance under a shared cancellation token.
+        // P3 control/event plane (DESIGN §15-§17). Resolve the shared messaging handle once —
+        // absent on some platforms, in which case the whole UNS layer degrades to a no-op and the
+        // P1/P2 engine runs unchanged (DESIGN §6) — plus the component-level topic prefix and the
+        // envelope thing/tags. Every instance's [`Events`] emitter uses the SAME component-level prefix
+        // so an instance's whole namespace — its `cmd` surface, `evt` stream, and retained `state` — is
+        // consistent and reachable at one root. A per-instance `topics.prefix` override (§15.7) is
+        // parsed but NOT honored in P3 (it would split an instance's command surface from its event
+        // stream — see the warning below); it is deferred to a later phase.
+        let msg = gg.messaging().ok();
+        if msg.is_none() {
+            tracing::warn!("messaging unavailable; UNS control/event plane disabled (engine runs normally)");
+        }
+        let global_prefix = global.topics.as_ref().and_then(|t| t.prefix.clone());
+        let thing = self.config.thing_name.clone();
+        let tags = self.config.parsed.tags.clone();
+
+        // Build + spawn each instance under a shared cancellation token, keeping a control-plane
+        // handle per instance (the same `Arc`, so the dispatcher drives the live instance).
         let cancel = CancellationToken::new();
         let mut handles = Vec::new();
+        let mut control_instances: Vec<Arc<dyn InstanceControl>> = Vec::new();
         for cfg in instances_cfg {
             let id = cfg.id.clone();
+            // A per-instance `topics.prefix` override is deferred (§15.7): honoring it here would put
+            // this instance's events/state on its override root while its `cmd/instances/{id}/…`
+            // control surface stays on the component root — a split, half-unreachable namespace. In P3
+            // the whole component shares the component prefix; warn and ignore an instance override.
+            if cfg.topics.as_ref().and_then(|t| t.prefix.as_deref()).is_some() {
+                tracing::warn!(
+                    instance = %id,
+                    "per-instance topics.prefix override is not honored in P3 (the component shares one \
+                     prefix for cmd/evt/state so the namespace stays consistent); ignoring"
+                );
+            }
+            let topics = Arc::new(Topics::from_config(&self.config, global_prefix.as_deref(), None));
+            let events = Events::new(msg.clone(), topics, thing.clone(), tags.clone());
             match Instance::build(
                 cfg,
                 &global,
@@ -147,12 +181,15 @@ impl App {
                 global_bw.clone(),
                 Some(self.metrics.clone()),
                 &deps,
+                events,
             ) {
                 Ok(inst) => {
                     tracing::info!(instance = %id, active = inst.is_active(), "instance started");
                     let inst = Arc::new(inst);
+                    control_instances.push(inst.clone());
                     let child = cancel.child_token();
-                    handles.push(tokio::spawn(async move { inst.run(child).await }));
+                    let run_inst = inst.clone();
+                    handles.push(tokio::spawn(async move { run_inst.run(child).await }));
                 }
                 Err(e) => tracing::error!(instance = %id, error = %e, "failed to build instance; skipping"),
             }
@@ -167,6 +204,20 @@ impl App {
             );
         }
 
+        // P3 control plane (DESIGN §15/§16): subscribe the `cmd/#` topic space on the Unified
+        // Namespace and answer get-config / get-status / trigger / set-activation via `reply_to`.
+        // Messaging may be absent on some platforms — the plane then degrades to a no-op (DESIGN §6).
+        let control = Arc::new(ControlPlane::build(
+            msg.clone(),
+            &self.config,
+            &global,
+            store.clone(),
+            control_instances,
+        ));
+        if let Err(e) = control.clone().start().await {
+            tracing::warn!(error = %e, "control plane failed to subscribe; continuing without it");
+        }
+
         tracing::info!(
             thing = %self.config.thing_name,
             instances = handles.len(),
@@ -175,8 +226,34 @@ impl App {
         );
         gg.set_ready(true);
 
+        // Component-ready lifecycle event on the UNS (DESIGN §17.1), on the component-level prefix.
+        // No-op when messaging is absent.
+        Events::new(
+            msg.clone(),
+            Arc::new(Topics::from_config(&self.config, global_prefix.as_deref(), None)),
+            thing.clone(),
+            tags.clone(),
+        )
+        .component_event(
+            Event::ComponentReady {
+                instances: handles.len() as u64,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            now_ms(),
+        )
+        .await;
+
+        // Seed the retained current-state topics (DESIGN §15.3 / §17.2 / FR-EVT-4) so a UI/cloud
+        // subscriber that connects to an idle component still renders every instance's state and the
+        // component roster — otherwise an instance that has not ticked yet appears on no state topic.
+        // No-op when messaging is absent.
+        control.publish_initial_state(now_ms()).await;
+
         gg.shutdown_signal().await;
         tracing::info!("shutdown signal received; stopping instances");
+        // Unsubscribe the control topics first so no command is accepted mid-shutdown (and no broker
+        // subscription is orphaned), then cancel the instance run loops.
+        control.stop().await;
         cancel.cancel();
         for h in handles {
             if let Err(e) = h.await {

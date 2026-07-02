@@ -33,8 +33,11 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{EgressCfg, GlobalCfg, InstanceCfg, ScheduleCfg};
+use crate::control::{instance_state_snapshot, InstanceControl};
 use crate::dest::{build_destination, DestDeps, SharedDestination};
+use crate::domain::ItemState;
 use crate::error::Result;
+use crate::events::{Event, Events};
 use crate::ratelimit::{parse_byte_rate, Bandwidth, Clock, SystemClock, TokenBucket};
 use crate::readiness::RealProbe;
 use crate::state::StateStore;
@@ -61,20 +64,35 @@ pub struct Instance {
     id: String,
     /// The persisted activation flag (runtime state wins over config `enabled`, DESIGN §7.5).
     active: AtomicBool,
-    /// Config `enabled` — the value [`clear_activation`](Self::clear_activation) reverts to. Read by
-    /// the reset path only, which the P3 control surface triggers (exercised by unit tests here).
-    #[allow(dead_code)]
+    /// Config `enabled` — the value [`clear_activation`](Self::clear_activation) reverts to, and the
+    /// `configuredEnabled` field reported by the P3 control plane's `get-status`.
     config_enabled: bool,
+    /// Short destination label (`dest.kind()`, e.g. `"local"`/`"s3"`) surfaced in `get-status`
+    /// `inProgress` rows via [`crate::control::InstanceControl::dest_label`].
+    dest_kind: &'static str,
+    /// The configured schedule mode (`"immediate"`/`"cron"`/`"window"`) reported by `get-status` and
+    /// the retained state snapshot (DESIGN §16). P1 runs everything immediate (cron/window is P4), but
+    /// reporting the *configured* mode never misrepresents an instance an operator set to a window.
+    schedule_mode: &'static str,
     rescan: Duration,
+    /// Serializes [`tick`](Self::tick) so the periodic run-loop tick and a control-triggered tick (both
+    /// on the same `Arc<Instance>`, from different tasks) never overlap — the new-file detection
+    /// (`store.get` then `enqueue`) is not atomic, so overlapping ticks could double-emit
+    /// `FileReady`/`ScanComplete` and double-count `discovered` for one file.
+    tick_lock: tokio::sync::Mutex<()>,
     /// Holds the readiness state (stability tracker), so discovery locks it briefly per tick. Behind
     /// an `Arc` so the blocking directory walk can run in `spawn_blocking` off the async runtime.
     watcher: Arc<Mutex<Watcher>>,
     queue: Queue,
     worker: Arc<Worker>,
     /// Held for the activation write-side ([`set_activation`](Self::set_activation) /
-    /// [`clear_activation`](Self::clear_activation)); the read-side runs at build time.
-    #[allow(dead_code)]
+    /// [`clear_activation`](Self::clear_activation)) and the P3 `get-status` store queries.
     store: Arc<dyn StateStore>,
+    /// UNS event emitter for this instance's discovery events (`FileReady`/`ScanComplete`) and the
+    /// retained per-instance `state/instances/{id}` republish (DESIGN §17). A no-op
+    /// [`Events::disabled`] when messaging is absent (or in unit tests), so the P1/P2 engine runs
+    /// unchanged. The worker holds a clone for the per-file lifecycle events.
+    events: Events,
 }
 
 impl Instance {
@@ -89,6 +107,7 @@ impl Instance {
         global_bw: Arc<TokenBucket>,
         metrics: Option<Arc<dyn MetricService>>,
         deps: &DestDeps,
+        events: Events,
     ) -> anyhow::Result<Instance> {
         anyhow::ensure!(
             cfg.egress.len() == 1,
@@ -100,7 +119,7 @@ impl Instance {
         let deps = deps.clone().with_store(store.clone());
         let dest = build_destination(&cfg.egress[0], &deps)
             .map_err(|e| anyhow::anyhow!("instance '{}': {e}", cfg.id))?;
-        Self::build_with_dest(cfg, global, store, global_sem, global_bw, metrics, dest)
+        Self::build_with_dest(cfg, global, store, global_sem, global_bw, metrics, dest, events)
     }
 
     /// Assemble an instance with a **caller-supplied** [`SharedDestination`], bypassing the egress
@@ -117,12 +136,21 @@ impl Instance {
         global_bw: Arc<TokenBucket>,
         metrics: Option<Arc<dyn MetricService>>,
         dest: SharedDestination,
+        events: Events,
     ) -> anyhow::Result<Instance> {
         // TODO(P4): cron/window scheduling. P1 supports immediate only; a non-immediate schedule is
         // accepted and run as immediate so a P4-authored config still replicates (just not gated).
+        // The *configured* mode is still reported by get-status/state (DESIGN §16) so an instance an
+        // operator set to a nightly window is not misrepresented as `immediate`.
+        let schedule_mode = match cfg.schedule {
+            ScheduleCfg::Immediate => "immediate",
+            ScheduleCfg::Cron(_) => "cron",
+            ScheduleCfg::Window(_) => "window",
+        };
         if !matches!(cfg.schedule, ScheduleCfg::Immediate) {
             tracing::warn!(
                 instance = %cfg.id,
+                mode = schedule_mode,
                 "cron/window scheduling is not implemented (P4); treating as immediate"
             );
         }
@@ -180,17 +208,21 @@ impl Instance {
         let global_retry = global.defaults.as_ref().and_then(|d| d.retry.as_ref());
         let retry = RetryPolicy::resolve(cfg.retry.as_ref(), global_retry);
 
+        let dest_kind = dest.kind();
         let queue = Queue::new(cfg.id.clone(), store.clone(), per_limit, global_sem);
-        let worker = Arc::new(Worker::new(
-            cfg.id.clone(),
-            store.clone(),
-            dest,
-            cfg.completion.clone(),
-            cfg.ingress.path.clone(),
-            bw,
-            retry,
-            metrics,
-        ));
+        let worker = Arc::new(
+            Worker::new(
+                cfg.id.clone(),
+                store.clone(),
+                dest,
+                cfg.completion.clone(),
+                cfg.ingress.path.clone(),
+                bw,
+                retry,
+                metrics,
+            )
+            .with_events(events.clone()),
+        );
 
         // Activation precedence (DESIGN §7.5): persisted runtime state ▸ config `enabled` ▸ default.
         let effective = match store.load_activation(&cfg.id)? {
@@ -205,11 +237,15 @@ impl Instance {
             id: cfg.id,
             active: AtomicBool::new(effective),
             config_enabled: cfg.enabled,
+            dest_kind,
+            schedule_mode,
             rescan,
+            tick_lock: tokio::sync::Mutex::new(()),
             watcher: Arc::new(Mutex::new(watcher)),
             queue,
             worker,
             store,
+            events,
         })
     }
 
@@ -219,10 +255,8 @@ impl Instance {
     }
 
     /// Set (and persist) the activation override so it survives restarts and config reloads
-    /// (DESIGN §7.5). `source` records who set it (e.g. `"control"`). The P3 `set-activation` control
-    /// message is its live trigger; exercised here by unit tests.
-    // P3 (control surface): write-side of activation; the read-side (persisted-wins) is live at build.
-    #[allow(dead_code)]
+    /// (DESIGN §7.5). `source` records who set it (e.g. `"control"`). Driven live by the P3
+    /// `set-activation` control message via [`crate::control::InstanceControl::apply_activation`].
     pub fn set_activation(&self, active: bool, source: &str, now: i64) -> Result<()> {
         self.store.set_activation(&self.id, active, source, now)?;
         self.active.store(active, Ordering::Relaxed);
@@ -230,8 +264,7 @@ impl Instance {
     }
 
     /// Clear the persisted activation override, reverting to config `enabled` (DESIGN §7.5 reset path).
-    // P3 (control surface): `set-activation { reset: true }`; exercised here by unit tests.
-    #[allow(dead_code)]
+    /// Driven by the P3 `set-activation { reset: true }` control message.
     pub fn clear_activation(&self, _now: i64) -> Result<()> {
         self.store.clear_activation(&self.id)?;
         self.active.store(self.config_enabled, Ordering::Relaxed);
@@ -245,6 +278,14 @@ impl Instance {
         if !self.is_active() {
             return;
         }
+
+        // Serialize ticks per instance: [`run`](Self::run) ticks on the periodic/OS-watch schedule
+        // while a control `trigger` ticks the same `Arc<Instance>` from the dispatcher's task. The
+        // new-file detection below (`store.get` then `enqueue`) is not atomic, so without this guard
+        // two overlapping ticks could each see a brand-new file as new and both emit `FileReady` /
+        // `ScanComplete` and double-count `discovered` (durable state stays correct — `claim_ready` is
+        // transactional — so this guard is purely event-stream/stat accuracy). Held for the whole tick.
+        let _tick = self.tick_lock.lock().await;
 
         // Discovery walk (blocking `read_dir` + per-file `metadata`, potentially over a 100k-file
         // spool) runs on the blocking pool, not a shared async worker thread (DESIGN §6.3 / the
@@ -263,10 +304,41 @@ impl Instance {
                 Vec::new()
             }
         };
+        let mut discovered: u64 = 0;
         for c in ready {
+            // A brand-new relpath (no prior durable row) is a genuine `FileReady` transition; a row
+            // that already exists (still Ready/InProgress/terminal) is a re-scan of a known file, so
+            // it is not re-announced (avoids per-rescan event spam for a backlog or a retained file).
+            let is_new = matches!(self.store.get(&self.id, &c.relpath), Ok(None));
             if let Err(e) = self.queue.enqueue(&c.relpath, c.size, c.mtime_ms, now) {
                 tracing::error!(instance = %self.id, relpath = %c.relpath, error = %e, "enqueue failed");
+                continue;
             }
+            if is_new {
+                discovered += 1;
+                self.events
+                    .instance_event(
+                        &self.id,
+                        Event::FileReady {
+                            path: c.relpath.clone(),
+                            size: c.size,
+                        },
+                        now,
+                    )
+                    .await;
+            }
+        }
+        // Announce the scan only when it actually enqueued something new (a heartbeat every rescan
+        // would be noise on the non-retained event stream); `awaiting` is the current ready backlog.
+        if discovered > 0 {
+            let awaiting = self
+                .store
+                .list_by_state(&self.id, ItemState::Ready)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0);
+            self.events
+                .instance_event(&self.id, Event::ScanComplete { discovered, awaiting }, now)
+                .await;
         }
 
         // Retry manager: promote any Failed items whose backoff gate has elapsed back to Ready. This
@@ -287,20 +359,47 @@ impl Instance {
                 return;
             }
         };
-        if batch.is_empty() {
-            return;
+        let processed = !batch.is_empty();
+        if processed {
+            let mut set: JoinSet<()> = JoinSet::new();
+            for item in batch {
+                let slot = self.queue.acquire_slot().await; // backpressure on the global cap
+                let worker = self.worker.clone();
+                set.spawn(async move {
+                    let _slot = slot; // released when the transfer finishes
+                    worker.process_item(&item, now).await;
+                });
+            }
+            while set.join_next().await.is_some() {}
         }
 
-        let mut set: JoinSet<()> = JoinSet::new();
-        for item in batch {
-            let slot = self.queue.acquire_slot().await; // backpressure on the global cap
-            let worker = self.worker.clone();
-            set.spawn(async move {
-                let _slot = slot; // released when the transfer finishes
-                worker.process_item(&item, now).await;
-            });
+        // Retained current-state (DESIGN §17.2 / FR-EVT-4): after any transition this tick produced
+        // (new discoveries and/or a processed batch, whose per-file terminal transitions have all
+        // been awaited above), republish the compact per-instance snapshot so a late/reconnecting UNS
+        // subscriber renders correctly. No-op when messaging is absent.
+        if discovered > 0 || processed {
+            self.publish_state(now).await;
         }
-        while set.join_next().await.is_some() {}
+    }
+
+    /// Republish this instance's compact current-state snapshot to the retained
+    /// `state/instances/{id}` topic (DESIGN §17.2), built from the same durable-store source as the
+    /// control plane's `get-status` reply (so a snapshot and a request/reply status match). No-op
+    /// when messaging is absent.
+    async fn publish_state(&self, now: i64) {
+        if !self.events.is_enabled() {
+            return;
+        }
+        let snapshot = instance_state_snapshot(
+            self.store.as_ref(),
+            &self.id,
+            self.is_active(),
+            self.config_enabled,
+            self.schedule_mode,
+            self.dest_kind,
+            now,
+        );
+        self.events.publish_instance_state(&self.id, snapshot).await;
     }
 
     /// Run until `cancel` fires: recover durable state, attach the OS file watcher, then tick on every
@@ -370,6 +469,61 @@ impl Instance {
     }
 }
 
+/// The P3 control-plane seam (DESIGN §16): the dispatcher drives each instance's activation,
+/// trigger, and status-facing metadata through this trait so it never depends on the engine
+/// internals. See [`crate::control::ControlPlane`].
+#[async_trait::async_trait]
+impl InstanceControl for Instance {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+    }
+
+    fn configured_enabled(&self) -> bool {
+        self.config_enabled
+    }
+
+    fn dest_label(&self) -> &str {
+        self.dest_kind
+    }
+
+    fn schedule_mode(&self) -> &str {
+        self.schedule_mode
+    }
+
+    async fn trigger_scan(&self, now: i64) {
+        // Force one full reconciliation pass now (discover → enqueue → claim → process), exactly as
+        // the periodic rescan / OS-watch nudge would. A deactivated instance's tick is a no-op.
+        self.tick(now).await;
+    }
+
+    fn apply_activation(
+        &self,
+        active: bool,
+        persist: bool,
+        source: &str,
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        if persist {
+            // Persisted override (survives restart); also flips the runtime flag.
+            self.set_activation(active, source, now)?;
+        } else {
+            // Runtime-only flip (FR-STATE-3 non-persistent path): the persisted state is untouched,
+            // so a restart reverts to it (or config `enabled`).
+            self.active.store(active, Ordering::Relaxed);
+        }
+        Ok(active)
+    }
+
+    fn reset_activation(&self, now: i64) -> anyhow::Result<bool> {
+        self.clear_activation(now)?;
+        Ok(self.is_active())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,6 +576,7 @@ mod tests {
             Arc::new(TokenBucket::unlimited()),
             None,
             &DestDeps::default(),
+            Events::disabled(),
         )
         .expect("instance builds")
     }
@@ -569,6 +724,43 @@ mod tests {
         assert_eq!(store.stats("loop").unwrap().replicated, 1, "replicated exactly once");
     }
 
+    #[tokio::test]
+    async fn instance_control_trait_drives_activation_and_trigger() {
+        // Exercises the REAL `InstanceControl` impl (the P3 control-plane seam), not the fake.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("t.txt"), b"data").unwrap();
+        let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let inst = build(instance_cfg("ictl", src.path(), dst.path(), true), store.clone());
+
+        // Metadata accessors.
+        assert_eq!(InstanceControl::id(&inst), "ictl");
+        assert!(inst.configured_enabled());
+        assert_eq!(inst.dest_label(), "local");
+        assert!(InstanceControl::is_active(&inst));
+
+        // Ephemeral deactivate: the runtime flag flips but nothing is persisted.
+        assert!(!inst.apply_activation(false, false, "control", 1).unwrap());
+        assert!(!InstanceControl::is_active(&inst));
+        assert!(
+            store.load_activation("ictl").unwrap().is_none(),
+            "a non-persistent flip leaves no durable override"
+        );
+
+        // Persistent deactivate: the override is recorded durably.
+        assert!(!inst.apply_activation(false, true, "control", 2).unwrap());
+        assert!(!store.load_activation("ictl").unwrap().unwrap().active);
+
+        // Reset reverts to config `enabled` (true) and drops the override.
+        assert!(inst.reset_activation(3).unwrap());
+        assert!(InstanceControl::is_active(&inst));
+        assert!(store.load_activation("ictl").unwrap().is_none());
+
+        // trigger_scan forces a replication pass now.
+        inst.trigger_scan(now_ms()).await;
+        assert!(dst.path().join("t.txt").exists(), "trigger replicated the file");
+    }
+
     #[test]
     fn build_rejects_multi_egress() {
         let src = tempfile::tempdir().unwrap();
@@ -587,7 +779,202 @@ mod tests {
             Arc::new(TokenBucket::unlimited()),
             None,
             &DestDeps::default(),
+            Events::disabled(),
         )
         .is_err());
+    }
+
+    // ---- P3 UNS event emission (the engine-wiring slice) ----------------------------------------
+
+    use crate::dest::{Destination, SharedDestination};
+    use crate::domain::{Delivered, ProgressSink, ResumeState, WorkItem};
+    use crate::error::{ReplError, Result as ReplResult};
+    use crate::events::test_support::recording_events;
+
+    /// A destination whose `deliver` always fails transiently — keeps the source file on disk (so a
+    /// second scan re-discovers a *known* file) for the `FileReady` dedup test.
+    struct AlwaysFail;
+    #[async_trait::async_trait]
+    impl Destination for AlwaysFail {
+        fn kind(&self) -> &'static str {
+            "failing"
+        }
+        fn supports_resume(&self) -> bool {
+            false
+        }
+        async fn deliver(
+            &self,
+            _i: &WorkItem,
+            _r: Option<ResumeState>,
+            _p: &ProgressSink,
+            _b: &Bandwidth,
+        ) -> ReplResult<Delivered> {
+            Err(ReplError::Transient("boom".into()))
+        }
+        async fn verify(
+            &self,
+            _i: &WorkItem,
+            _d: &Delivered,
+            _v: crate::config::Verify,
+        ) -> ReplResult<()> {
+            Ok(())
+        }
+        async fn abort(&self, _i: &WorkItem, _r: &ResumeState) -> ReplResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_emits_discovery_lifecycle_and_state_events() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
+        let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let (fake, events) = recording_events();
+        let inst = Instance::build(
+            instance_cfg("evt", src.path(), dst.path(), true),
+            &GlobalCfg::default(),
+            store.clone(),
+            Arc::new(Semaphore::new(8)),
+            Arc::new(TokenBucket::unlimited()),
+            None,
+            &DestDeps::default(),
+            events,
+        )
+        .expect("instance builds");
+
+        inst.tick(1_000).await;
+
+        // Instance-level discovery events on the per-instance topic.
+        let ready = fake.events_named("FileReady");
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].body["path"], serde_json::json!("a.txt"));
+        assert!(fake
+            .topics()
+            .contains(&"gw-01/file-replicator/evt/instances/evt/FileReady".to_string()));
+        let scan = fake.events_named("ScanComplete");
+        assert_eq!(scan.len(), 1);
+        assert_eq!(scan[0].body["discovered"], serde_json::json!(1));
+
+        // The worker's per-file lifecycle events rode the same emitter (Instance→Worker wiring).
+        assert_eq!(fake.events_named("ReplicationStarted").len(), 1);
+        assert_eq!(fake.events_named("ReplicationCompleted").len(), 1);
+        assert_eq!(fake.events_named("FileDeleted").len(), 1);
+
+        // The retained per-instance state snapshot was republished after the tick, and reflects the
+        // completed transfer (replicated count = 1), matching the get-status document shape.
+        let states = fake.state_snapshots();
+        assert!(!states.is_empty(), "state republished after the tick");
+        let (topic, msg) = states.last().unwrap();
+        assert_eq!(topic, "gw-01/file-replicator/state/instances/evt");
+        assert_eq!(msg.body["instance"], serde_json::json!("evt"));
+        assert_eq!(msg.body["active"], serde_json::json!(true));
+        assert_eq!(msg.body["replicated"]["count"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn tick_does_not_reemit_file_ready_for_a_known_file() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("keep.txt"), b"stays").unwrap();
+        let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let (fake, events) = recording_events();
+        let dest: SharedDestination = Arc::new(AlwaysFail);
+        let inst = Instance::build_with_dest(
+            instance_cfg("dd", src.path(), dst.path(), true),
+            &GlobalCfg::default(),
+            store.clone(),
+            Arc::new(Semaphore::new(8)),
+            Arc::new(TokenBucket::unlimited()),
+            None,
+            dest,
+            events,
+        )
+        .expect("instance builds");
+
+        // First tick: FileReady once; the transfer fails, so the source stays on disk as a Failed row.
+        inst.tick(1_000).await;
+        assert_eq!(fake.events_named("FileReady").len(), 1);
+        assert_eq!(
+            store.get("dd", "keep.txt").unwrap().unwrap().state,
+            ItemState::Failed
+        );
+
+        // Second tick: the file is re-discovered on disk but is already a tracked row → no new
+        // FileReady and no ScanComplete (nothing newly enqueued).
+        inst.tick(2_000).await;
+        assert_eq!(fake.events_named("FileReady").len(), 1, "known file not re-announced");
+        assert_eq!(fake.events_named("ScanComplete").len(), 1, "no scan heartbeat without new work");
+    }
+
+    #[tokio::test]
+    async fn concurrent_ticks_announce_a_new_file_exactly_once() {
+        // The per-instance tick guard: a control `trigger` tick and the run-loop tick on the same
+        // `Arc<Instance>` must not both announce a brand-new file. AlwaysFail keeps the source on disk
+        // (Failed row) so both ticks discover it, but only the first (serialized) sees it as new.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("c.txt"), b"data").unwrap();
+        let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let (fake, events) = recording_events();
+        let dest: SharedDestination = Arc::new(AlwaysFail);
+        let inst = Arc::new(
+            Instance::build_with_dest(
+                instance_cfg("cc", src.path(), dst.path(), true),
+                &GlobalCfg::default(),
+                store.clone(),
+                Arc::new(Semaphore::new(8)),
+                Arc::new(TokenBucket::unlimited()),
+                None,
+                dest,
+                events,
+            )
+            .expect("instance builds"),
+        );
+
+        let a = {
+            let i = inst.clone();
+            tokio::spawn(async move { i.tick(1_000).await })
+        };
+        let b = {
+            let i = inst.clone();
+            tokio::spawn(async move { i.tick(1_000).await })
+        };
+        a.await.unwrap();
+        b.await.unwrap();
+
+        assert_eq!(
+            fake.events_named("FileReady").len(),
+            1,
+            "a new file is announced exactly once across concurrent ticks"
+        );
+        assert_eq!(
+            fake.events_named("ScanComplete").len(),
+            1,
+            "only the tick that enqueued new work emits a ScanComplete"
+        );
+    }
+
+    #[tokio::test]
+    async fn deactivated_instance_emits_no_events() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"x").unwrap();
+        let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let (fake, events) = recording_events();
+        let inst = Instance::build(
+            instance_cfg("off", src.path(), dst.path(), false),
+            &GlobalCfg::default(),
+            store.clone(),
+            Arc::new(Semaphore::new(8)),
+            Arc::new(TokenBucket::unlimited()),
+            None,
+            &DestDeps::default(),
+            events,
+        )
+        .expect("instance builds");
+
+        inst.tick(1_000).await; // inactive → tick returns before any discovery/emission
+        assert!(fake.topics().is_empty(), "an inactive instance publishes nothing");
     }
 }

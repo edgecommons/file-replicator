@@ -96,8 +96,9 @@ pub struct InstanceCfg {
     /// Concurrency + bandwidth caps (per-instance; global caps live under `component.global`).
     pub limits: Option<LimitsCfg>,
     /// Per-instance UNS topic override (default is `component.global.topics.prefix`).
-    // P3 (control/events on the unified namespace): consumed by the topic builder, not the engine.
-    #[allow(dead_code)]
+    // P3: parsed and read (to warn on use), but a per-instance `prefix` override is DEFERRED — it
+    // would split an instance's command surface from its event/state stream (DESIGN §15.7); the whole
+    // component shares the component prefix in P3. The component-wide `global.topics.prefix` IS honored.
     pub topics: Option<TopicsCfg>,
 }
 
@@ -377,6 +378,10 @@ pub struct LimitsCfg {
 pub struct TopicsCfg {
     /// Topic prefix template (default `{ThingName}/file-replicator`).
     pub prefix: Option<String>,
+    /// Also answer the core `ggcommons/{thing}/config/get/{ComponentName}` GetConfiguration topic
+    /// (DESIGN §15.6). Off by default; opt in with `legacyConfigTopic: true` under
+    /// `component.global.topics`. Consumed by the P3 control plane, not the engine.
+    pub legacy_config_topic: Option<bool>,
 }
 
 /// Component-global config subtree (`component.global`, DESIGN §7.2): aggregate concurrency +

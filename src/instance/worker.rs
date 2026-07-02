@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ggcommons::metrics::MetricService;
@@ -31,6 +31,7 @@ use crate::config::{Collision, CompletionCfg, OnExhausted, OnSuccess, RetryCfg, 
 use crate::dest::SharedDestination;
 use crate::domain::{Checksum, Delivered, ItemState, ProgressSink, ResumeState, WorkItem};
 use crate::error::{ReplError, Result};
+use crate::events::{Event, Events, ProgressThrottle};
 use crate::ratelimit::Bandwidth;
 use crate::state::{StatsDelta, StateStore};
 
@@ -199,6 +200,11 @@ pub struct Worker {
     rng: Mutex<StdRng>,
     /// Optional metric emitter (`filesReplicated`/`bytesReplicated`/`filesFailed`).
     metrics: Option<Arc<dyn MetricService>>,
+    /// UNS event emitter for the per-file lifecycle events (`ReplicationStarted`/`…Progress`/
+    /// `…Completed`/`…Failed`/`FileDeleted`/`FileArchived`/`RetriesExhausted`/`FileQuarantined`,
+    /// DESIGN §17). A no-op [`Events::disabled`] by default, so a worker built without messaging (or
+    /// in a unit test) runs the exact P1/P2 pipeline with zero event overhead.
+    events: Events,
 }
 
 impl Worker {
@@ -225,7 +231,16 @@ impl Worker {
             retry,
             rng: Mutex::new(StdRng::from_entropy()),
             metrics,
+            events: Events::disabled(),
         }
+    }
+
+    /// Attach the UNS event emitter (the P3 control-plane wiring path, [`crate::app`]). Consumes and
+    /// returns `self` so it composes in [`crate::instance::Instance::build_with_dest`] before the
+    /// worker is shared behind an `Arc`. With the default [`Events::disabled`] every emit is a no-op.
+    pub fn with_events(mut self, events: Events) -> Self {
+        self.events = events;
+        self
     }
 
     /// The absolute source path for `item`, rebuilt from the ingress root and the stored `relpath`
@@ -240,6 +255,21 @@ impl Worker {
         // The store returns `relpath` only; rebuild the live absolute source path for delivery.
         let mut item = item.clone();
         item.abs_source = self.abs_source(&item);
+
+        // The item was claimed (`Ready → InProgress`) by the queue before it reached us — emit the
+        // start-of-transfer lifecycle event (DESIGN §17.1). `attempt` is 1-based (attempts so far + 1).
+        self.events
+            .instance_event(
+                &self.instance,
+                Event::ReplicationStarted {
+                    path: item.relpath.clone(),
+                    size: item.size,
+                    destination: self.dest.kind().to_string(),
+                    attempt: item.attempts + 1,
+                },
+                now,
+            )
+            .await;
 
         let state = match self.run_pipeline(&item, now).await {
             Ok(s) => s,
@@ -261,7 +291,7 @@ impl Worker {
         let resume = self
             .store
             .load_resume(&self.instance, &item.relpath, self.dest.kind())?;
-        let progress = self.progress_sink(&item.relpath);
+        let (progress, drainer) = self.make_progress(item);
 
         let outcome = async {
             let delivered = self.dest.deliver(item, resume, &progress, &self.bw).await?;
@@ -271,6 +301,13 @@ impl Worker {
             Ok::<Delivered, ReplError>(delivered)
         }
         .await;
+
+        // Drop our sink handle so the progress channel closes once every destination-held clone is
+        // gone (deliver has returned), then flush any still-queued `ReplicationProgress` events.
+        drop(progress);
+        if let Some(d) = drainer {
+            let _ = d.await;
+        }
 
         match outcome {
             Ok(delivered) => {
@@ -377,6 +414,50 @@ impl Worker {
                 bytes: bytes as i64,
             },
         )?;
+
+        // Lifecycle events (DESIGN §17.1): the completion, then the source side effect that ran.
+        self.events
+            .instance_event(
+                &self.instance,
+                Event::ReplicationCompleted {
+                    path: item.relpath.clone(),
+                    size: item.size,
+                    destination: self.dest.kind().to_string(),
+                    bytes,
+                },
+                now,
+            )
+            .await;
+        match self.completion.on_success {
+            OnSuccess::Delete => {
+                self.events
+                    .instance_event(
+                        &self.instance,
+                        Event::FileDeleted {
+                            path: item.relpath.clone(),
+                        },
+                        now,
+                    )
+                    .await;
+            }
+            OnSuccess::Archive => {
+                let archive_path = self
+                    .completion
+                    .archive_dir
+                    .as_ref()
+                    .map(|d| join_rel(d, &item.relpath).display().to_string());
+                self.events
+                    .instance_event(
+                        &self.instance,
+                        Event::FileArchived {
+                            path: item.relpath.clone(),
+                            archive_path,
+                        },
+                        now,
+                    )
+                    .await;
+            }
+        }
         Ok(ItemState::Completed)
     }
 
@@ -404,6 +485,19 @@ impl Worker {
                     attempts = item.attempts + 1, retry_at = next_attempt_at, error = %err_str,
                     "transfer failed; scheduled for retry"
                 );
+                self.events
+                    .instance_event(
+                        &self.instance,
+                        Event::ReplicationFailed {
+                            path: item.relpath.clone(),
+                            destination: self.dest.kind().to_string(),
+                            attempt: item.attempts + 1,
+                            error: err_str,
+                            next_attempt_at_ms: Some(next_attempt_at),
+                        },
+                        now,
+                    )
+                    .await;
                 Ok(ItemState::Failed)
             }
             RetryDecision::GiveUp => {
@@ -431,6 +525,18 @@ impl Worker {
                     instance = %self.instance, relpath = %item.relpath, attempts, error = %err_str,
                     "retries exhausted"
                 );
+                self.events
+                    .instance_event(
+                        &self.instance,
+                        Event::RetriesExhausted {
+                            path: item.relpath.clone(),
+                            destination: self.dest.kind().to_string(),
+                            attempts,
+                            last_error: err_str.clone(),
+                        },
+                        now,
+                    )
+                    .await;
                 self.finish_exhausted(item, &err_str, attempts, now).await
             }
         }
@@ -478,6 +584,23 @@ impl Worker {
                 }
                 self.store
                     .set_state(&self.instance, &item.relpath, ItemState::Quarantined, now)?;
+                let quarantine_path = self
+                    .completion
+                    .failed_dir
+                    .as_ref()
+                    .map(|d| join_rel(d, &item.relpath).display().to_string());
+                self.events
+                    .instance_event(
+                        &self.instance,
+                        Event::FileQuarantined {
+                            path: item.relpath.clone(),
+                            attempts,
+                            last_error: last_error.to_string(),
+                            quarantine_path,
+                        },
+                        now,
+                    )
+                    .await;
                 Ok(ItemState::Quarantined)
             }
         }
@@ -561,21 +684,80 @@ impl Worker {
         Ok(())
     }
 
-    /// A [`ProgressSink`] that persists `bytes_done` at most once per [`PROGRESS_STEP_BYTES`].
-    fn progress_sink(&self, relpath: &str) -> ProgressSink {
+    /// Build the [`ProgressSink`] the destination streams byte-progress into, plus (only when the UNS
+    /// event stream is live) a drainer task that turns those checkpoints into throttled
+    /// `ReplicationProgress` events (DESIGN §17.2 / FR-EVT-2).
+    ///
+    /// The sink persists `bytes_done` to the durable store at most once per [`PROGRESS_STEP_BYTES`]
+    /// (for `get-status`/resume) and, when events are enabled, forwards a checkpoint over an unbounded
+    /// channel — a non-blocking send from the sync callback, so the transfer never awaits the broker.
+    /// The drainer applies the percent-step/interval [`ProgressThrottle`] and publishes, ending when
+    /// the transfer drops every clone of the sink (closing the channel). When events are disabled the
+    /// sink is exactly the P1/P2 store-persist sink and no task is spawned (zero overhead, identical
+    /// behavior).
+    ///
+    /// To honor the FR-EVT-2 "0%/100% always" guarantee, the events-enabled sink forwards the **first**
+    /// observation and the **terminal** (`done == size`) report unconditionally — not just the ≥4 MiB
+    /// persist checkpoints. Otherwise the sub-4 MiB head/tail is swallowed by the persist gate and the
+    /// throttle never sees percent 0 or 100 (small files would emit no progress at all).
+    fn make_progress(&self, item: &WorkItem) -> (ProgressSink, Option<tokio::task::JoinHandle<()>>) {
         let store = self.store.clone();
         let instance = self.instance.clone();
-        let relpath = relpath.to_string();
+        let relpath = item.relpath.clone();
         let last = Arc::new(AtomicU64::new(0));
-        ProgressSink::new(move |done| {
-            let prev = last.load(Ordering::Relaxed);
-            if done.saturating_sub(prev) >= PROGRESS_STEP_BYTES {
-                last.store(done, Ordering::Relaxed);
-                if let Err(e) = store.set_bytes_done(&instance, &relpath, done, now_ms()) {
-                    tracing::debug!(relpath = %relpath, error = %e, "persist progress failed");
+
+        if !self.events.is_enabled() {
+            let sink = ProgressSink::new(move |done| {
+                persist_progress(&store, &instance, &relpath, &last, done);
+            });
+            return (sink, None);
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let events = self.events.clone();
+        let id = self.instance.clone();
+        let path = item.relpath.clone();
+        let size = item.size;
+        let destination = self.dest.kind().to_string();
+        let attempt = item.attempts + 1;
+        let drainer = tokio::spawn(async move {
+            let mut throttle = ProgressThrottle::with_defaults();
+            while let Some(done) = rx.recv().await {
+                let pct = percent_int(done, size);
+                let now = now_ms();
+                if throttle.should_emit(pct, now) {
+                    events
+                        .instance_event(
+                            &id,
+                            Event::ReplicationProgress {
+                                path: path.clone(),
+                                size,
+                                bytes_done: done,
+                                percent: pct as f64,
+                                destination: destination.clone(),
+                                attempt,
+                            },
+                            now,
+                        )
+                        .await;
                 }
             }
-        })
+        });
+
+        let size_bytes = item.size;
+        let first = Arc::new(AtomicBool::new(true));
+        let sink = ProgressSink::new(move |done| {
+            let checkpoint = persist_progress(&store, &instance, &relpath, &last, done);
+            // Always forward the first observation (→ the throttle's guaranteed 0%) and the terminal
+            // `done == size` report (→ the guaranteed 100%), plus every ≥4 MiB persist checkpoint in
+            // between. The drainer's [`ProgressThrottle`] then decides what actually publishes.
+            let is_first = first.swap(false, Ordering::Relaxed);
+            let is_terminal = size_bytes > 0 && done >= size_bytes;
+            if checkpoint || is_first || is_terminal {
+                let _ = tx.send(done);
+            }
+        });
+        (sink, Some(drainer))
     }
 
     /// Emit the completion/failure metric for a terminal state (best-effort).
@@ -595,6 +777,36 @@ impl Worker {
             let _ = m.emit_metric("fileReplicator", v).await;
         }
     }
+}
+
+/// Persist `done` bytes to the store when it advanced ≥ [`PROGRESS_STEP_BYTES`] since the last
+/// checkpoint, returning whether a checkpoint was written this call (the cadence the event drainer
+/// also rides). Best-effort: a store fault is logged at `debug!`, never fatal.
+fn persist_progress(
+    store: &Arc<dyn StateStore>,
+    instance: &str,
+    relpath: &str,
+    last: &AtomicU64,
+    done: u64,
+) -> bool {
+    let prev = last.load(Ordering::Relaxed);
+    if done.saturating_sub(prev) >= PROGRESS_STEP_BYTES {
+        last.store(done, Ordering::Relaxed);
+        if let Err(e) = store.set_bytes_done(instance, relpath, done, now_ms()) {
+            tracing::debug!(relpath = %relpath, error = %e, "persist progress failed");
+        }
+        return true;
+    }
+    false
+}
+
+/// Integer percent complete (`0..=100`) for the progress throttle. A zero-length file is `0%` until
+/// any byte lands, then `100%`.
+fn percent_int(done: u64, size: u64) -> i32 {
+    if size == 0 {
+        return if done == 0 { 0 } else { 100 };
+    }
+    (((done as f64 / size as f64) * 100.0).round() as i32).clamp(0, 100)
 }
 
 /// Join a forward-slash `relpath` onto `root`, dropping empty/`.`/`..` segments so the result always
@@ -1612,5 +1824,234 @@ mod tests {
         let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
         assert_eq!(worker.process_item(&item, 100).await, ItemState::Completed);
         assert_eq!(metrics.calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    // ---- P3 UNS event emission (the engine-wiring slice) ----------------------------------------
+
+    use crate::events::test_support::recording_events;
+
+    #[tokio::test]
+    async fn events_success_delete_emits_started_completed_deleted() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "a/b.txt", b"payload");
+        let (fake, events) = recording_events();
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            RetryPolicy::default(),
+        )
+        .with_events(events);
+
+        let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
+        assert_eq!(worker.process_item(&item, 100).await, ItemState::Completed);
+
+        // ReplicationStarted on the right per-instance topic, with size/attempt/destination.
+        let started = fake.events_named("ReplicationStarted");
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].body["path"], serde_json::json!("a/b.txt"));
+        assert_eq!(started[0].body["attempt"], serde_json::json!(1));
+        assert_eq!(started[0].body["destination"], serde_json::json!("local"));
+        assert!(fake
+            .topics()
+            .contains(&"gw-01/file-replicator/evt/instances/w/ReplicationStarted".to_string()));
+
+        // ReplicationCompleted carries the delivered byte count, then FileDeleted (onSuccess=delete).
+        let done = fake.events_named("ReplicationCompleted");
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].body["bytes"], serde_json::json!(7));
+        let deleted = fake.events_named("FileDeleted");
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].body["path"], serde_json::json!("a/b.txt"));
+        assert!(fake.events_named("FileArchived").is_empty(), "delete, not archive");
+    }
+
+    #[tokio::test]
+    async fn events_success_archive_emits_file_archived_with_path() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let archive = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "r.csv", b"1,2,3");
+        let mut comp = completion(OnSuccess::Archive);
+        comp.archive_dir = Some(archive.path().to_path_buf());
+        let (fake, events) = recording_events();
+        let worker = local_worker(store.clone(), src.path(), dst.path(), comp, RetryPolicy::default())
+            .with_events(events);
+
+        let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
+        assert_eq!(worker.process_item(&item, 100).await, ItemState::Completed);
+
+        let archived = fake.events_named("FileArchived");
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].body["path"], serde_json::json!("r.csv"));
+        let ap = archived[0].body["archivePath"].as_str().unwrap();
+        assert!(ap.ends_with("r.csv"), "archivePath points at the moved file: {ap}");
+        assert!(fake.events_named("FileDeleted").is_empty(), "archive, not delete");
+    }
+
+    #[tokio::test]
+    async fn events_transient_failure_emits_replication_failed_with_next_attempt() {
+        let src = tempfile::tempdir().unwrap();
+        let store = store();
+        store.upsert_ready(INST, "f", 10, 0, 1).unwrap();
+        let dest: SharedDestination = Arc::new(FailingDest {
+            err: || ReplError::Transient("network".into()),
+        });
+        let (fake, events) = recording_events();
+        let worker = Worker::new(
+            INST.into(),
+            store.clone(),
+            dest,
+            completion(OnSuccess::Delete),
+            src.path().to_path_buf(),
+            Bandwidth::unlimited(),
+            RetryPolicy::default(),
+            None,
+        )
+        .with_events(events);
+
+        let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
+        assert_eq!(worker.process_item(&item, 100).await, ItemState::Failed);
+
+        let failed = fake.events_named("ReplicationFailed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].body["willRetry"], serde_json::json!(true));
+        assert_eq!(failed[0].body["attempt"], serde_json::json!(1));
+        assert!(failed[0].body["error"].as_str().unwrap().contains("network"));
+        assert!(failed[0].body.get("nextAttemptAt").is_some(), "retry has a scheduled next attempt");
+        assert!(fake.events_named("RetriesExhausted").is_empty());
+    }
+
+    #[tokio::test]
+    async fn events_exhaustion_emits_retries_exhausted_then_quarantined() {
+        let src = tempfile::tempdir().unwrap();
+        let failed = tempfile::tempdir().unwrap();
+        let store = store();
+        std::fs::write(src.path().join("bad.dat"), b"oops").unwrap();
+        store.upsert_ready(INST, "bad.dat", 4, 0, 1).unwrap();
+        let mut comp = completion(OnSuccess::Delete);
+        comp.on_exhausted = OnExhausted::Quarantine;
+        comp.failed_dir = Some(failed.path().to_path_buf());
+        let dest: SharedDestination = Arc::new(FailingDest {
+            err: || ReplError::Permanent("denied".into()),
+        });
+        let (fake, events) = recording_events();
+        let worker = Worker::new(
+            INST.into(),
+            store.clone(),
+            dest,
+            comp,
+            src.path().to_path_buf(),
+            Bandwidth::unlimited(),
+            RetryPolicy::default(),
+            None,
+        )
+        .with_events(events);
+
+        let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
+        assert_eq!(worker.process_item(&item, 100).await, ItemState::Quarantined);
+
+        let exhausted = fake.events_named("RetriesExhausted");
+        assert_eq!(exhausted.len(), 1);
+        assert_eq!(exhausted[0].body["attempts"], serde_json::json!(1));
+        assert!(exhausted[0].body["lastError"].as_str().unwrap().contains("denied"));
+
+        let quarantined = fake.events_named("FileQuarantined");
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].body["path"], serde_json::json!("bad.dat"));
+        assert!(quarantined[0].body["quarantinePath"].as_str().unwrap().ends_with("bad.dat"));
+        // A permanent failure never rides the retry path.
+        assert!(fake.events_named("ReplicationFailed").is_empty());
+    }
+
+    #[tokio::test]
+    async fn events_progress_emitted_for_a_large_transfer() {
+        // A file larger than PROGRESS_STEP_BYTES (4 MiB) drives at least one throttled progress
+        // checkpoint through the drainer → a ReplicationProgress event.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store = store();
+        let big = vec![7u8; (PROGRESS_STEP_BYTES as usize) * 2 + 1024];
+        enqueue_file(&store, src.path(), "big.bin", &big);
+        let (fake, events) = recording_events();
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            RetryPolicy::default(),
+        )
+        .with_events(events);
+
+        let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
+        assert_eq!(worker.process_item(&item, 100).await, ItemState::Completed);
+
+        let progress = fake.events_named("ReplicationProgress");
+        assert!(!progress.is_empty(), "a multi-checkpoint transfer emits progress");
+        let p0 = &progress[0].body;
+        assert_eq!(p0["path"], serde_json::json!("big.bin"));
+        assert_eq!(p0["destination"], serde_json::json!("local"));
+        assert!(p0["bytesDone"].as_u64().unwrap() > 0);
+        assert!(p0["percent"].as_f64().unwrap() >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn events_progress_honors_zero_and_hundred_percent_endpoints() {
+        // FR-EVT-2 "0%/100% always": the first observation and the terminal report (done == size →
+        // 100%) must both reach the throttle end-to-end, even though the sub-4-MiB head/tail never
+        // crosses the 4 MiB persist gate. Regression for the review finding that the 100%-always
+        // guarantee was unreachable in the real pipeline. Sized >13 MiB so the first 64 KiB chunk
+        // rounds to a genuine 0% (a smaller file's first observation is already >0%).
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store = store();
+        let big = vec![9u8; 13 * 1024 * 1024];
+        enqueue_file(&store, src.path(), "big.bin", &big);
+        let (fake, events) = recording_events();
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            RetryPolicy::default(),
+        )
+        .with_events(events);
+
+        let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
+        assert_eq!(worker.process_item(&item, 100).await, ItemState::Completed);
+
+        let progress = fake.events_named("ReplicationProgress");
+        assert!(progress.len() >= 2, "at least the 0% and 100% endpoints, got {}", progress.len());
+        assert!(progress.len() <= 50, "still throttled, not one per chunk (got {})", progress.len());
+        let percents: Vec<f64> =
+            progress.iter().filter_map(|m| m.body["percent"].as_f64()).collect();
+        assert!(percents.contains(&0.0), "the 0% endpoint is emitted (got {percents:?})");
+        assert!(percents.contains(&100.0), "the 100% endpoint is emitted (got {percents:?})");
+        let last = progress.last().unwrap();
+        assert_eq!(last.body["percent"], serde_json::json!(100.0), "final progress is 100%");
+        assert_eq!(last.body["bytesDone"].as_u64().unwrap(), big.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn events_disabled_worker_publishes_nothing() {
+        // The default (no messaging) worker runs the identical pipeline with zero events.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "x.txt", b"data");
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            RetryPolicy::default(),
+        ); // no .with_events(...)
+        let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
+        assert_eq!(worker.process_item(&item, 100).await, ItemState::Completed);
+        // Nothing to assert on a fake — the point is it neither panics nor spawns a drainer.
     }
 }

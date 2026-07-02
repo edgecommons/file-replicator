@@ -25,10 +25,12 @@ jobs:
 
   coverage:
     # The 90% line-coverage gate (NFR-2 / DESIGN §18 / CLAUDE.md), actually RUN here (the reusable
-    # component-ci only does build/test/clippy). `dest/s3/client.rs` is the live-infra S3 SDK-call seam
-    # — excluded like ggcommons excludes `testutil.rs` — so the floci S3 integration tests (which
-    # self-skip when floci is down, keeping CI green) never contribute to the gate; the unit tests must
-    # meet the floor on their own.
+    # component-ci only does build/test/clippy). Excluded from the denominator: `dest/s3/client.rs` (the
+    # live-infra S3 SDK-call seam, like ggcommons excludes `testutil.rs`) AND the self-skipping
+    # integration-test files (`tests/s3_floci.rs`, `tests/p3_control_emqx.rs`) — this coverage job
+    # provisions no floci/EMQX, so those tests early-return and their (large) bodies would otherwise
+    # count as uncovered, eroding the margin the gate is meant to rest on. The UNIT tests must meet the
+    # floor on their own.
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -47,8 +49,8 @@ jobs:
           git config --global \
             url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/".insteadOf \
             "https://github.com/"
-      - name: Coverage gate (90% lines; S3 SDK-call seam excluded)
+      - name: Coverage gate (90% lines; S3 SDK-call seam + self-skipping integration tests excluded)
         run: >
           cargo llvm-cov --features dest-s3
-          --ignore-filename-regex '(testutil|dest.s3.client)\.rs'
+          --ignore-filename-regex '(testutil|dest.s3.client|p3_control_emqx|s3_floci)\.rs'
           --fail-under-lines 90

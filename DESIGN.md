@@ -197,7 +197,7 @@ IDs follow the ecosystem `FR-<AREA>-<n>` convention. RFC-2119 keywords.
 - **FR-EVT-1** — Publish lifecycle events on the UNS with intelligent defaults: file discovered/ready, upload started/progress(throttled)/completed/failed, file archived/deleted/quarantined, retries-exhausted, schedule-triggered, window-opened/closed, scan-complete, **instance-activated/deactivated**, component-ready.
 - **FR-EVT-2** — Progress events MUST be **throttled** (percent delta and/or time).
 - **FR-EVT-3** — Events MUST carry enough context (instance, relative path, size, bytes-done, destination, attempt) to drive a UI without extra lookups.
-- **FR-EVT-4** — Current per-instance/component **state** MUST be published **retained** so a fresh subscriber (edge UI or cloud) gets the latest snapshot on connect (§15, §17).
+- **FR-EVT-4** — Current per-instance/component **state** MUST be published **retained** so a fresh subscriber (edge UI or cloud) gets the latest snapshot on connect (§15, §17). **Implementation status (P3): a KNOWN GAP.** The ggcommons Rust `MessagingService` exposes no MQTT retain flag today, so state is published **non-retained** (best-effort): live subscribers see every snapshot on each transition, but a subscriber that connects *after* the last snapshot will not receive it. The reliable current-state-on-demand path is the `cmd/status` request/reply, which works regardless. Closing the gap needs a one-line, four-language ggcommons enhancement (`publish_retained`) — see the module docs in `src/events.rs`. We do NOT fake retention (no periodic republish spam).
 
 ---
 
@@ -836,8 +836,14 @@ the inconsistent `ggcommons/` root and add the `class` layer (§15.6).
 | Activate/deactivate | cmd | `…/cmd/instances/{instance}/activation`  body `{active,persist,reset}` | — |
 | Instance events | evt | `…/evt/instances/{instance}/{event}` | no |
 | Component events | evt | `…/evt/{event}` (e.g. `component-ready`) | no |
-| Instance current state | state | `…/state/instances/{instance}` | **yes** |
-| Component current state | state | `…/state` | **yes** |
+| Instance current state | state | `…/state/instances/{instance}` | **yes**¹ |
+| Component current state | state | `…/state` | **yes**¹ |
+
+¹ **Retained is the target; not yet met in P3.** The ggcommons Rust `MessagingService` has no retain
+flag, so `state/…` is published **non-retained** today (see FR-EVT-4 and `src/events.rs`). The
+component still publishes the current-state snapshot on every transition *and* an initial snapshot at
+startup, so live subscribers stay in sync; only the connect-after-the-fact case degrades (use
+`cmd/status` for reliable current state on demand).
 
 Deepest topic = `…/cmd/instances/{instance}/activation` = **5 slashes** (well under 7). Replies use the
 request's `reply_to` (ephemeral) — no fixed reply topics.
@@ -899,6 +905,19 @@ a *shared* non-IoT-Core broker that want an app namespace can prepend one here. 
 there's no ThingName-uniqueness enforcement, so set a unique `-t/--thing` per HOST deployment (the default
 identity would otherwise collide).
 
+**Per-instance override — P3 status.** A `component.global.topics.prefix` (component-wide) override IS
+honored in P3. A *per-instance* `instances[].topics.prefix` override is parsed but **deferred**
+(warned and ignored): honoring only the instance's events/state on the override root while its
+`cmd/instances/{id}/…` control surface stays on the component root would split an instance's namespace
+into two half-reachable halves. In P3 the whole component — `cmd`, `evt`, and `state` — shares one
+prefix so the namespace is consistent and every instance is addressable at one root. (The builder in
+`uns.rs` still resolves an instance override for when the feature is enabled in a later phase.)
+
+**Budget guard.** Every built topic — including the control-plane `cmd/#` subscribe filter and the
+legacy alias — passes an internal guard checking all three §15.1 rules (≤256 bytes, ≤7 slashes, no
+`$`-leading level). A violation warns but never panics (a hostile ThingName / over-long override
+prefix must not crash the engine); at worst the broker rejects the publish/subscribe.
+
 ---
 
 ## 16. Control-message suite
@@ -932,6 +951,13 @@ framework** — each component wires its own handlers — so we build a small lo
 }
 ```
 
+**P3 reporting notes.** `schedule.mode` reports the **configured** mode verbatim (`immediate` /
+`cron` / `window`) — never a hardcoded literal — so an instance an operator set to a window is not
+misrepresented as `immediate` (cron/window *execution* is P4; the window-state sub-fields
+`window`/`windowClosesAt` land then). `link` is **omitted** in P3: there is no destination
+circuit-breaker yet (P4, §13.4), so asserting `"Connected"` for an instance failing every transfer
+against an unreachable endpoint would be a lie — the field returns once it can be derived truthfully.
+
 ---
 
 ## 17. Status/event publishing (realtime UI)
@@ -957,8 +983,15 @@ ggcommons `Message`; `header.name = "FileReplicatorEvent"`, `version = "1.0"`; `
 - **Throttling (FR-EVT-2):** progress on ≥`progressPercentStep` (default 10%) **or** every
   `progressIntervalSecs` (default 5s); `0%`/`100%` always. QoS `AtMostOnce` for progress, `AtLeastOnce` for
   lifecycle transitions.
-- **Retained state (FR-EVT-4):** after each transition the component republishes the compact per-instance
-  state to `state/instances/{id}` (retained), so a late UI/cloud subscriber renders correctly on connect.
+- **0%/100% always:** the endpoints are guaranteed — the worker forwards the first observation and the
+  terminal (`bytes_done == size`) report to the throttle unconditionally, past the internal 4 MiB
+  persist-checkpoint gate, so a small file (or the sub-4 MiB tail of a large one) still yields the
+  0%/100% events. Between them the throttle applies the percent-step/interval gate.
+- **Retained state (FR-EVT-4):** after each transition — and at startup for an idle component — the
+  component republishes the compact per-instance state to `state/instances/{id}` (and the component
+  roster to `state`), so a UI/cloud subscriber renders correctly. **Interim (P3): non-retained** — a
+  late-connecting subscriber does not get the last snapshot until the next transition; see the FR-EVT-4
+  gap note and use `cmd/status` for reliable current state on demand.
 
 ---
 
@@ -1047,7 +1080,7 @@ rehash of the config keys.
 | **P0 — Scaffold** | Repo from the Rust template; config model; module stubs; CI caller + gate; docs shell; registry PR. | build/test/clippy green; empty engine runs on HOST. |
 | **P1 — Core engine (local)** | Watcher + readiness(stability) + durable store(**SQLite**) + worker + completion(delete/archive/**quarantine**) + integrity(checksum) + retry + **bandwidth cap** + **activation**, local dest, immediate mode. | Move files local→local, crash-safe, verified, bandwidth-limited, activate/deactivate persists; 3 platforms; ≥90% cov. |
 | **P2 — S3 destination** | Size-adaptive PutObject/multipart, parallel parts, **acceleration/trailing-checksum/unsigned-PUT**, resumable, **ambient creds**+`$secret`. | Validated vs floci + a real bucket; resume-after-kill + 2-day-outage sim proven. |
-| **P3 — Control + events + UNS** | UNS topic layer; control dispatcher (get-config/get-status/trigger/set-activation); event publisher + retained state; metrics. | Live status + activation via control msg; UI-ready UNS stream + retained snapshots; cloud-bridge wildcard test. |
+| **P3 — Control + events + UNS** | UNS topic layer; control dispatcher (get-config/get-status/trigger/set-activation); event publisher + current-state snapshots; metrics. | Live status + activation via control msg; UI-ready UNS stream + current-state snapshots (**retained pending the ggcommons `publish_retained` enhancement — interim: live/non-retained, FR-EVT-4**); cloud-bridge wildcard test. |
 | **P4 — Scheduling & windows** | `croner` cron + window(open/close/duration) + `onWindowClose` pause/resume; English sugar. | Windowed uploads incl. overnight/DST; mid-window pause/resume proven. |
 | **P5 — More destinations** | SFTP/FTPS, HTTP(S), then Azure/GCS (features off default until stable). | Each validated + resume where supported. |
 | **P6 — Multi-destination fan-out** | Lift `len==1`; parallel fan-out + aggregate completion. | N-dest delivery, per-dest retry, single completion. |
