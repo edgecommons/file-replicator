@@ -633,6 +633,10 @@ impl Worker {
         }
         self.store
             .set_state(&self.instance, &item.relpath, ItemState::Completed, now)?;
+        tracing::info!(
+            instance = %self.instance, relpath = %item.relpath,
+            action = ?self.completion.on_success, "item completed; source side-effect applied"
+        );
         // Clear every destination's resume checkpoint + per-destination completion bookkeeping only
         // AFTER Completed is durable, so a crash in the aggregate Verified→Completed gap still finds
         // the expected-checksum checkpoints and per-dest `Verified` phases recovery needs (DESIGN §20-B).
@@ -998,6 +1002,12 @@ async fn run_one_dest(ctx: DestAttemptCtx) -> Result<(String, DestOutcome)> {
     let resume = store.load_resume(&instance, &item.relpath, &label)?;
     let attempt = attempts_so_far.saturating_add(1);
 
+    tracing::info!(
+        instance = %instance, relpath = %item.relpath, dest = %label,
+        size = item.size, attempt, resuming = resume.is_some(),
+        "delivering to destination"
+    );
+
     events
         .instance_event(
             &instance,
@@ -1044,6 +1054,10 @@ async fn run_one_dest(ctx: DestAttemptCtx) -> Result<(String, DestOutcome)> {
             // destination's transfer is complete.
             save_verified_checkpoint(&store, &instance, &item.relpath, &label, &delivered);
             store.set_dest_phase(&instance, &item.relpath, &label, DestPhase::Verified, now)?;
+            tracing::info!(
+                instance = %instance, relpath = %item.relpath, dest = %label,
+                bytes = delivered.bytes, attempt, "destination delivered + verified"
+            );
             events
                 .instance_event(
                     &instance,
