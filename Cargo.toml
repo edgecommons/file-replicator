@@ -77,9 +77,16 @@ dest-gcs = ["dep:reqwest", "reqwest/json", "dep:base64", "ggcommons/credentials"
 # ggcommons Rust library, pinned to a commit on edgecommons/ggcommons (private). Building standalone needs
 # read access to that repo. The fetch goes through the git CLI (see .cargo/config.toml); locally use your
 # gh/git credential helper, and CI's reusable workflow rewrites the https URL with EDGECOMMONS_READ_TOKEN.
-# For local development against the sibling checkout, the gitignored .cargo/config.toml `paths` override
-# points cargo at ../ggcommons/libs/rust (Windows + WSL) — no Cargo.toml edit needed.
-ggcommons = { git = "https://github.com/edgecommons/ggcommons.git", rev = "cc037a92c1780c3d88cc98885cfdefec0403a898", default-features = false }
+#
+# UNS MIGRATION NOTE: this code REQUIRES the UNS core (top-level `identity`, `gg.uns()`, `gg.commands()`,
+# the reserved-class guard, the `data()`/`events()`/`app()` class facades), which today lives only on the
+# local `feat/unified-namespace` branch — not yet on the remote. Cargo must be able to load the
+# patched-over source, so the pin below is the current remote `main` (pre-UNS, a resolvable placeholder —
+# the same one the sibling `uns-bridge`/`telemetry-processor` pin). LOCAL DEV builds against the sibling
+# checkout via the gitignored `.cargo/config.toml` `paths` override, which replaces this source outright.
+# Do the real pin bump (to the UNS-core rev, regenerating Cargo.lock) once feat/unified-namespace lands on
+# main. A pure git-rev build does NOT compile until then.
+ggcommons = { git = "https://github.com/edgecommons/ggcommons.git", rev = "5865d3b14e947e8e0355ca4fcc470f1f2bb31f52", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

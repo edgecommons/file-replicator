@@ -1,14 +1,20 @@
 # file-replicator — Requirements & Design
 
-> **Status:** DRAFT for review · **Version:** 0.2 (revised after review round 1) · **Date:** 2026-07-01
+> **Status:** v0.2 design, **implemented through P6** of §21 (P0–P6 shipped; P7 optional core-promotion
+> outstanding — see `git log --oneline` for the per-phase commits) · **Version:** 0.2 (revised after review
+> round 1) · **Date:** 2026-07-01 (design) / updated 2026-07-03 to flag implementation status
 > **Component:** `file-replicator` · **Full name:** `com.mbreissi.edgecommons.FileReplicator`
 > **Category:** `sink` (northbound delivery) · **Language:** Rust · **Library:** `ggcommons`
 > **Platforms:** HOST · GREENGRASS · KUBERNETES
 
-This document is the single review artifact. It captures **what** the component does (requirements) and
-**how** it is built (design), grounded in EdgeCommons conventions (`telemetry-processor` as the Rust
-template, the `ggcommons` library API, and the org registry/CI/docs plumbing). Nothing is implemented yet —
-this is for review before scaffolding.
+This document is the original review artifact, and its requirements/rationale remain authoritative. It
+captures **what** the component does (requirements) and **how** it is built (design), grounded in
+EdgeCommons conventions (`telemetry-processor` as the Rust template, the `ggcommons` library API, and the
+org registry/CI/docs plumbing). **This intro paragraph predates scaffolding and is now stale on that one
+point** — P0 through P6 of §21's phase plan have since been implemented and are CI-gated at 90% line
+coverage (`.github/workflows/ci.yml`); only P7 (optional) remains. Inline notes elsewhere in this document
+tagged with a phase (e.g. "P3 status", "P5 note") already reflect the shipped code as of the phase they
+name and do not need correction — check `src/` before assuming a gap noted there has since been closed.
 
 ### Changes since v0.1 (review round 1)
 
@@ -104,7 +110,7 @@ cargo features so a build pulls only what it needs.
 |---|---|
 | **Instance** | One watched-directory specification = one `component.instances[]` entry (the standard ggcommons instance idiom, as `telemetry-processor` uses routes). Unit of config, isolation, statistics, activation, and control. |
 | **Ingress** | The source: local directory, optional recursion, readiness policy, include/exclude globs. |
-| **Egress** | Destination(s): an ordered **list** of delivery targets. v1 enforces exactly one; schema + engine are multi-destination-ready (§20-B). |
+| **Egress** | Destination(s): an ordered **list** of delivery targets. Originally v1 was to enforce exactly one, with the schema + engine multi-destination-ready for later (§20-B) — **multi-destination fan-out has since shipped (P6)**: `N >= 1` entries fan out independently. |
 | **Schedule** | *When* work runs: `immediate` (on arrival, default), `cron` (point trigger), or `window` (a recurring open→close span). |
 | **Window** | A recurring time span (`open`→`close`, cron-defined) during which uploads are permitted; work outside waits for the next window. |
 | **Completion** | Source-file lifecycle after **all** egress succeed: `delete` or `archive`; on retry-exhaustion, `quarantine` (Failed folder). |
@@ -132,9 +138,13 @@ IDs follow the ecosystem `FR-<AREA>-<n>` convention. RFC-2119 keywords.
 
 ### 4.2 Egress / destinations (EGR)
 
-- **FR-EGR-1** — Destination types: **local** + **S3** (v1); **SFTP/FTPS**, **HTTP(S)**, **Azure Blob**, **GCS** (designed, phased).
-- **FR-EGR-2** — Egress is an **ordered list** per instance; **v1 validates exactly one**; multi-destination fan-out fully specified (§20-B).
-- **FR-EGR-3** (multi, future) — File **Completed only when ALL destinations succeed**; each retries **independently**; completion fires once.
+- **FR-EGR-1** — Destination types: **local** + **S3** (default-on); **SFTP/FTPS**, **HTTP(S)**, **Azure
+  Blob**, **GCS** — all shipped (P5), each behind its own off-by-default cargo feature pending
+  crate-maturity confidence (Azure/GCS) or a live integration test (FTPS).
+- **FR-EGR-2** — Egress is an **ordered list** per instance; originally speced as "v1 validates exactly
+  one, multi-destination fan-out specified for later (§20-B)" — **fan-out has since shipped (P6)**:
+  `N >= 1` is validated (an empty list is rejected), and every entry fans out independently.
+- **FR-EGR-3** (shipped P6, not merely future) — File **Completed only when ALL destinations succeed**; each retries **independently**; completion fires once.
 - **FR-EGR-4** — Configurable **path/prefix mapping** per destination; preserves the recursive subtree.
 - **FR-EGR-5** — MUST report **per-file progress** (bytes / total) to drive events + statistics.
 - **FR-EGR-6** — Destinations that support it MUST **resume a partial transfer** rather than restart (§13).
@@ -166,7 +176,7 @@ IDs follow the ecosystem `FR-<AREA>-<n>` convention. RFC-2119 keywords.
 - **FR-REL-4** — MUST be **idempotent** on re-delivery (stable keys; verify-before-complete).
 - **FR-REL-5** — MUST apply **concurrency backpressure**: bounded in-flight files per instance and globally.
 - **FR-REL-6** — MUST support a **bandwidth cap** (bytes/sec) per instance **and** a global aggregate cap (§13.5).
-- **FR-REL-7** — MUST **tolerate long disconnections** (hours to ~2 days): keep retrying within `giveUpAfter`, resume in-flight uploads, and avoid reconnect thundering-herd via a disconnection circuit-breaker (§13.4).
+- **FR-REL-7** — MUST **tolerate long disconnections** (hours to ~2 days): keep retrying within `giveUpAfter`, resume in-flight uploads, and avoid reconnect thundering-herd via a disconnection circuit-breaker (§13.4). **Status:** `giveUpAfter` + resume shipped (P1/P2); the **circuit-breaker itself is not yet implemented** (`Event::Disconnected`/`Reconnected` are `Deferred` variants in `src/events.rs`) — this sub-requirement remains open, not just undocumented.
 
 ### 4.6 Activation & state (STATE)
 
@@ -780,10 +790,13 @@ The retry model is built for hours-to-~2-days offline:
 - **Transient vs permanent classification.** Connectivity/timeouts/5xx/throttling = transient (back off,
   keep trying). Auth-denied / no-such-bucket / object-too-large / precondition = permanent (fail fast to
   `Exhausted` without burning days). Documented per backend.
-- **Disconnection circuit-breaker.** On sustained failures the instance enters a `Disconnected` state and
-  probes on the `maxDelay` cadence instead of hammering every file — avoiding a thundering herd when the link
-  returns; on first success it re-opens and drains the queue (oldest-first). Emits `Disconnected` /
-  `Reconnected` events.
+- **Disconnection circuit-breaker — designed, not yet implemented.** On sustained failures the instance
+  would enter a `Disconnected` state and probe on the `maxDelay` cadence instead of hammering every file —
+  avoiding a thundering herd when the link returns; on first success it re-opens and drains the queue
+  (oldest-first), emitting `Disconnected`/`Reconnected` events. As of P6 this remains a gap: the two event
+  variants exist in `src/events.rs` but are marked `Deferred` — nothing currently triggers them, and
+  `get-status`'s `link` field stays omitted rather than assert a connectivity state the engine can't yet
+  derive truthfully (§16).
 - **Resume, not restart.** In-flight uploads resume from persisted checkpoints after the outage (and across
   any reboots during it, thanks to durable state, §14).
 - **MPU lifecycle interplay.** S3 incomplete-multipart-upload lifecycle-abort age must exceed `giveUpAfter`
@@ -829,12 +842,14 @@ isn't crash-safe, use redb" test resolves in SQLite's favor — SQLite *is* cras
 | Build cost | none | one C amalgamation compile (Linux builders + Windows both have the toolchain now) |
 | Binary/runtime | slightly smaller | statically linked, no runtime dep |
 
-**Decision: SQLite** (`rusqlite` with the `bundled` feature, WAL mode) — confirmed by review. The
-status/statistics surface (FR-CTL-2) and per-file diagnostics map directly onto SQL, and an on-disk SQLite
-file an operator can inspect is a real advantage for a data-moving component. The only cost — a C compile at
-build time — is now negligible (all build targets have the toolchain; the runtime binary is statically linked
-with no external dep). **`redb` is retained only as a `state-redb` fallback feature** behind the same
-`state.rs` trait (backend swappable, does not leak into the engine).
+**Decision: SQLite** (`rusqlite` with the `bundled` feature, WAL mode) — confirmed by review, and shipped in
+P1 as the sole `StateStore` implementation (`SqliteStore`, `src/state.rs`). The status/statistics surface
+(FR-CTL-2) and per-file diagnostics map directly onto SQL, and an on-disk SQLite file an operator can
+inspect is a real advantage for a data-moving component. The only cost — a C compile at build time — is now
+negligible (all build targets have the toolchain; the runtime binary is statically linked with no external
+dep). **`redb` was proposed as a `state-redb` fallback feature** behind the same `state.rs` trait (backend
+swappable, does not leak into the engine) — **this was never built**: no `redb` dependency or `state-redb`
+Cargo feature exists as of P6. Treat it as an unbuilt future option, not shipped behavior.
 
 ### 14.2 Schema (SQLite)
 
@@ -944,21 +959,30 @@ flowchart LR
 `thing` is globally unique, so bridging (`#`, or per-thing) preserves distinctness with **no location segments
 needed**. Consumers select with wildcards: all file-replicator state across the fleet
 (`+/file-replicator/state/#`), one edge (`{thing}/file-replicator/#`), one instance
-(`+/file-replicator/evt/instances/{id}/#`). Retained `state/…` gives a dashboard the latest snapshot on
-connect. Location filtering (site/enterprise) happens on the envelope `tags` (consumer-side or a cloud rule),
-since those aren't reliable enough to sit in the path.
+(`+/file-replicator/evt/instances/{id}/#`). `state/…` is meant to give a dashboard the latest snapshot on
+connect via retain — still not met as of P6 (§15.3 footnote; non-retained interim). Location filtering
+(site/enterprise) happens on the envelope `tags` (consumer-side or a cloud rule), since those aren't
+reliable enough to sit in the path.
 
 ### 15.6 Reconciling with ggcommons core
 
 Core publishes heartbeat/metrics under `ggcommons/{ThingName}/{ComponentName}/…` and answers
 `GetConfiguration` on `ggcommons/{ThingName}/config/get/{ComponentName}`. Our scheme intentionally keeps
-core's `{thing}/{component}` ordering — minus the `ggcommons/` root, plus the `class` layer. Plan:
-1. **file-replicator** uses `{thing}/file-replicator/{class}/…` now.
+core's `{thing}/{component}` ordering — minus the `ggcommons/` root, plus the `class` layer. Plan (status as
+of P6, this repo's `git log`):
+1. **file-replicator** uses `{thing}/file-replicator/{class}/…` now. — ✅ shipped (P3, `src/uns.rs`).
 2. **Optional legacy alias:** also answer the core `ggcommons/{thing}/config/get/{component}` for
-   `GetConfiguration` so existing config-source clients keep working (`legacyConfigTopic: true`).
+   `GetConfiguration` so existing config-source clients keep working (`legacyConfigTopic: true`). — ✅
+   shipped (P3; `legacy_config_topic()` in `src/uns.rs`, wired in `src/control.rs`) — this was still framed
+   as a future "plan" step in earlier drafts of this doc.
 3. **Separate core proposal:** drop the `ggcommons/` root and adopt the `class` layer across core
    (four-language parity) → one consistent, bridge-safe namespace ecosystem-wide. This is the proper home for
-   the "promote to core" idea (§16, §20-E).
+   the "promote to core" idea (§16, §20-E). — ⬜ **not done via this proposal**: nothing from
+   file-replicator's UNS/control-surface design has been promoted into `ggcommons` (P7 remains unstarted,
+   §21). Note for anyone reconciling this later: `ggcommons` is independently mid-flight on a *much* larger,
+   differently-shaped UNS rework of its own (`ecv1/{device}/{component}/{instance}/{class}[/channel]`, see
+   `ggcommons/docs/platform/UNS-CANONICAL-DESIGN.md`, branch `feat/unified-namespace`, unmerged as of this
+   check) — that effort is unrelated to and does not incorporate this section's specific proposal.
 
 ### 15.7 Configurability & non-IoT-Core brokers
 
@@ -1063,7 +1087,12 @@ ggcommons `Message`; `header.name = "FileReplicatorEvent"`, `version = "1.0"`; `
 - **Metrics** (`gg.metrics()`): `files_discovered`, `files_replicated`, `files_failed`, `files_quarantined`,
   `bytes_replicated`, `in_progress`, `queue_depth`, `retry_count`, `bandwidth_bytes_per_sec`,
   `link_connected` (gauge), `instance_active` (gauge), `upload_duration_ms`. Target resolves per platform
-  (prometheus on k8s, log elsewhere).
+  (prometheus on k8s, log elsewhere). **As shipped (P3, not previously audited against this list):** only a
+  subset exists, under the `"fileReplicator"` metric group with camelCase names —
+  `filesReplicated`/`bytesReplicated` on completion and a single `filesFailed` covering both `Quarantined`
+  and `Retained` outcomes (`src/instance/worker.rs`'s `emit`). The rest of this list — discovery/in-progress/
+  queue-depth/retry-count/bandwidth/link/activation/duration metrics — has no emission call anywhere in
+  `src/` as of P6; treat them as still-designed, not shipped.
 - **Platform** entirely via the ggcommons resolver (HOST→FILE/MQTT, GG→GG_CONFIG/IPC, K8S→CONFIGMAP/MQTT);
   no `#[cfg(platform)]` in engine code; cargo features gate backends + the Linux-only `greengrass` (IPC)
   feature (OFF by default). Health `/livez` `/readyz` `/startupz` + JSON logging from the library on k8s.
@@ -1074,8 +1103,10 @@ ggcommons `Message`; `header.name = "FileReplicatorEvent"`, `version = "1.0"`; `
   ConfigMap whole-volume mount for hot-reload; Downward-API identity; health/metrics ports); `test-configs/`
   (HOST).
 - **CI:** one caller → `edgecommons/.github/.github/workflows/component-ci.yml@main`
-  (`language: RUST`, `rust-features: "dest-s3,dest-sftp,dest-http"`, `secrets: inherit`) + in-repo 90% gate
-  (`cargo llvm-cov --fail-under-lines 90`).
+  (`language: RUST`, `secrets: inherit`) + in-repo 90% gate (`cargo llvm-cov --fail-under-lines 90`). As
+  shipped (P5/P6), `.github/workflows/ci.yml`'s `rust-features` covers every destination —
+  `"dest-s3,dest-sftp,dest-ftps,dest-http,dest-azure,dest-gcs"` — wider than the `dest-s3,dest-sftp,
+  dest-http` sketched here at design time.
 
 ---
 
@@ -1118,7 +1149,8 @@ rehash of the config keys.
   propose the reusable core **control-surface + UNS** standard separately (§15.4). ✔
 - **F. Durable state — DECIDED → SQLite** (`rusqlite` bundled, WAL): crash-safe *and* the better functional
   fit for the status/statistics surface + operational introspection, now that the C toolchain is available
-  (§14). `redb` retained only as a `state-redb` fallback feature behind the same `state.rs` trait. ✔
+  (§14) — shipped as `SqliteStore`. `redb` was proposed as a `state-redb` fallback feature behind the same
+  `state.rs` trait but **was never implemented** (no `redb` dep/feature exists as of P6). ✔
 - **G. Category — ACCEPTED:** registry `category: "sink"`. ✔
 - **H. UNS shape — REVISED per review:** `{thing}/{component}/{class}/{resource…}` — dropped
   `edgecommons` root, `v1` (envelope carries version), and `site`/`enterprise` (unreliable tags → envelope);
@@ -1138,16 +1170,16 @@ rehash of the config keys.
 
 ## 21. Phased implementation plan
 
-| Phase | Scope | Exit criteria |
-|---|---|---|
-| **P0 — Scaffold** | Repo from the Rust template; config model; module stubs; CI caller + gate; docs shell; registry PR. | build/test/clippy green; empty engine runs on HOST. |
-| **P1 — Core engine (local)** | Watcher + readiness(stability) + durable store(**SQLite**) + worker + completion(delete/archive/**quarantine**) + integrity(checksum) + retry + **bandwidth cap** + **activation**, local dest, immediate mode. | Move files local→local, crash-safe, verified, bandwidth-limited, activate/deactivate persists; 3 platforms; ≥90% cov. |
-| **P2 — S3 destination** | Size-adaptive PutObject/multipart, parallel parts, **acceleration/trailing-checksum/unsigned-PUT**, resumable, **ambient creds**+`$secret`. | Validated vs floci + a real bucket; resume-after-kill + 2-day-outage sim proven. |
-| **P3 — Control + events + UNS** | UNS topic layer; control dispatcher (get-config/get-status/trigger/set-activation); event publisher + current-state snapshots; metrics. | Live status + activation via control msg; UI-ready UNS stream + current-state snapshots (**retained pending the ggcommons `publish_retained` enhancement — interim: live/non-retained, FR-EVT-4**); cloud-bridge wildcard test. |
-| **P4 — Scheduling & windows** | `croner` cron + window(open/close/duration) + `onWindowClose` pause/resume; English sugar. | Windowed uploads incl. overnight/DST; mid-window pause/resume proven. |
-| **P5 — More destinations** | SFTP/FTPS, HTTP(S), then Azure/GCS (features off default until stable). | Each validated + resume where supported. |
-| **P6 — Multi-destination fan-out** | Lift `len==1`; parallel fan-out + aggregate completion. | N-dest delivery, per-dest retry, single completion. |
-| **P7 — Core promotion (optional)** | Extract UNS + control-surface helper → ggcommons (4-lang). | Parity + gates in all four langs. |
+| Phase | Scope | Exit criteria | Status |
+|---|---|---|---|
+| **P0 — Scaffold** | Repo from the Rust template; config model; module stubs; CI caller + gate; docs shell; registry PR. | build/test/clippy green; empty engine runs on HOST. | ✅ shipped (`19e1ec8`) |
+| **P1 — Core engine (local)** | Watcher + readiness(stability) + durable store(**SQLite**) + worker + completion(delete/archive/**quarantine**) + integrity(checksum) + retry + **bandwidth cap** + **activation**, local dest, immediate mode. | Move files local→local, crash-safe, verified, bandwidth-limited, activate/deactivate persists; 3 platforms; ≥90% cov. | ✅ shipped (`1aafd3a`) |
+| **P2 — S3 destination** | Size-adaptive PutObject/multipart, parallel parts, **acceleration/trailing-checksum/unsigned-PUT**, resumable, **ambient creds**+`$secret`. | Validated vs floci + a real bucket; resume-after-kill + 2-day-outage sim proven. | ✅ shipped (`40b79e4`) |
+| **P3 — Control + events + UNS** | UNS topic layer; control dispatcher (get-config/get-status/trigger/set-activation); event publisher + current-state snapshots; metrics. | Live status + activation via control msg; UI-ready UNS stream + current-state snapshots (**retained pending the ggcommons `publish_retained` enhancement — interim: live/non-retained, FR-EVT-4**); cloud-bridge wildcard test. | ✅ shipped (`86d7f4f`) — the retained-state gap is still open (unchanged; see §15.3 footnote) |
+| **P4 — Scheduling & windows** | `croner` cron + window(open/close/duration) + `onWindowClose` pause/resume; English sugar. | Windowed uploads incl. overnight/DST; mid-window pause/resume proven. | ✅ shipped (`301082d`) — the destination disconnection circuit-breaker (§13.4) and its `get-status` `link`/window sub-fields were bundled with this phase in earlier drafts of this doc but are **still not implemented** (`Event::Disconnected`/`Reconnected` are `Deferred` enum variants in `src/events.rs`) |
+| **P5 — More destinations** | SFTP/FTPS, HTTP(S), then Azure/GCS (features off default until stable). | Each validated + resume where supported. | ✅ shipped (`a4f4bdb`) |
+| **P6 — Multi-destination fan-out** | Lift `len==1`; parallel fan-out + aggregate completion. | N-dest delivery, per-dest retry, single completion. | ✅ shipped (`830d5a2`) |
+| **P7 — Core promotion (optional)** | Extract UNS + control-surface helper → ggcommons (4-lang). | Parity + gates in all four langs. | ⬜ not started — no such promotion exists in `ggcommons` as of this check (a separate, independently-designed UNS rework is underway there on the unmerged `feat/unified-namespace` branch, unrelated to this proposal) |
 
 Validation: HOST→Windows + EMQX/floci; GREENGRASS→lab-5950x; k8s→kind + lab-k3s; Rust `greengrass` build→WSL.
 
@@ -1178,7 +1210,7 @@ Validation: HOST→Windows + EMQX/floci; GREENGRASS→lab-5950x; k8s→kind + la
 | `ggcommons` | the library | pinned by git rev; local sibling via `.cargo/config.toml` (gitignored) |
 | `tokio` | async runtime | `rt-multi-thread,macros,signal,time,sync,fs` |
 | `notify` | filesystem watch | already used by the ggcommons config watcher |
-| **`rusqlite`** (bundled) | durable state | **decided (§14)**; WAL, statically linked. `redb` = `state-redb` fallback |
+| **`rusqlite`** (bundled) | durable state | **decided (§14) and shipped** (`SqliteStore`); WAL, statically linked. `redb`/`state-redb` was proposed as a fallback but never built — no such dependency/feature exists |
 | **`croner`** + `chrono` + `chrono-tz` | cron + windows, TZ/DST | pure-Rust; alternatives `cron`/`saffron` |
 | `globset` | include/exclude globs | pure-Rust |
 | `crc32c` / `sha2` | integrity | pure-Rust |
@@ -1203,6 +1235,14 @@ dest-gcs   = ["dep:google-cloud-storage"]     # OFF (maturity)
 state-redb = ["dep:redb"]                     # pure-Rust durable-state alternative to bundled SQLite
 ```
 
+> **As-shipped note (2026-07-03):** this was the pre-scaffold sketch; the real `Cargo.toml` (P0–P6) has
+> since diverged in a few particulars worth knowing before relying on this block — `dest-ftps` is its own
+> feature using `suppaftp` (not folded into `dest-sftp`), `dest-gcs` drives GCS's resumable-upload protocol
+> directly over `reqwest` rather than the `google-cloud-storage` crate, and **`state-redb` was never
+> added** — there is no `redb` dependency or feature in the shipped `Cargo.toml`; SQLite (`SqliteStore`) is
+> the only `StateStore` implementation. See `Cargo.toml`'s own `[features]` comments for the current,
+> authoritative list.
+
 ### 22.3 Repo scaffold (created after approval)
 
 ```
@@ -1221,12 +1261,17 @@ file-replicator/
 
 ### Review checklist
 
-- ✅ **§14 (F)** — durable state = **SQLite** (decided).
-- ✅ **§15 (H)** — UNS = `{thing}/file-replicator/{cmd|evt|state}/…` (revised per review; confirm §15.2 reads right).
-- ⬜ **§12** — cron-first + English sugar; confirm the window model (open/close/duration) fits your phrasings.
-- ⬜ **§13.3** — Failed-folder default (`retainInPlace` vs `quarantine`).
-- ⬜ **§13.4** — `giveUpAfter` default (7d) + circuit-breaker for long outages.
-- ⬜ **§11.5** — ambient-creds-by-default for S3.
-- ⬜ **§21** — phase ordering (P1 local + P2 S3 = usable MVP).
+> **Update (2026-07-03):** every item below was an open sign-off decision at v0.2 draft time. Since then
+> P0–P6 have been implemented, and each decision was resolved one way or another *in code* — resolved as
+> follows:
 
-On sign-off I'll scaffold P0 and open the registry PR.
+- ✅ **§14 (F)** — durable state = **SQLite** (decided, and shipped as `SqliteStore`, `src/state.rs`).
+- ✅ **§15 (H)** — UNS = `{thing}/file-replicator/{cmd|evt|state}/…` (revised per review; shipped in P3, `src/uns.rs`).
+- ✅ **§12** — cron-first + English sugar shipped as designed in P4 (`src/schedule/{cron,sugar,window}.rs`); the open/close/duration window model is implemented and unit-tested.
+- ✅ **§13.3** — Failed-folder default resolved as `retainInPlace` (shipped default in `src/config.rs`'s `CompletionCfg`; `quarantine` is the opt-in).
+- ⚠️ **§13.4** — `giveUpAfter` default (7d) **shipped** (P1, time-governed retry); the long-outage **circuit-breaker** itself is **still not implemented** (`Event::Disconnected`/`Reconnected` remain `Deferred` in `src/events.rs`) — this part of the decision is still genuinely open, not just undocumented.
+- ✅ **§11.5** — ambient-creds-by-default for S3 shipped in P2 (`src/dest/s3/`).
+- ✅ **§21** — phase ordering (P1 local + P2 S3 = usable MVP) followed exactly; P0–P6 shipped in order (see `git log --oneline`), P7 (optional) not started.
+
+The original closing line ("On sign-off I'll scaffold P0 and open the registry PR") is stale — P0 was
+scaffolded and P1–P6 followed; see the phase table in §21 for current status.

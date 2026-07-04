@@ -256,7 +256,6 @@ mod tests {
             completion,
             retry: None,
             limits: None,
-            topics: None,
             on_permission_error: None,
             priority: 100,
         }

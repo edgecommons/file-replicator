@@ -8,10 +8,13 @@ can be activated/deactivated per instance from the control plane, and publishes 
 unified namespace for realtime UIs. Runs standalone (**HOST**), on **Greengrass** (IPC), and on
 **Kubernetes** (ConfigMap) via the `ggcommons` library.
 
-> **Status: design + scaffold (P0).** The authoritative specification is
+> **Status: implemented through P6** (local + S3 + control/events/UNS + cron/window scheduling + SFTP/
+> FTPS/HTTP/Azure/GCS + multi-destination fan-out — see `DESIGN.md` §21 and `git log`). Only P7 (optional
+> core promotion) is outstanding. The authoritative specification is
 > [`DESIGN.md`](https://github.com/edgecommons/file-replicator/blob/main/DESIGN.md) in the repo root. These
-> docs are authored per implementation phase (see DESIGN §21) and validated against the source — start with
-> the design doc for anything not yet covered here.
+> docs are authored per implementation phase and validated against the source, but as of P6 several pages
+> still describe an earlier phase than what's shipped — start with the design doc and `src/` for anything
+> that looks out of date here.
 
 ## Where to go
 

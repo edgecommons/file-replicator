@@ -151,7 +151,9 @@ destination, and then follows the **existing, unchanged** retry/quarantine decis
 handling here is observability, not a new failure-handling branch. (See `src/permission.rs`.)
 
 ## The unified namespace
-All command/event/state topics are rooted on the globally-unique ThingName:
-`{thing}/file-replicator/{cmd|evt|state}/…` — RESTful, within IoT Core's 256-byte/7-slash limits, and
-cloud-bridge-safe (identity is in the topic). Retained `state/…` gives dashboards a snapshot on connect.
-(DESIGN §15.)
+Commands and events ride the ggcommons UNS core: `ecv1/{device}/FileReplicator/{instance}/{cmd|evt}/…`
+(minted by the library's `commands()`/`events()` facades, not a hand-rolled topic builder — see
+`docs/reference/messaging-interface.md`). There is no dashboard-facing retained `state/…` snapshot: the
+UNS `state` class is reserved to the library's own RUNNING/STOPPED keepalive, and a dashboard wanting an
+instance's current picture calls `get-status` (a `cmd` verb) instead — which is what a late-connecting
+subscriber always had to fall back to anyway.

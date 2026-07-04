@@ -2,7 +2,9 @@
 
 Complete, annotated configs for real scenarios. This library grows per phase and each sample is validated
 against the config parser (`src/config.rs`) — not against other docs. The two below are parseable today
-(they are covered by the `config.rs` unit tests); scheduling/S3-runtime behaviour lands in P2/P4.
+(they are covered by the `config.rs` unit tests); scheduling and S3-runtime behaviour actually ship too
+(P2/P4 both landed — see `DESIGN.md` §21 and `git log`), so both samples below are fully runnable, not
+just parseable.
 
 Every instance lives under `component.instances[]`; the standard ggcommons sections (`messaging`,
 `credentials`, `logging`, `heartbeat`, `metricEmission`, `tags`) sit alongside `component`. Full field
@@ -70,6 +72,8 @@ reference: [Reference › Configuration](reference/configuration.md).
 }
 ```
 
-More samples (SFTP, HTTP, Azure/GCS, multi-readiness, per-platform HOST/GG/k8s variants) are added as those
-capabilities ship. See [`DESIGN.md`](https://github.com/edgecommons/file-replicator/blob/main/DESIGN.md)
-§7 for additional annotated examples.
+More samples (SFTP, HTTP, Azure/GCS, multi-readiness, per-platform HOST/GG/k8s variants) are still to be
+added to this page — those destination/scheduling capabilities have already shipped (P5/P6, off-by-default
+cargo features per DESIGN §10.2), the gap here is authoring, not implementation. See
+[`DESIGN.md`](https://github.com/edgecommons/file-replicator/blob/main/DESIGN.md) §7 for additional
+annotated examples in the meantime.

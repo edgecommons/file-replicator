@@ -23,7 +23,6 @@ use crate::events::{Event, Events};
 use crate::instance::{now_ms, Instance};
 use crate::ratelimit::{parse_byte_rate, SystemClock, TokenBucket};
 use crate::state::{SqliteStore, StateStore};
-use crate::uns::Topics;
 
 /// Split instance configs into the ones to keep (first occurrence of each id) and the ids that were
 /// dropped as duplicates. Instance identity keys every durable-state table, so a duplicate id must
@@ -140,21 +139,15 @@ impl App {
         #[cfg(feature = "dest-s3")]
         let deps = deps.with_credentials(gg.credentials());
 
-        // P3 control/event plane (DESIGN §15-§17). Resolve the shared messaging handle once —
-        // absent on some platforms, in which case the whole UNS layer degrades to a no-op and the
-        // P1/P2 engine runs unchanged (DESIGN §6) — plus the component-level topic prefix and the
-        // envelope thing/tags. Every instance's [`Events`] emitter uses the SAME component-level prefix
-        // so an instance's whole namespace — its `cmd` surface, `evt` stream, and retained `state` — is
-        // consistent and reachable at one root. A per-instance `topics.prefix` override (§15.7) is
-        // parsed but NOT honored in P3 (it would split an instance's command surface from its event
-        // stream — see the warning below); it is deferred to a later phase.
-        let msg = gg.messaging().ok();
-        if msg.is_none() {
+        // Control/event plane (DESIGN §15-§17, migrated onto the ggcommons UNS core). Messaging may be
+        // absent on some platforms, in which case every `events()`/`commands()` call below degrades to
+        // a no-op (or is simply never registered) and the P1/P2 engine runs unchanged (DESIGN §6).
+        if gg.messaging().is_err() {
             tracing::warn!("messaging unavailable; UNS control/event plane disabled (engine runs normally)");
         }
-        let global_prefix = global.topics.as_ref().and_then(|t| t.prefix.clone());
-        let thing = self.config.thing_name.clone();
-        let tags = self.config.parsed.tags.clone();
+        // The component-level ("main" instance) event emitter — `ComponentReady` and the control
+        // plane's scope-`"all"` `ScheduleTriggered` (crate::control module docs).
+        let main_events = Events::new(gg.events());
 
         // Build + spawn each instance under a shared cancellation token, keeping a control-plane
         // handle per instance (the same `Arc`, so the dispatcher drives the live instance).
@@ -168,19 +161,18 @@ impl App {
         let mut disabled_infos: Vec<crate::control::DisabledInstanceInfo> = Vec::new();
         for cfg in instances_cfg {
             let id = cfg.id.clone();
-            // A per-instance `topics.prefix` override is deferred (§15.7): honoring it here would put
-            // this instance's events/state on its override root while its `cmd/instances/{id}/…`
-            // control surface stays on the component root — a split, half-unreachable namespace. In P3
-            // the whole component shares the component prefix; warn and ignore an instance override.
-            if cfg.topics.as_ref().and_then(|t| t.prefix.as_deref()).is_some() {
-                tracing::warn!(
-                    instance = %id,
-                    "per-instance topics.prefix override is not honored in P3 (the component shares one \
-                     prefix for cmd/evt/state so the namespace stays consistent); ignoring"
-                );
-            }
-            let topics = Arc::new(Topics::from_config(&self.config, global_prefix.as_deref(), None));
-            let events = Events::new(msg.clone(), topics, thing.clone(), tags.clone());
+            // Mint this instance's own bound `events()` facade once, while `gg` is in scope (an owned
+            // value — `EventsFacade` does not borrow `GgCommons` — so it can be handed into the
+            // long-lived `Instance`/`Worker`; see `crate::events` module docs). A UNS-token-invalid id
+            // (forbidden chars — `/ + # \` or control chars) degrades to a disabled emitter rather than
+            // aborting the whole component over a naming quirk (DESIGN §6-style graceful degradation).
+            let events = match gg.instance(&id) {
+                Ok(inst) => Events::new(inst.events()),
+                Err(e) => {
+                    tracing::error!(instance = %id, error = %e, "invalid UNS instance id; events disabled for this instance");
+                    Events::disabled()
+                }
+            };
 
             // Feature A startup validation (§2 of the design): probe the instance's ingress/egress/
             // archive/failed directories BEFORE building it, and apply the resolved policy. A violation
@@ -195,15 +187,11 @@ impl App {
                     "startup permission/access check failed"
                 );
                 events
-                    .instance_event(
-                        &id,
-                        Event::PermissionDenied {
-                            path: v.path.display().to_string(),
-                            role: v.role.as_str().to_string(),
-                            error: v.msg.clone(),
-                        },
-                        now_ms(),
-                    )
+                    .emit(Event::PermissionDenied {
+                        path: v.path.display().to_string(),
+                        role: v.role.as_str().to_string(),
+                        error: v.msg.clone(),
+                    })
                     .await;
             }
             match crate::permission::apply_policy(policy, &violations) {
@@ -287,15 +275,19 @@ impl App {
             );
         }
 
-        // P3 control plane (DESIGN §15/§16): subscribe the `cmd/#` topic space on the Unified
-        // Namespace and answer get-config / get-status / trigger / set-activation via `reply_to`.
-        // Messaging may be absent on some platforms — the plane then degrades to a no-op (DESIGN §6).
+        // Control plane (DESIGN §15/§16, migrated onto `gg.commands()`): registers `get-status` /
+        // `trigger` / `set-activation` on the component command inbox — the built-in `ping` /
+        // `reload-config` / `get-configuration` verbs answer everything the old custom `cmd/config`
+        // verb used to (see `crate::control` module docs). No-op when no messaging transport was wired
+        // (`gg.commands()` is then `None` — DESIGN §6).
         let control = Arc::new(
-            ControlPlane::build(msg.clone(), &self.config, &global, store.clone(), control_instances)
+            ControlPlane::new(self.config.clone(), store.clone(), control_instances, main_events.clone())
                 .with_disabled(disabled_infos),
         );
-        if let Err(e) = control.clone().start().await {
-            tracing::warn!(error = %e, "control plane failed to subscribe; continuing without it");
+        if let Some(commands) = gg.commands() {
+            control.clone().register(&commands);
+        } else {
+            tracing::warn!("no command inbox available; control plane verbs not registered");
         }
 
         tracing::info!(
@@ -306,34 +298,17 @@ impl App {
         );
         gg.set_ready(true);
 
-        // Component-ready lifecycle event on the UNS (DESIGN §17.1), on the component-level prefix.
-        // No-op when messaging is absent.
-        Events::new(
-            msg.clone(),
-            Arc::new(Topics::from_config(&self.config, global_prefix.as_deref(), None)),
-            thing.clone(),
-            tags.clone(),
-        )
-        .component_event(
-            Event::ComponentReady {
+        // Component-ready lifecycle event (DESIGN §17.1), on the component-level ("main" instance)
+        // emitter. No-op when messaging is absent.
+        main_events
+            .emit(Event::ComponentReady {
                 instances: handles.len() as u64,
                 version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-            now_ms(),
-        )
-        .await;
-
-        // Seed the retained current-state topics (DESIGN §15.3 / §17.2 / FR-EVT-4) so a UI/cloud
-        // subscriber that connects to an idle component still renders every instance's state and the
-        // component roster — otherwise an instance that has not ticked yet appears on no state topic.
-        // No-op when messaging is absent.
-        control.publish_initial_state(now_ms()).await;
+            })
+            .await;
 
         gg.shutdown_signal().await;
         tracing::info!("shutdown signal received; stopping instances");
-        // Unsubscribe the control topics first so no command is accepted mid-shutdown (and no broker
-        // subscription is orphaned), then cancel the instance run loops.
-        control.stop().await;
         cancel.cancel();
         for h in handles {
             if let Err(e) = h.await {
@@ -371,7 +346,6 @@ mod tests {
             completion: Default::default(),
             retry: None,
             limits: None,
-            topics: None,
             on_permission_error: None,
             priority: 100,
         }

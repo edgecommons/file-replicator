@@ -68,7 +68,6 @@ fn local_cfg(id: &str, src: &Path, dst: &Path, completion: CompletionCfg) -> Ins
         completion,
         retry: None,
         limits: None,
-        topics: None,
         on_permission_error: None,
         priority: 100,
     }
@@ -433,7 +432,6 @@ async fn failed_delivery_retries_then_quarantines_while_other_instance_unaffecte
             max_attempts: Some(2),
         }),
         limits: None,
-        topics: None,
         on_permission_error: None,
         priority: 100,
     };
@@ -730,7 +728,6 @@ async fn completion_does_not_fire_when_verify_fails() {
             max_attempts: None,
         }),
         limits: None,
-        topics: None,
         on_permission_error: None,
         priority: 100,
     };

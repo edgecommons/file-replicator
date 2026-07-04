@@ -40,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::admission::PriorityGate;
 use crate::config::{EgressCfg, GlobalCfg, InstanceCfg, ScheduleCfg, WindowClose};
-use crate::control::{instance_state_snapshot, InstanceControl};
+use crate::control::InstanceControl;
 use crate::dest::{build_destination, DestDeps, SharedDestination};
 use crate::domain::{ItemState, WorkItem};
 use crate::error::Result;
@@ -81,8 +81,8 @@ pub struct Instance {
     /// one destination, or every configured destination's label joined with `"+"` for a fan-out
     /// instance (e.g. `"local+s3"`, DESIGN §20-B).
     dest_kind: String,
-    /// The configured schedule mode (`"immediate"`/`"cron"`/`"window"`) reported by `get-status` and
-    /// the retained state snapshot (DESIGN §16), driven live by [`schedule`](Self::schedule).
+    /// The configured schedule mode (`"immediate"`/`"cron"`/`"window"`) reported by `get-status`
+    /// (DESIGN §16), driven live by [`schedule`](Self::schedule).
     schedule_mode: &'static str,
     /// The parsed schedule (DESIGN §12); [`Schedule::admission`] gates every tick's claim.
     schedule: Schedule,
@@ -108,10 +108,11 @@ pub struct Instance {
     /// Held for the activation write-side ([`set_activation`](Self::set_activation) /
     /// [`clear_activation`](Self::clear_activation)) and the P3 `get-status` store queries.
     store: Arc<dyn StateStore>,
-    /// UNS event emitter for this instance's discovery events (`FileReady`/`ScanComplete`) and the
-    /// retained per-instance `state/instances/{id}` republish (DESIGN §17). A no-op
-    /// [`Events::disabled`] when messaging is absent (or in unit tests), so the P1/P2 engine runs
-    /// unchanged. The worker holds a clone for the per-file lifecycle events.
+    /// UNS event emitter for this instance's discovery events (`FileReady`/`ScanComplete`) and
+    /// lifecycle events, bound once to this instance's own `gg.instance(id).events()` facade (see
+    /// `crate::app`/`crate::events` module docs). A no-op [`Events::disabled`] when messaging is
+    /// absent (or in unit tests), so the P1/P2 engine runs unchanged. The worker holds a clone for the
+    /// per-file lifecycle events.
     events: Events,
     /// Feature A dedup-log state for **ingress** permission/access errors on this instance's watched
     /// directory (`src/permission.rs`) — the "log once, not per rescan" gate for [`report_scan_issues`].
@@ -298,7 +299,7 @@ impl Instance {
         // documented `finishCurrent` fallback handles that single-destination case already, and the
         // same fallback now covers "at least one destination can't resume"). `dest_kind` is every
         // configured destination's label, joined (`"local"` for N=1, `"local+s3"` for N=2, …) — the
-        // short label surfaced in `get-status`/the retained state snapshot.
+        // short label surfaced in `get-status`.
         let dest_kind = dests
             .iter()
             .map(|d| d.kind())
@@ -465,28 +466,22 @@ impl Instance {
             if is_new {
                 discovered += 1;
                 self.events
-                    .instance_event(
-                        &self.id,
-                        Event::FileReady {
-                            path: c.relpath.clone(),
-                            size: c.size,
-                        },
-                        now,
-                    )
+                    .emit(Event::FileReady {
+                        path: c.relpath.clone(),
+                        size: c.size,
+                    })
                     .await;
             }
         }
         // Announce the scan only when it actually enqueued something new (a heartbeat every rescan
-        // would be noise on the non-retained event stream); `awaiting` is the current ready backlog.
+        // would be noise on the evt stream); `awaiting` is the current ready backlog.
         if discovered > 0 {
             let awaiting = self
                 .store
                 .list_by_state(&self.id, ItemState::Ready)
                 .map(|v| v.len() as u64)
                 .unwrap_or(0);
-            self.events
-                .instance_event(&self.id, Event::ScanComplete { discovered, awaiting }, now)
-                .await;
+            self.events.emit(Event::ScanComplete { discovered, awaiting }).await;
         }
 
         // Retry manager: promote any Failed items whose backoff gate has elapsed back to Ready. This
@@ -509,46 +504,33 @@ impl Instance {
             self.evaluate_schedule(ms_to_utc(now))
         };
         if transition.triggered {
-            self.events
-                .instance_event(&self.id, Event::ScheduleTriggered { scope: self.id.clone() }, now)
-                .await;
+            self.events.emit(Event::ScheduleTriggered { scope: self.id.clone() }).await;
         }
         if transition.window_opened {
-            self.events
-                .instance_event(&self.id, Event::WindowOpened { window: self.window_label() }, now)
-                .await;
+            self.events.emit(Event::WindowOpened { window: self.window_label() }).await;
         }
         if transition.window_closed {
             // The common case: the previous windowed batch (if any) fully drained before `close_at`,
             // so the close is only discovered on this later tick — no transfer to pause here (a close
             // caught mid-transfer is instead handled synchronously in `run_batch_windowed`).
-            self.events
-                .instance_event(&self.id, Event::WindowClosed { window: self.window_label() }, now)
-                .await;
-            self.events
-                .instance_event(&self.id, Event::ScheduleComplete { mode: "window".to_string() }, now)
-                .await;
+            self.events.emit(Event::WindowClosed { window: self.window_label() }).await;
+            self.events.emit(Event::ScheduleComplete { mode: "window".to_string() }).await;
         }
 
-        let processed = match admission {
-            Admission::All { drain } => self.run_admitted(drain, now).await,
-            Admission::None => false,
-            Admission::Windowed { close_at, on_close } => {
-                self.run_windowed(close_at, on_close, now).await
+        // The return value used to also gate a retained-state republish (dropped — see events.rs's
+        // module docs: `state` is now a reserved, library-owned UNS class); the calls themselves still
+        // run for their side effects (persisting/delivering the admitted batch).
+        match admission {
+            Admission::All { drain } => {
+                self.run_admitted(drain, now).await;
             }
-        };
-        if transition.triggered {
-            self.events
-                .instance_event(&self.id, Event::ScheduleComplete { mode: "cron".to_string() }, now)
-                .await;
+            Admission::None => {}
+            Admission::Windowed { close_at, on_close } => {
+                self.run_windowed(close_at, on_close, now).await;
+            }
         }
-
-        // Retained current-state (DESIGN §17.2 / FR-EVT-4): after any transition this tick produced
-        // (new discoveries and/or a processed batch, whose per-file terminal transitions have all
-        // been awaited above), republish the compact per-instance snapshot so a late/reconnecting UNS
-        // subscriber renders correctly. No-op when messaging is absent.
-        if discovered > 0 || processed {
-            self.publish_state(now).await;
+        if transition.triggered {
+            self.events.emit(Event::ScheduleComplete { mode: "cron".to_string() }).await;
         }
     }
 
@@ -576,15 +558,11 @@ impl Instance {
                     "ingress directory permission denied; will not spam this every rescan"
                 );
                 self.events
-                    .instance_event(
-                        &self.id,
-                        Event::PermissionDenied {
-                            path: path.clone(),
-                            role: Role::Ingress.as_str().to_string(),
-                            error: msg,
-                        },
-                        now,
-                    )
+                    .emit(Event::PermissionDenied {
+                        path: path.clone(),
+                        role: Role::Ingress.as_str().to_string(),
+                        error: msg,
+                    })
                     .await;
             } else {
                 // Other unreadable-directory kinds (e.g. NotFound — a watched subdir was removed) still
@@ -771,9 +749,7 @@ impl Instance {
                     // tick's `evaluate_schedule` sees it already closed and does not also fire
                     // `transition.window_closed` for this same close.
                     self.sched_track.lock().expect("schedule track mutex").window_open = false;
-                    self.events
-                        .instance_event(&self.id, Event::WindowClosed { window: self.window_label() }, now)
-                        .await;
+                    self.events.emit(Event::WindowClosed { window: self.window_label() }).await;
                     let cancel = matches!(on_close, WindowClose::PauseResume) && self.dest_supports_resume;
                     if cancel {
                         set.abort_all();
@@ -787,9 +763,7 @@ impl Instance {
             }
         }
         if closed {
-            self.events
-                .instance_event(&self.id, Event::ScheduleComplete { mode: "window".to_string() }, now)
-                .await;
+            self.events.emit(Event::ScheduleComplete { mode: "window".to_string() }).await;
         }
         closed
     }
@@ -831,26 +805,6 @@ impl Instance {
                 ),
             }
         }
-    }
-
-    /// Republish this instance's compact current-state snapshot to the retained
-    /// `state/instances/{id}` topic (DESIGN §17.2), built from the same durable-store source as the
-    /// control plane's `get-status` reply (so a snapshot and a request/reply status match). No-op
-    /// when messaging is absent.
-    async fn publish_state(&self, now: i64) {
-        if !self.events.is_enabled() {
-            return;
-        }
-        let snapshot = instance_state_snapshot(
-            self.store.as_ref(),
-            &self.id,
-            self.is_active(),
-            self.config_enabled,
-            self.schedule_mode,
-            &self.dest_kind,
-            now,
-        );
-        self.events.publish_instance_state(&self.id, snapshot).await;
     }
 
     /// Run until `cancel` fires: recover durable state, attach the OS file watcher, then tick on every
@@ -1020,6 +974,10 @@ impl InstanceControl for Instance {
         self.clear_activation(now)?;
         Ok(self.is_active())
     }
+
+    async fn notify(&self, ev: Event) {
+        self.events.emit(ev).await;
+    }
 }
 
 #[cfg(test)]
@@ -1061,7 +1019,6 @@ mod tests {
             },
             retry: None,
             limits: None,
-            topics: None,
             on_permission_error: None,
             priority: 100,
         }
@@ -1473,13 +1430,11 @@ mod tests {
 
         inst.tick(1_000).await;
 
-        // Instance-level discovery events on the per-instance topic.
+        // Instance-level discovery events (the facade-derived topic itself is ggcommons' own tested
+        // concern — see the `crate::events` module docs' "Testability" note).
         let ready = fake.events_named("FileReady");
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].body["path"], serde_json::json!("a.txt"));
-        assert!(fake
-            .topics()
-            .contains(&"gw-01/file-replicator/evt/instances/evt/FileReady".to_string()));
         let scan = fake.events_named("ScanComplete");
         assert_eq!(scan.len(), 1);
         assert_eq!(scan[0].body["discovered"], serde_json::json!(1));
@@ -1489,15 +1444,9 @@ mod tests {
         assert_eq!(fake.events_named("ReplicationCompleted").len(), 1);
         assert_eq!(fake.events_named("FileDeleted").len(), 1);
 
-        // The retained per-instance state snapshot was republished after the tick, and reflects the
-        // completed transfer (replicated count = 1), matching the get-status document shape.
-        let states = fake.state_snapshots();
-        assert!(!states.is_empty(), "state republished after the tick");
-        let (topic, msg) = states.last().unwrap();
-        assert_eq!(topic, "gw-01/file-replicator/state/instances/evt");
-        assert_eq!(msg.body["instance"], serde_json::json!("evt"));
-        assert_eq!(msg.body["active"], serde_json::json!(true));
-        assert_eq!(msg.body["replicated"]["count"], serde_json::json!(1));
+        // The retained state snapshot republish is gone (DESIGN: `state` is now a reserved,
+        // library-owned UNS class — see `crate::events` module docs); the durable-store-backed
+        // `get-status` document is exercised directly in `crate::control`'s tests.
     }
 
     #[tokio::test]
@@ -1603,7 +1552,7 @@ mod tests {
         .expect("instance builds");
 
         inst.tick(1_000).await; // inactive → tick returns before any discovery/emission
-        assert!(fake.topics().is_empty(), "an inactive instance publishes nothing");
+        assert!(fake.is_empty(), "an inactive instance publishes nothing");
     }
 
     // ---- P4 scheduling: engine gating (cron / window admission) ---------------------------------

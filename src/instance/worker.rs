@@ -679,13 +679,9 @@ impl Worker {
         match self.completion.on_success {
             OnSuccess::Delete => {
                 self.events
-                    .instance_event(
-                        &self.instance,
-                        Event::FileDeleted {
-                            path: item.relpath.clone(),
-                        },
-                        now,
-                    )
+                    .emit(Event::FileDeleted {
+                        path: item.relpath.clone(),
+                    })
                     .await;
             }
             OnSuccess::Archive => {
@@ -695,14 +691,10 @@ impl Worker {
                     .as_ref()
                     .map(|d| join_rel(d, &item.relpath).display().to_string());
                 self.events
-                    .instance_event(
-                        &self.instance,
-                        Event::FileArchived {
-                            path: item.relpath.clone(),
-                            archive_path,
-                        },
-                        now,
-                    )
+                    .emit(Event::FileArchived {
+                        path: item.relpath.clone(),
+                        archive_path,
+                    })
                     .await;
             }
         }
@@ -757,16 +749,12 @@ impl Worker {
                     .as_ref()
                     .map(|d| join_rel(d, &item.relpath).display().to_string());
                 self.events
-                    .instance_event(
-                        &self.instance,
-                        Event::FileQuarantined {
-                            path: item.relpath.clone(),
-                            attempts,
-                            last_error: last_error.to_string(),
-                            quarantine_path,
-                        },
-                        now,
-                    )
+                    .emit(Event::FileQuarantined {
+                        path: item.relpath.clone(),
+                        attempts,
+                        last_error: last_error.to_string(),
+                        quarantine_path,
+                    })
                     .await;
                 Ok(ItemState::Quarantined)
             }
@@ -1034,16 +1022,12 @@ async fn run_one_dest(ctx: DestAttemptCtx) -> Result<(String, DestOutcome)> {
     );
 
     events
-        .instance_event(
-            &instance,
-            Event::ReplicationStarted {
-                path: item.relpath.clone(),
-                size: item.size,
-                destination: label.clone(),
-                attempt,
-            },
-            now,
-        )
+        .emit(Event::ReplicationStarted {
+            path: item.relpath.clone(),
+            size: item.size,
+            destination: label.clone(),
+            attempt,
+        })
         .await;
 
     let (progress, drainer) = build_progress(
@@ -1084,16 +1068,12 @@ async fn run_one_dest(ctx: DestAttemptCtx) -> Result<(String, DestOutcome)> {
                 bytes = delivered.bytes, attempt, "destination delivered + verified"
             );
             events
-                .instance_event(
-                    &instance,
-                    Event::ReplicationCompleted {
-                        path: item.relpath.clone(),
-                        size: item.size,
-                        destination: label.clone(),
-                        bytes: delivered.bytes,
-                    },
-                    now,
-                )
+                .emit(Event::ReplicationCompleted {
+                    path: item.relpath.clone(),
+                    size: item.size,
+                    destination: label.clone(),
+                    bytes: delivered.bytes,
+                })
                 .await;
             Ok((label, DestOutcome::Verified))
         }
@@ -1125,15 +1105,11 @@ async fn run_one_dest(ctx: DestAttemptCtx) -> Result<(String, DestOutcome)> {
                     "destination permission denied; will not spam this every retry / file"
                 );
                 events
-                    .instance_event(
-                        &instance,
-                        Event::PermissionDenied {
-                            path: label.clone(),
-                            role: Role::Egress.as_str().to_string(),
-                            error: e.to_string(),
-                        },
-                        now,
-                    )
+                    .emit(Event::PermissionDenied {
+                        path: label.clone(),
+                        role: Role::Egress.as_str().to_string(),
+                        error: e.to_string(),
+                    })
                     .await;
             }
             let permanent = e.is_permanent();
@@ -1165,17 +1141,13 @@ async fn run_one_dest(ctx: DestAttemptCtx) -> Result<(String, DestOutcome)> {
                         "destination transfer failed; scheduled for retry"
                     );
                     events
-                        .instance_event(
-                            &instance,
-                            Event::ReplicationFailed {
-                                path: item.relpath.clone(),
-                                destination: label.clone(),
-                                attempt,
-                                error: err_str.clone(),
-                                next_attempt_at_ms: Some(next_attempt_at),
-                            },
-                            now,
-                        )
+                        .emit(Event::ReplicationFailed {
+                            path: item.relpath.clone(),
+                            destination: label.clone(),
+                            attempt,
+                            error: err_str.clone(),
+                            next_attempt_at_ms: Some(next_attempt_at),
+                        })
                         .await;
                     Ok((label, DestOutcome::Retry { next_attempt_at, err: err_str }))
                 }
@@ -1212,16 +1184,12 @@ async fn run_one_dest(ctx: DestAttemptCtx) -> Result<(String, DestOutcome)> {
                         error = %err_str, "retries exhausted on this destination"
                     );
                     events
-                        .instance_event(
-                            &instance,
-                            Event::RetriesExhausted {
-                                path: item.relpath.clone(),
-                                destination: label.clone(),
-                                attempts: attempt,
-                                last_error: err_str.clone(),
-                            },
-                            now,
-                        )
+                        .emit(Event::RetriesExhausted {
+                            path: item.relpath.clone(),
+                            destination: label.clone(),
+                            attempts: attempt,
+                            last_error: err_str.clone(),
+                        })
                         .await;
                     Ok((label, DestOutcome::GiveUp { err: err_str, attempts: attempt }))
                 }
@@ -1298,7 +1266,6 @@ fn build_progress(
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
     let drainer_events = events.clone();
-    let id = instance.clone();
     let path = relpath.clone();
     let destination = label.clone();
     let drainer = tokio::spawn(async move {
@@ -1308,18 +1275,14 @@ fn build_progress(
             let now = now_ms();
             if throttle.should_emit(pct, now) {
                 drainer_events
-                    .instance_event(
-                        &id,
-                        Event::ReplicationProgress {
-                            path: path.clone(),
-                            size,
-                            bytes_done: done,
-                            percent: pct as f64,
-                            destination: destination.clone(),
-                            attempt,
-                        },
-                        now,
-                    )
+                    .emit(Event::ReplicationProgress {
+                        path: path.clone(),
+                        size,
+                        bytes_done: done,
+                        percent: pct as f64,
+                        destination: destination.clone(),
+                        attempt,
+                    })
                     .await;
             }
         }
@@ -2416,9 +2379,6 @@ mod tests {
         assert_eq!(started[0].body["path"], serde_json::json!("a/b.txt"));
         assert_eq!(started[0].body["attempt"], serde_json::json!(1));
         assert_eq!(started[0].body["destination"], serde_json::json!("local"));
-        assert!(fake
-            .topics()
-            .contains(&"gw-01/file-replicator/evt/instances/w/ReplicationStarted".to_string()));
 
         // ReplicationCompleted carries the delivered byte count, then FileDeleted (onSuccess=delete).
         let done = fake.events_named("ReplicationCompleted");

@@ -2,7 +2,10 @@
 
 The canonical configuration reference. There is no per-component JSON schema in the ecosystem; **this
 document is the source of truth**, and it is validated against the parser in `src/config.rs` (not against
-other docs). Fields are added here as each phase implements them; the shape below matches the P0 model.
+other docs). Fields are added here as each phase implements them; the component has shipped through P6
+(DESIGN §21), so most of the parser's actual field surface — including the P5 destinations and P6
+multi-destination `egress` — is ahead of what's documented below; treat gaps here as a docs lag, not an
+implementation gap.
 
 The component owns the `component` section (`component.global` + `component.instances[]`). Sibling sections
 (`messaging`, `credentials`, `logging`, `heartbeat`, `metricEmission`, `health`, `tags`) are parsed by the
@@ -15,8 +18,11 @@ The component owns the `component` section (`component.global` + `component.inst
 | `defaults.timezone` | string | UTC | Default schedule timezone. |
 | `limits.maxConcurrentFiles` | int | 64 | Global in-flight cap across all instances. |
 | `limits.maxBandwidth` | string | — | Global aggregate byte-rate cap, e.g. `"50MB/s"` (P1). |
-| `topics.prefix` | string | `{ThingName}/file-replicator` | UNS prefix template (DESIGN §15). |
 | `onPermissionError` | `"disableInstance"` \| `"fatal"` \| `"retain"` | `"disableInstance"` | Component-wide default for what happens when an instance's ingress/egress/archive/failed directory fails a startup readable/writable check. An instance's own `onPermissionError` (below) overrides this. See **Permission handling** in `explanation.md`. |
+
+> There is no `topics.prefix`/`legacyConfigTopic` config anymore — topics are minted by the ggcommons UNS
+> core (`ecv1/{device}/FileReplicator/{instance}/{class}…`, fixed grammar, no override). See
+> [Reference › Messaging interface](messaging-interface.md).
 
 ## `component.instances[]` — one per watched directory
 | Key | Type | Default | Notes |
@@ -24,12 +30,11 @@ The component owns the `component` section (`component.global` + `component.inst
 | `id` | string | *(required)* | Stable instance id. |
 | `enabled` | bool | `true` | Initial activation; persisted runtime state may override (DESIGN §7.5). |
 | `ingress` | object | *(required)* | Source + readiness. See below. |
-| `egress` | array | *(required)* | Destination list; v1 requires exactly one. See **egress**. |
+| `egress` | array | *(required)* | Destination list; `N >= 1` entries fan out independently and complete once every entry verifies (multi-destination fan-out shipped P6, DESIGN §20-B). See **egress**. |
 | `schedule` | object | `{ "mode": "immediate" }` | See **schedule**. |
 | `completion` | object | defaults below | See **completion**. |
 | `retry` | object | global default | See **retry**. |
 | `limits` | object | — | `maxConcurrentFiles`, `maxBandwidth` (per-instance). |
-| `topics` | object | global prefix | `{ "prefix": "…" }` override. |
 | `onPermissionError` | `"disableInstance"` \| `"fatal"` \| `"retain"` | inherits `component.global.onPermissionError` | Per-instance override of the component-wide permission-error policy. `disableInstance` skips just this instance (its siblings keep running); `fatal` aborts the whole component; `retain` starts the instance anyway, leaning on runtime dedup-logging + the `PermissionDenied` event for ongoing diagnostics. If **every** instance ends up disabled (or the set is empty), the component still fails fast (FR-CFG-4's "zero instances started" rule). |
 | `priority` | int | `100` | Cross-instance **global** concurrency-admission priority: under contention for the shared `component.global.limits.maxConcurrentFiles` cap, a **lower** number is admitted first (the same 0-255-ish convention as elsewhere; ties broken FIFO by enqueue order). Governs ONLY the global admission decision — it does not affect this instance's own `limits.maxConcurrentFiles` cap, and there is **no bandwidth weighting** by priority. Demand-adaptive: an instance not currently contending for a global slot reserves nothing, regardless of its priority. See **Cross-instance priority** in `explanation.md`. |
 
@@ -53,8 +58,10 @@ The component owns the `component` section (`component.global` + `component.inst
 > [Explanation › Discovery](../explanation.md).
 
 ### `egress` (item)
-`type` selects the backend: `local` \| `s3` (modeled) \| `sftp` \| `ftps` \| `http` \| `azure` \| `gcs`
-(phased). See [Reference › Destinations](destinations.md) for per-backend fields. `local`: `path`,
+`type` selects the backend: `local` \| `s3` (both on by default) \| `sftp` \| `ftps` \| `http` \| `azure` \|
+`gcs` (all implemented, each behind its own off-by-default cargo feature — `dest-sftp`/`dest-ftps`/
+`dest-http`/`dest-azure`/`dest-gcs`). See [Reference › Destinations](destinations.md) for per-backend
+fields. `local`: `path`,
 `fsync`. `s3`: `bucket`, `prefix`, `region`, `endpointUrl`, `credentials` (`$secret`; optional — ambient
 by default), `storageClass`, `sse`/`kmsKeyId`, `accelerate`, `unsignedPayload`, `checksumAlgorithm`,
 `multipart.{thresholdBytes,partSizeBytes,maxConcurrentParts}`.

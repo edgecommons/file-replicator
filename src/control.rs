@@ -1,63 +1,92 @@
 //! # file-replicator — control-message dispatcher (DESIGN §16)
 //!
-//! **One-liner purpose**: The inbound half of the control plane — subscribe the `cmd/#` topic space
-//! on the Unified Namespace, route each request (`get-config` · `get-status` · `trigger` ·
-//! `set-activation`) to a handler, and answer via the request's `reply_to` (DESIGN §15/§16).
+//! **One-liner purpose**: The inbound half of the control plane — register `get-status` / `trigger`
+//! / `set-activation` on the ggcommons component **command inbox** (`gg.commands()`,
+//! `ecv1/{device}/file-replicator/main/cmd/#`) and answer via the library's request/reply wrapping.
+//! The built-in `ping` / `reload-config` / `get-configuration` verbs (registered by the library)
+//! answer everything the old custom `cmd/config` verb used to.
 //!
-//! ## Shape
-//! [`ControlPlane`] wraps the ggcommons [`MessagingService`] (the request/reply seam), the resolved
-//! [`Topics`] (from [`crate::uns`]), the config snapshot, the shared durable [`StateStore`] (the
-//! source of per-instance statistics), the outbound [`Events`] emitter (for the control-triggered
-//! `InstanceActivated`/`InstanceDeactivated`/`ScheduleTriggered` events), and the set of live
-//! instances behind the [`InstanceControl`] seam. [`ControlPlane::start`] registers the subscription;
-//! every request is dispatched through the pure [`ControlPlane::route`] router (from [`crate::uns`])
-//! and answered with a `FileReplicatorReply` envelope.
+//! ## UNS migration (replaces the hand-rolled `cmd/#` subscribe)
+//! [`ControlPlane`] used to own its own `{prefix}/cmd/#` subscription, a hand-rolled topic router
+//! ([`crate::uns::parse_cmd`], now deleted), and its own reply envelope. All three are now the
+//! library's job: [`ControlPlane::register`] registers three verbs on the shared
+//! [`ggcommons::commands::CommandInbox`] (mirroring exactly how opcua-adapter/modbus-adapter register
+//! their `sb/*` verbs and telemetry-processor its `flush`/`get-stats`/`pause`/`resume` verbs) — the
+//! inbox handles the subscribe, the verb/topic routing, the reply envelope (with the request's
+//! `correlation_id`), and the normative `{"ok":true,"result":…}` / `{"ok":false,"error":{code,
+//! message}}` body shape. Handlers return `Result<Option<Value>, CommandError>` instead of building
+//! their own reply.
+//!
+//! **Scoping — body field, not topic segment.** The old scheme split `cmd/status` (all instances)
+//! from `cmd/instances/{id}/status` (one instance) by TOPIC. The command inbox is one subscription
+//! per component (bound to the `main` instance), so scoping now rides an optional `instance` field in
+//! the request body — the same convention opcua-adapter/modbus-adapter use for their multi-instance
+//! `sb/*` verbs and telemetry-processor uses for `pause`/`resume`'s `route` field. `get-status`/
+//! `trigger` omit `instance` for "all"; `set-activation` always requires it (it never had an "all"
+//! form).
+//!
+//! ## get-config — retired, not migrated
+//! The custom `get-config` verb (and its optional `legacyConfigTopic` alias) is dropped outright: the
+//! library's built-in `get-configuration` verb already answers this, and more safely — it returns the
+//! **redacted** effective config (secrets replaced, not just left as unresolved `$secret` refs).
+//! There is nothing left for this component to add.
 //!
 //! ## Instance seam
 //! The dispatcher never touches the engine directly — it drives instances through [`InstanceControl`]
-//! (id / activation / trigger / destination label). The real [`crate::instance::Instance`] implements
-//! it; unit tests substitute a fake, so routing, reply construction, and status serialization are
-//! tested with a fake messaging service and a real (temp) [`StateStore`].
+//! (id / activation / trigger / destination label / event notification). The real
+//! [`crate::instance::Instance`] implements it; unit tests substitute a fake, so routing, status
+//! serialization, and activation lifecycle are tested with a real (temp) [`StateStore`] and no live
+//! messaging transport (see the module docs' "Testability" note in `crate::events`).
+//!
+//! ## Instance-scoped events — delegated, not duplicated
+//! `InstanceActivated`/`InstanceDeactivated`/a per-instance `ScheduleTriggered` used to publish
+//! through the control plane's OWN `Events` emitter (a second copy of the same component-wide topic
+//! prefix). Under the UNS core, an event's facade is bound to ONE instance at construction
+//! (`gg.instance(id).events()`, minted once when that instance is built — see `crate::app`), so the
+//! control plane does not hold a redundant one: it calls [`InstanceControl::notify`] on the SPECIFIC
+//! instance it already looked up, which emits through that instance's own bound
+//! [`crate::events::Events`]. The control plane keeps only its own component-level `Events` (bound to
+//! `gg.events()`, the `main` instance) for scope-`"all"` events (`ScheduleTriggered{scope:"all"}`).
+//!
+//! ## `state/…` — dropped (see `crate::events` module docs)
+//! The retained per-instance/component snapshot publish (`republish_after_transition`/
+//! `publish_initial_state`) is removed outright, not migrated — `state` is now a reserved,
+//! library-owned UNS class. `get-status` (unchanged status-assembly logic) remains the reliable
+//! "current state on demand" path.
 //!
 //! ## Graceful degradation (DESIGN §6)
-//! Messaging may be **absent** on a platform (`gg.messaging()` is `Err`). The control layer then
-//! degrades to a no-op: [`ControlPlane::start`] warns once and subscribes nothing, and every reply is
-//! silently skipped. The P1/P2 replication engine is unaffected.
-//!
-//! ## get-config & secrets
-//! `get-config` returns the **effective configuration document** (`config.raw`), reusing the core
-//! `GetConfiguration` contract. Because `$secret` references are stored *unresolved* in the config
-//! document (FR-CFG-5), returning it never leaks a credential value — only the reference name travels.
-//! An optional legacy alias topic (`ggcommons/{thing}/config/get/{ComponentName}`, DESIGN §15.6) is
-//! answered too when enabled via `component.global.topics.legacyConfigTopic`.
+//! Messaging may be **absent** on a platform. `gg.commands()` is then `None` and
+//! [`ControlPlane::register`] is simply never called by `crate::app`; the P1/P2 replication engine is
+//! unaffected.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ggcommons::messaging::{message_handler, Message, MessageBuilder, MessagingService};
+use ggcommons::commands::{command_handler, CommandError, CommandHandler, CommandInbox};
+use ggcommons::messaging::Message;
 use ggcommons::prelude::Config;
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use crate::config::GlobalCfg;
 use crate::domain::{ItemState, WorkItem};
 use crate::events::{Event, Events};
 use crate::instance::now_ms;
 use crate::state::{Stats, StateStore};
-use crate::uns::{legacy_config_topic, parse_cmd, Command, Scope, Topics};
 
-/// `header.name` for every control reply envelope (DESIGN §16).
-const REPLY_MESSAGE_NAME: &str = "FileReplicatorReply";
-/// Envelope schema version for control replies (matches the event/state envelope).
-const MESSAGE_VERSION: &str = "1.0";
-/// Client-side queue depth for the command subscription.
-const CMD_QUEUE: usize = 32;
-/// Concurrency for the command subscription — control commands are short, independent reads.
-const CMD_CONCURRENCY: usize = 4;
 /// Upper bound on the per-array file/item listing in a `get-status` reply, so a 100k-file spool never
 /// produces a multi-megabyte reply (the `count`/`bytes` totals are always exact regardless).
 const MAX_LISTED: usize = 100;
+
+/// Error code: the request named (or was required to name) an instance id this component does not
+/// run.
+const ERR_UNKNOWN_INSTANCE: &str = "UNKNOWN_INSTANCE";
+/// Error code: `set-activation` was sent with no `instance` field (it has no "all" form).
+const ERR_INSTANCE_REQUIRED: &str = "INSTANCE_REQUIRED";
+/// Error code: `set-activation` carried neither `active` nor `reset: true`.
+const ERR_INVALID_REQUEST: &str = "INVALID_REQUEST";
+/// Error code: the [`InstanceControl`] handler itself failed (e.g. a durable-state write error).
+const ERR_ACTIVATION_FAILED: &str = "ACTIVATION_FAILED";
 
 /// The engine seam the dispatcher drives — the minimal surface `get-status` / `trigger` /
 /// `set-activation` need, kept narrow so the control layer is testable with a fake and never depends
@@ -73,8 +102,7 @@ pub trait InstanceControl: Send + Sync {
     /// A short destination label (e.g. `"local"`, `"s3"`) for `inProgress` status rows.
     fn dest_label(&self) -> &str;
     /// The configured schedule mode (`"immediate"`/`"cron"`/`"window"`), reported verbatim by
-    /// `get-status`/state so an instance an operator set to a window is not misrepresented as
-    /// `immediate` (cron/window execution is P4; the *reported* mode reflects config today).
+    /// `get-status` (cron/window execution is P4; the *reported* mode reflects config today).
     fn schedule_mode(&self) -> &str;
     /// Force one scan/replication pass **now** (FR-CTL-3). With `ignore_window = true` the forced tick
     /// **bypasses the schedule gate** and drains all ready work regardless of cron/window state (the
@@ -96,6 +124,10 @@ pub trait InstanceControl: Send + Sync {
     /// Clear the persisted activation override, reverting to config `enabled` (DESIGN §7.5 reset).
     /// Returns the new effective active state.
     fn reset_activation(&self, now: i64) -> anyhow::Result<bool>;
+    /// Emit `ev` through THIS instance's own bound `events()` facade (see the module docs'
+    /// "Instance-scoped events" note) — used by the control plane to notify an activation transition
+    /// or a scoped `trigger` without holding a duplicate per-instance emitter itself.
+    async fn notify(&self, ev: Event);
 }
 
 /// One instance that never started because of a startup permission/access violation (Feature A,
@@ -117,179 +149,107 @@ pub struct DisabledInstanceInfo {
 
 /// The inbound control-message dispatcher (DESIGN §16).
 pub struct ControlPlane {
-    msg: Option<Arc<dyn MessagingService>>,
-    topics: Arc<Topics>,
     config: Arc<Config>,
     store: Arc<dyn StateStore>,
     instances: Vec<Arc<dyn InstanceControl>>,
+    /// Component-level ("main" instance) event emitter — scope-`"all"` `ScheduleTriggered` only; every
+    /// instance-scoped event is delegated to [`InstanceControl::notify`] instead (module docs).
     events: Events,
-    legacy_enabled: bool,
-    legacy_topic: String,
     /// Instances that never started (Feature A `onPermissionError: disableInstance`) — see
     /// [`DisabledInstanceInfo`]. Empty unless [`with_disabled`](Self::with_disabled) was called.
     disabled: Vec<DisabledInstanceInfo>,
 }
 
 impl ControlPlane {
-    /// Assemble the dispatcher from raw parts (the seam unit tests use).
-    #[allow(clippy::too_many_arguments)]
+    /// Assemble the dispatcher. `events` is the component-level ("main" instance) emitter (e.g.
+    /// `Events::new(gg.events())`) — see the module docs' "Instance-scoped events" note for why this
+    /// is the ONLY emitter the control plane itself holds.
     pub fn new(
-        msg: Option<Arc<dyn MessagingService>>,
-        topics: Arc<Topics>,
         config: Arc<Config>,
         store: Arc<dyn StateStore>,
         instances: Vec<Arc<dyn InstanceControl>>,
         events: Events,
-        legacy_enabled: bool,
     ) -> Self {
-        let legacy_topic = legacy_config_topic(&config);
         Self {
-            msg,
-            topics,
             config,
             store,
             instances,
             events,
-            legacy_enabled,
-            legacy_topic,
             disabled: Vec::new(),
         }
     }
 
     /// Attach the set of instances that never started (Feature A, `onPermissionError:
     /// disableInstance`), so `get-status` reflects them instead of reporting "unknown instance".
-    /// Consumes and returns `self` (composes like [`with_events`](Events)'s builder siblings) so
-    /// existing `ControlPlane::new`/`build` call sites are unaffected when there is nothing disabled.
+    /// Consumes and returns `self` (a small builder step) so existing `ControlPlane::new` call sites
+    /// are unaffected when there is nothing disabled.
     pub fn with_disabled(mut self, disabled: Vec<DisabledInstanceInfo>) -> Self {
         self.disabled = disabled;
         self
     }
 
-    /// Build the dispatcher from the component config + parsed `component.global` (the wiring path).
-    /// Resolves the component-level topic prefix (`component.global.topics.prefix`), the legacy-alias
-    /// flag, and an [`Events`] emitter sharing that prefix.
-    pub fn build(
-        msg: Option<Arc<dyn MessagingService>>,
-        config: &Arc<Config>,
-        global: &GlobalCfg,
-        store: Arc<dyn StateStore>,
-        instances: Vec<Arc<dyn InstanceControl>>,
-    ) -> Self {
-        let global_prefix = global.topics.as_ref().and_then(|t| t.prefix.as_deref());
-        let legacy_enabled = global
-            .topics
-            .as_ref()
-            .and_then(|t| t.legacy_config_topic)
-            .unwrap_or(false);
-        let topics = Arc::new(Topics::from_config(config, global_prefix, None));
-        let events = Events::new(
-            msg.clone(),
-            topics.clone(),
-            config.thing_name.clone(),
-            config.parsed.tags.clone(),
-        );
-        Self::new(
-            msg,
-            topics,
-            config.clone(),
-            store,
-            instances,
-            events,
-            legacy_enabled,
-        )
-    }
-
-    /// Subscribe the `cmd/#` topic space (plus the legacy `GetConfiguration` alias when enabled) and
-    /// dispatch each request. No-op (warn once) when messaging is unavailable (DESIGN §6).
-    pub async fn start(self: Arc<Self>) -> anyhow::Result<()> {
-        let Some(msg) = self.msg.clone() else {
-            tracing::warn!("messaging unavailable; control plane disabled (no command subscription)");
-            return Ok(());
-        };
-
-        let filter = self.topics.cmd_filter();
+    /// Registers `get-status` / `trigger` / `set-activation` on the component command inbox
+    /// (`gg.commands()`). No-op (a debug log) per verb that fails to register (mirrors
+    /// telemetry-processor's `try_register`) — a duplicate/invalid verb name must not crash startup.
+    /// Called once by `crate::app` right after the inbox exists; a no-op call site (never made) when
+    /// no messaging transport was wired (DESIGN §6).
+    pub fn register(self: Arc<Self>, commands: &CommandInbox) {
         {
             let me = self.clone();
-            let handler = message_handler(move |topic, message| {
-                let me = me.clone();
-                async move { me.handle(topic, message).await }
-            });
-            msg.subscribe(&filter, handler, CMD_QUEUE, CMD_CONCURRENCY)
-                .await
-                .map_err(|e| anyhow::anyhow!("subscribe {filter}: {e}"))?;
+            try_register(
+                commands,
+                "get-status",
+                command_handler(move |req| {
+                    let me = me.clone();
+                    async move { me.on_get_status(req).await }
+                }),
+            );
         }
-
-        if self.legacy_enabled {
+        {
             let me = self.clone();
-            let legacy = self.legacy_topic.clone();
-            let handler = message_handler(move |topic, message| {
-                let me = me.clone();
-                async move { me.handle(topic, message).await }
-            });
-            msg.subscribe(&legacy, handler, 4, 1)
-                .await
-                .map_err(|e| anyhow::anyhow!("subscribe {legacy}: {e}"))?;
-            tracing::info!(topic = %legacy, "legacy GetConfiguration alias enabled");
+            try_register(
+                commands,
+                "trigger",
+                command_handler(move |req| {
+                    let me = me.clone();
+                    async move { me.on_trigger(req).await }
+                }),
+            );
         }
-
-        tracing::info!(filter = %filter, instances = self.instances.len(), "control plane subscribed");
-        Ok(())
-    }
-
-    /// Unsubscribe every control topic (call before shutdown so no broker subscription is orphaned).
-    pub async fn stop(&self) {
-        let Some(msg) = &self.msg else { return };
-        let _ = msg.unsubscribe(&self.topics.cmd_filter()).await;
-        if self.legacy_enabled {
-            let _ = msg.unsubscribe(&self.legacy_topic).await;
-        }
-    }
-
-    /// Route an inbound request `topic` to its [`Command`], honoring the legacy config-alias topic.
-    fn route(&self, topic: &str) -> Option<Command> {
-        if self.legacy_enabled && topic == self.legacy_topic {
-            return Some(Command::GetConfig);
-        }
-        parse_cmd(self.topics.prefix(), topic)
-    }
-
-    /// Dispatch one received request. An unroutable topic is logged and ignored (no reply).
-    async fn handle(&self, topic: String, req: Message) {
-        match self.route(&topic) {
-            Some(Command::GetConfig) => self.on_get_config(&req).await,
-            Some(Command::GetStatus(scope)) => self.on_get_status(&req, scope).await,
-            Some(Command::Trigger(scope)) => self.on_trigger(&req, scope).await,
-            Some(Command::SetActivation(id)) => self.on_set_activation(&req, &id).await,
-            None => tracing::warn!(topic = %topic, "unroutable control command; ignoring"),
+        {
+            let me = self.clone();
+            try_register(
+                commands,
+                "set-activation",
+                command_handler(move |req| {
+                    let me = me.clone();
+                    async move { me.on_set_activation(req).await }
+                }),
+            );
         }
     }
 
     // ---- handlers -------------------------------------------------------------------------------
 
-    /// `get-config` → the effective configuration document (unresolved `$secret` refs are safe).
-    async fn on_get_config(&self, req: &Message) {
-        self.reply(req, json!({ "ok": true, "config": self.config.raw })).await;
-    }
-
-    /// `get-status` → per-instance (scoped) or component-wide statistics (DESIGN §16). A scoped request
-    /// for a disabled instance id (Feature A) returns its disabled doc, not "unknown instance" — it was
-    /// legitimately configured, just never started.
-    async fn on_get_status(&self, req: &Message, scope: Scope) {
+    /// `get-status` → per-instance (scoped by an `instance` body field) or component-wide statistics
+    /// (DESIGN §16). A scoped request for a disabled instance id (Feature A) returns its disabled doc,
+    /// not `UNKNOWN_INSTANCE` — it was legitimately configured, just never started.
+    async fn on_get_status(&self, req: Message) -> Result<Option<Value>, CommandError> {
         let now = now_ms();
-        let body = match scope {
-            Scope::All => self.component_status_json(now),
-            Scope::Instance(id) => match self.find(&id) {
-                Some(inst) => self.instance_status(inst.as_ref(), now),
-                None => match self.find_disabled(&id) {
-                    Some(info) => disabled_status_json(info),
-                    None => unknown_instance(&id),
+        match instance_of(&req) {
+            None => Ok(Some(self.component_status_json(now))),
+            Some(id) => match self.find(id) {
+                Some(inst) => Ok(Some(self.instance_status(inst.as_ref(), now))),
+                None => match self.find_disabled(id) {
+                    Some(info) => Ok(Some(disabled_status_json(info))),
+                    None => Err(unknown_instance(id)),
                 },
             },
-        };
-        self.reply(req, body).await;
+        }
     }
 
-    /// `trigger` → force a scan now for one instance or all (FR-CTL-3), emitting `ScheduleTriggered`.
+    /// `trigger` → force a scan now for one instance (`instance` body field) or all (FR-CTL-3),
+    /// emitting `ScheduleTriggered`.
     ///
     /// The scan is run as a **detached task** and the reply is sent immediately ("accepted + counts",
     /// DESIGN §16): a scan is a full deliver→verify→complete batch (potentially a multi-GB/slow-S3
@@ -299,16 +259,15 @@ impl ControlPlane {
     ///
     /// `ignoreWindow` (default `false`) is threaded into [`InstanceControl::trigger_scan`]: when `true`
     /// the forced tick bypasses the P4 schedule gate and replicates all ready work regardless of the
-    /// instance's cron/window state; when `false` the trigger respects the gate (a cron/window instance
-    /// between its open spans discovers/enqueues but replicates nothing this tick). `triggered` counts
+    /// instance's cron/window state; when `false` the trigger respects the gate. `triggered` counts
     /// the instances whose scan was **dispatched**, not files sent (the async batch's outcome is not
     /// known at reply time).
-    async fn on_trigger(&self, req: &Message, scope: Scope) {
+    async fn on_trigger(&self, req: Message) -> Result<Option<Value>, CommandError> {
         let now = now_ms();
         let ignore_window = lenient_bool(req.body.get("ignoreWindow")).unwrap_or(false);
 
-        let body = match scope {
-            Scope::All => {
+        match instance_of(&req) {
+            None => {
                 let mut triggered: Vec<String> = Vec::new();
                 let mut skipped: Vec<String> = Vec::new();
                 for inst in &self.instances {
@@ -319,145 +278,93 @@ impl ControlPlane {
                         skipped.push(inst.id().to_string());
                     }
                 }
-                self.events
-                    .component_event(Event::ScheduleTriggered { scope: "all".into() }, now)
-                    .await;
-                json!({
-                    "ok": true, "scope": "all", "triggered": triggered.len(),
+                self.events.emit(Event::ScheduleTriggered { scope: "all".into() }).await;
+                Ok(Some(json!({
+                    "scope": "all", "triggered": triggered.len(),
                     "instances": triggered, "skipped": skipped, "ignoreWindow": ignore_window
-                })
+                })))
             }
-            Scope::Instance(id) => match self.find(&id) {
+            Some(id) => match self.find(id) {
                 Some(inst) => {
                     if !inst.is_active() {
                         // A deactivated instance's tick is a no-op — report the truth, emit nothing.
-                        json!({
-                            "ok": true, "scope": id, "triggered": 0, "skipped": "inactive",
+                        Ok(Some(json!({
+                            "scope": id, "triggered": 0, "skipped": "inactive",
                             "ignoreWindow": ignore_window
-                        })
+                        })))
                     } else {
                         spawn_trigger(inst.clone(), now, ignore_window);
-                        self.events
-                            .instance_event(&id, Event::ScheduleTriggered { scope: id.clone() }, now)
-                            .await;
-                        json!({ "ok": true, "scope": id, "triggered": 1, "ignoreWindow": ignore_window })
+                        inst.notify(Event::ScheduleTriggered { scope: id.to_string() }).await;
+                        Ok(Some(json!({ "scope": id, "triggered": 1, "ignoreWindow": ignore_window })))
                     }
                 }
-                None => unknown_instance(&id),
+                None => Err(unknown_instance(id)),
             },
-        };
-        self.reply(req, body).await;
+        }
     }
 
     /// `set-activation` → activate/deactivate/reset an instance (FR-CTL-4 / DESIGN §7.5), emitting
-    /// `InstanceActivated` / `InstanceDeactivated`. The action runs even when there is no `reply_to`.
-    async fn on_set_activation(&self, req: &Message, id: &str) {
+    /// `InstanceActivated` / `InstanceDeactivated` via [`InstanceControl::notify`]. Unlike
+    /// `get-status`/`trigger`, this has no "all" form — `instance` is required.
+    async fn on_set_activation(&self, req: Message) -> Result<Option<Value>, CommandError> {
         let now = now_ms();
-        let Some(inst) = self.find(id) else {
-            self.reply(req, unknown_instance(id)).await;
-            return;
+        let Some(id) = instance_of(&req) else {
+            return Err(CommandError::new(
+                ERR_INSTANCE_REQUIRED,
+                "set-activation requires an \"instance\" field (it has no \"all\" form)",
+            ));
         };
+        let Some(inst) = self.find(id) else {
+            return Err(unknown_instance(id));
+        };
+
         // Field-by-field lenient parse (NOT whole-body `serde_json::from_value`): a Greengrass-style
         // numeric double (`{"active": false, "persist": 1}`) must not fail deserialization and get
-        // silently discarded — that would drop a real deactivate and reply a misleading "requires
-        // active" while the instance keeps replicating (FR-CFG-3 lenient-number convention).
+        // silently discarded — that would drop a real deactivate while the instance keeps replicating
+        // (FR-CFG-3 lenient-number convention).
         let reset = lenient_bool(req.body.get("reset")).unwrap_or(false);
         let active = lenient_bool(req.body.get("active"));
 
-        let body = if reset {
-            match inst.reset_activation(now) {
+        if reset {
+            return match inst.reset_activation(now) {
                 Ok(effective) => {
-                    self.emit_activation(id, effective, now).await;
-                    self.republish_after_transition(inst.as_ref(), now).await;
-                    json!({
-                        "ok": true, "instance": id, "active": effective,
+                    self.emit_activation(inst.as_ref(), effective).await;
+                    Ok(Some(json!({
+                        "instance": id, "active": effective,
                         "configuredEnabled": inst.configured_enabled(), "reset": true
-                    })
+                    })))
                 }
-                Err(e) => error_body(id, &e.to_string()),
-            }
-        } else if let Some(active) = active {
+                Err(e) => Err(CommandError::new(ERR_ACTIVATION_FAILED, e.to_string())),
+            };
+        }
+        if let Some(active) = active {
             let persist = lenient_bool(req.body.get("persist")).unwrap_or(true);
-            match inst.apply_activation(active, persist, "control", now) {
+            return match inst.apply_activation(active, persist, "control", now) {
                 Ok(effective) => {
-                    self.emit_activation(id, effective, now).await;
-                    self.republish_after_transition(inst.as_ref(), now).await;
-                    json!({
-                        "ok": true, "instance": id, "active": effective,
+                    self.emit_activation(inst.as_ref(), effective).await;
+                    Ok(Some(json!({
+                        "instance": id, "active": effective,
                         "configuredEnabled": inst.configured_enabled(), "persisted": persist
-                    })
+                    })))
                 }
-                Err(e) => error_body(id, &e.to_string()),
-            }
-        } else {
-            json!({
-                "ok": false, "instance": id,
-                "error": "set-activation requires `active` (bool) or `reset: true`"
-            })
-        };
-        self.reply(req, body).await;
+                Err(e) => Err(CommandError::new(ERR_ACTIVATION_FAILED, e.to_string())),
+            };
+        }
+        Err(CommandError::new(
+            ERR_INVALID_REQUEST,
+            "set-activation requires `active` (bool) or `reset: true`",
+        ))
     }
 
-    /// Emit the activation lifecycle event matching the new effective state.
-    async fn emit_activation(&self, id: &str, active: bool, now: i64) {
+    /// Notify the activation lifecycle event matching the new effective state, through `inst`'s own
+    /// bound facade.
+    async fn emit_activation(&self, inst: &dyn InstanceControl, active: bool) {
         let ev = if active {
             Event::InstanceActivated { source: "control".into() }
         } else {
             Event::InstanceDeactivated { source: "control".into() }
         };
-        self.events.instance_event(id, ev, now).await;
-    }
-
-    /// Republish the retained current-state snapshots after an activation transition (DESIGN §17.2 /
-    /// FR-EVT-4). A deactivated instance's `tick` early-returns and never republishes, so without this
-    /// the last-published `state/instances/{id}` would stay `active:true` forever while `get-status`
-    /// (which reads live state) correctly reports `active:false` — the two would permanently disagree.
-    /// Also refreshes the component roster snapshot so its `active` count stays current.
-    async fn republish_after_transition(&self, inst: &dyn InstanceControl, now: i64) {
-        let snapshot = instance_state_snapshot(
-            self.store.as_ref(),
-            inst.id(),
-            inst.is_active(),
-            inst.configured_enabled(),
-            inst.schedule_mode(),
-            inst.dest_label(),
-            now,
-        );
-        self.events.publish_instance_state(inst.id(), snapshot).await;
-        self.events
-            .publish_component_state(self.component_status_json(now))
-            .await;
-    }
-
-    /// Publish the initial retained state snapshots at startup (DESIGN §15.3 / §17.2): one per
-    /// instance plus the component roster, so a UI/cloud subscriber that connects to an idle component
-    /// (nothing has ticked yet) still renders every instance's current state. Called once by
-    /// [`crate::app`] after the control plane subscribes. No-op when messaging is absent.
-    pub async fn publish_initial_state(&self, now: i64) {
-        for inst in &self.instances {
-            let snapshot = instance_state_snapshot(
-                self.store.as_ref(),
-                inst.id(),
-                inst.is_active(),
-                inst.configured_enabled(),
-                inst.schedule_mode(),
-                inst.dest_label(),
-                now,
-            );
-            self.events.publish_instance_state(inst.id(), snapshot).await;
-        }
-        // Feature A: a disabled instance never ticks (never republishes its own state), so without
-        // this its retained `state/instances/{id}` topic would simply never exist — a UI/cloud
-        // subscriber would see nothing at all for an id it knows was configured, rather than the
-        // `disabled: true` + reason DESIGN §16 promises.
-        for info in &self.disabled {
-            self.events
-                .publish_instance_state(&info.id, disabled_status_json(info))
-                .await;
-        }
-        self.events
-            .publish_component_state(self.component_status_json(now))
-            .await;
+        inst.notify(ev).await;
     }
 
     // ---- status assembly ------------------------------------------------------------------------
@@ -486,9 +393,7 @@ impl ControlPlane {
     }
 
     /// One instance's status, sourced from the durable store (awaiting / in-progress / failed rows +
-    /// running stats) and its live activation/destination state. Delegates to the shared
-    /// [`instance_state_snapshot`] so `get-status` and the engine's retained `state/…` republish
-    /// render identically.
+    /// running stats) and its live activation/destination state.
     fn instance_status(&self, inst: &dyn InstanceControl, now: i64) -> Value {
         instance_state_snapshot(
             self.store.as_ref(),
@@ -499,25 +404,6 @@ impl ControlPlane {
             inst.dest_label(),
             now,
         )
-    }
-
-    // ---- reply ----------------------------------------------------------------------------------
-
-    /// Publish a reply to the request's `reply_to` (correlation is set by the messaging service).
-    /// No-op when messaging is absent or the request carried no `reply_to`.
-    async fn reply(&self, req: &Message, body: Value) {
-        let Some(msg) = &self.msg else { return };
-        if req.header.reply_to.is_none() {
-            tracing::debug!(name = %req.header.name, "control request has no reply_to; not replying");
-            return;
-        }
-        let reply = MessageBuilder::new(REPLY_MESSAGE_NAME, MESSAGE_VERSION)
-            .from_config(&self.config)
-            .payload(body)
-            .build();
-        if let Err(e) = msg.reply(req, reply).await {
-            tracing::debug!(error = %e, "control reply publish failed (ignored)");
-        }
     }
 
     /// Look up a live instance handle by id.
@@ -531,11 +417,31 @@ impl ControlPlane {
     }
 }
 
+/// Registers a verb, logging (not failing) if the inbox rejects it — mirrors
+/// telemetry-processor's `try_register`.
+fn try_register(commands: &CommandInbox, verb: &str, handler: Arc<dyn CommandHandler>) {
+    if let Err(e) = commands.register(verb, handler) {
+        tracing::warn!(verb, error = %e, "failed to register command verb");
+    }
+}
+
+/// The request body's `"instance"` selector (absent → "all", except `set-activation`, which requires
+/// it — see [`ControlPlane::on_set_activation`]).
+fn instance_of(req: &Message) -> Option<&str> {
+    req.body.get("instance").and_then(Value::as_str)
+}
+
+/// A coded error for a request that named (or was required to name) an instance id this component
+/// does not run.
+fn unknown_instance(id: &str) -> CommandError {
+    CommandError::new(ERR_UNKNOWN_INSTANCE, format!("unknown instance '{id}'"))
+}
+
 /// Build the compact status doc for an instance that never started (Feature A, `onPermissionError:
 /// disableInstance`) — the disabled-instance counterpart of [`instance_status_json`], shaped so a
-/// consumer parsing `get-status`/`state/…` doesn't need a separate schema for the disabled case: same
-/// top-level keys, `active`/`awaiting`/`inProgress`/`replicated`/`failed` all zeroed/empty, plus
-/// `disabled: true` and `disabledReason` so the "why" is never lost.
+/// consumer parsing `get-status` doesn't need a separate schema for the disabled case: same top-level
+/// keys, `active`/`awaiting`/`inProgress`/`replicated`/`failed` all zeroed/empty, plus `disabled:
+/// true` and `disabledReason` so the "why" is never lost.
 fn disabled_status_json(info: &DisabledInstanceInfo) -> Value {
     json!({
         "instance": info.id,
@@ -594,11 +500,11 @@ struct StatusInputs<'a> {
     failed: &'a [WorkItem],
 }
 
-/// Build the compact per-instance state/status document from the durable store (DESIGN §16 /
-/// §17.2). Shared by the control plane's `get-status` reply and the engine's retained
-/// `state/instances/{id}` republish (see [`crate::instance::Instance`]), so a request/reply status
-/// and a retained snapshot render identically. Side-effect-free aside from the store reads (each
-/// falling back to empty/default on a store fault, so status is best-effort and never panics).
+/// Build the compact per-instance state/status document from the durable store (DESIGN §16). Used by
+/// the control plane's `get-status` reply (`crate::instance::Instance` no longer republishes a
+/// parallel retained snapshot — see the module docs' "`state/…` — dropped" note). Side-effect-free
+/// aside from the store reads (each falling back to empty/default on a store fault, so status is
+/// best-effort and never panics).
 pub(crate) fn instance_state_snapshot(
     store: &dyn StateStore,
     id: &str,
@@ -709,16 +615,6 @@ fn age_secs(now: i64, discovered_at: i64) -> i64 {
     (now - discovered_at).max(0) / 1000
 }
 
-/// A reply body for a command that named an instance id the component does not run.
-fn unknown_instance(id: &str) -> Value {
-    json!({ "ok": false, "instance": id, "error": "unknown instance" })
-}
-
-/// A reply body for a handler that failed while acting on `id`.
-fn error_body(id: &str, err: &str) -> Value {
-    json!({ "ok": false, "instance": id, "error": err })
-}
-
 /// Format a Unix-millis instant as an RFC3339 UTC string; epoch on the (practically impossible)
 /// out-of-range/format failure.
 fn rfc3339_ms(now_ms: i64) -> String {
@@ -732,21 +628,19 @@ fn rfc3339_ms(now_ms: i64) -> String {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use ggcommons::messaging::{MessageHandler, Qos, ReplyFuture};
-    use ggcommons::{GgError, Result};
     use serde_json::json;
-    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
 
+    use crate::events::test_support::{recording_events, EventRecorder};
     use crate::state::SqliteStore;
 
     /// Poll `pred` (yielding to the runtime between checks) until it holds or a short deadline elapses.
-    /// `trigger` now dispatches the scan as a detached task (so the reply never blocks on a transfer),
-    /// so a trigger's side effect (the `FakeInstance` counter) is observed just after the handler
-    /// returns, not synchronously.
+    /// `trigger` dispatches the scan as a detached task (so the reply never blocks on a transfer), so a
+    /// trigger's side effect (the `FakeInstance` counter) is observed just after the handler returns,
+    /// not synchronously.
     async fn eventually(pred: impl Fn() -> bool) {
         for _ in 0..200 {
             if pred() {
@@ -755,136 +649,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("condition not met within the deadline");
-    }
-
-    // ---- fake messaging service (records publishes + replies + subscriptions) --------------------
-
-    struct FakeMsg {
-        published: Mutex<Vec<(String, Message)>>,
-        replies: Mutex<Vec<(String, Message)>>,
-        subscribed: Mutex<Vec<String>>,
-        /// The `(filter, handler)` pairs registered via `subscribe` — kept (not discarded) so a test
-        /// can drive the real subscribe→dispatch→reply wiring without a broker (see [`Self::deliver`]).
-        handlers: Mutex<Vec<(String, Arc<dyn MessageHandler>)>>,
-        unsubscribed: Mutex<Vec<String>>,
-        fail_reply: AtomicBool,
-    }
-
-    impl FakeMsg {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                published: Mutex::new(Vec::new()),
-                replies: Mutex::new(Vec::new()),
-                subscribed: Mutex::new(Vec::new()),
-                handlers: Mutex::new(Vec::new()),
-                unsubscribed: Mutex::new(Vec::new()),
-                fail_reply: AtomicBool::new(false),
-            })
-        }
-        fn replies(&self) -> Vec<(String, Message)> {
-            self.replies.lock().unwrap().clone()
-        }
-        fn published_topics(&self) -> Vec<String> {
-            self.published.lock().unwrap().iter().map(|(t, _)| t.clone()).collect()
-        }
-        fn published_messages(&self) -> Vec<(String, Message)> {
-            self.published.lock().unwrap().clone()
-        }
-        fn only_reply(&self) -> (String, Message) {
-            let r = self.replies();
-            assert_eq!(r.len(), 1, "expected exactly one reply, got {}", r.len());
-            r.into_iter().next().unwrap()
-        }
-        /// Deliver `msg` on `topic` to every subscription whose filter matches — exercising the actual
-        /// handler closures registered in [`ControlPlane::start`] (the dispatch→route→reply path that
-        /// the direct `cp.handle(...)` tests bypass), so command delivery is covered without a broker.
-        async fn deliver(&self, topic: &str, msg: Message) {
-            let handlers = self.handlers.lock().unwrap().clone();
-            for (filter, h) in handlers {
-                if filter_matches(&filter, topic) {
-                    h.handle(topic.to_string(), msg.clone()).await;
-                }
-            }
-        }
-    }
-
-    /// MQTT-style filter match sufficient for the tests: a trailing `/#` matches the parent and any
-    /// descendant; otherwise an exact match.
-    fn filter_matches(filter: &str, topic: &str) -> bool {
-        match filter.strip_suffix("/#") {
-            Some(parent) => topic == parent || topic.starts_with(&format!("{parent}/")),
-            None => filter == topic,
-        }
-    }
-
-    #[async_trait]
-    impl MessagingService for FakeMsg {
-        async fn publish(&self, topic: &str, msg: &Message) -> Result<()> {
-            self.published.lock().unwrap().push((topic.to_string(), msg.clone()));
-            Ok(())
-        }
-        async fn publish_to_iot_core(&self, topic: &str, msg: &Message, _q: Qos) -> Result<()> {
-            self.publish(topic, msg).await
-        }
-        async fn publish_raw(&self, topic: &str, payload: &Value) -> Result<()> {
-            self.publish(topic, &Message::raw(payload.clone())).await
-        }
-        async fn publish_to_iot_core_raw(&self, topic: &str, p: &Value, _q: Qos) -> Result<()> {
-            self.publish_raw(topic, p).await
-        }
-        async fn subscribe(
-            &self,
-            filter: &str,
-            h: Arc<dyn MessageHandler>,
-            _m: usize,
-            _c: usize,
-        ) -> Result<()> {
-            self.subscribed.lock().unwrap().push(filter.to_string());
-            self.handlers.lock().unwrap().push((filter.to_string(), h));
-            Ok(())
-        }
-        async fn subscribe_to_iot_core(
-            &self,
-            filter: &str,
-            h: Arc<dyn MessageHandler>,
-            _q: Qos,
-            m: usize,
-            c: usize,
-        ) -> Result<()> {
-            self.subscribe(filter, h, m, c).await
-        }
-        async fn unsubscribe(&self, filter: &str) -> Result<()> {
-            self.unsubscribed.lock().unwrap().push(filter.to_string());
-            Ok(())
-        }
-        async fn unsubscribe_from_iot_core(&self, filter: &str) -> Result<()> {
-            self.unsubscribe(filter).await
-        }
-        async fn request(&self, _t: &str, _m: Message) -> Result<ReplyFuture> {
-            unimplemented!("request is not used by the control-plane tests")
-        }
-        async fn request_from_iot_core(&self, _t: &str, _m: Message) -> Result<ReplyFuture> {
-            unimplemented!("request is not used by the control-plane tests")
-        }
-        async fn reply(&self, req: &Message, reply: Message) -> Result<()> {
-            if self.fail_reply.load(Ordering::SeqCst) {
-                return Err(GgError::Messaging("fake reply failure".into()));
-            }
-            // Mirror DefaultMessagingService: correlate the reply and route it to `reply_to`.
-            let mut reply = reply;
-            reply.header.correlation_id = req.header.correlation_id.clone();
-            let to = req.header.reply_to.clone().unwrap_or_default();
-            self.replies.lock().unwrap().push((to, reply));
-            Ok(())
-        }
-        async fn reply_to_iot_core(&self, req: &Message, reply: Message) -> Result<()> {
-            self.reply(req, reply).await
-        }
-        fn cancel_request(&self, _rf: ReplyFuture) {}
-        fn cancel_request_from_iot_core(&self, _rf: ReplyFuture) {}
-        fn connected(&self) -> bool {
-            true
-        }
     }
 
     // ---- fake instance handle -------------------------------------------------------------------
@@ -901,6 +665,9 @@ mod tests {
         last_apply: Mutex<Option<(bool, bool)>>,
         resets: AtomicUsize,
         fail: bool,
+        /// Every event `notify`d on this instance (module docs: the control plane delegates
+        /// instance-scoped events here instead of holding a duplicate emitter).
+        notified: Mutex<Vec<Event>>,
     }
 
     impl FakeInstance {
@@ -924,6 +691,7 @@ mod tests {
                 last_apply: Mutex::new(None),
                 resets: AtomicUsize::new(0),
                 fail: false,
+                notified: Mutex::new(Vec::new()),
             })
         }
         fn failing(id: &str) -> Arc<Self> {
@@ -938,7 +706,17 @@ mod tests {
                 last_apply: Mutex::new(None),
                 resets: AtomicUsize::new(0),
                 fail: true,
+                notified: Mutex::new(Vec::new()),
             })
+        }
+        fn notified_named(&self, name: &str) -> Vec<Event> {
+            self.notified
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.name() == name)
+                .cloned()
+                .collect()
         }
     }
 
@@ -985,6 +763,9 @@ mod tests {
             self.active.store(self.configured_enabled, Ordering::SeqCst);
             Ok(self.configured_enabled)
         }
+        async fn notify(&self, ev: Event) {
+            self.notified.lock().unwrap().push(ev);
+        }
     }
 
     // ---- fixtures -------------------------------------------------------------------------------
@@ -1000,30 +781,14 @@ mod tests {
         )
     }
 
-    fn events(fake: Arc<FakeMsg>, topics: Arc<Topics>) -> Events {
-        let mut tags = BTreeMap::new();
-        tags.insert("site".to_string(), json!("factory-1"));
-        Events::new(Some(fake as Arc<dyn MessagingService>), topics, "gw-01", tags)
-    }
-
-    /// A dispatcher over a real in-memory store + the given instances, wired to `fake`.
+    /// A dispatcher over a real in-memory store + the given instances, with a recording component-
+    /// level `Events` emitter.
     fn plane(
-        fake: Arc<FakeMsg>,
         store: Arc<dyn StateStore>,
         instances: Vec<Arc<dyn InstanceControl>>,
-        legacy: bool,
-    ) -> ControlPlane {
-        let topics = Arc::new(Topics::from_prefix("gw-01/file-replicator"));
-        let ev = events(fake.clone(), topics.clone());
-        ControlPlane::new(
-            Some(fake as Arc<dyn MessagingService>),
-            topics,
-            cfg(),
-            store,
-            instances,
-            ev,
-            legacy,
-        )
+    ) -> (Arc<EventRecorder>, ControlPlane) {
+        let (rec, events) = recording_events();
+        (rec, ControlPlane::new(cfg(), store, instances, events))
     }
 
     fn mem_store() -> Arc<dyn StateStore> {
@@ -1031,7 +796,7 @@ mod tests {
     }
 
     fn req(name: &str, body: Value) -> Message {
-        MessageBuilder::new(name, "1.0")
+        ggcommons::messaging::MessageBuilder::new(name, "1.0")
             .reply_to("reply/here")
             .correlation_id("corr-1")
             .payload(body)
@@ -1135,42 +900,6 @@ mod tests {
         assert_eq!(v["failed"]["items"][1]["quarantinedAt"], json!("2026-07-01T09:15:22Z"));
     }
 
-    // ---- get-config -----------------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn get_config_returns_effective_document_with_correlation() {
-        let fake = FakeMsg::new();
-        let cp = plane(fake.clone(), mem_store(), vec![], false);
-        cp.handle("gw-01/file-replicator/cmd/config".into(), req("GetConfig", json!({})))
-            .await;
-
-        let (to, reply) = fake.only_reply();
-        assert_eq!(to, "reply/here");
-        assert_eq!(reply.header.correlation_id, "corr-1", "correlation preserved");
-        assert_eq!(reply.header.name, REPLY_MESSAGE_NAME);
-        assert_eq!(reply.tags.thing_name, "gw-01");
-        assert_eq!(reply.body["ok"], json!(true));
-        assert_eq!(reply.body["config"], cp.config.raw);
-    }
-
-    #[tokio::test]
-    async fn legacy_alias_routes_to_get_config_only_when_enabled() {
-        let topic = "ggcommons/gw-01/config/get/FileReplicator";
-
-        // Enabled → GetConfig reply.
-        let fake = FakeMsg::new();
-        let cp = plane(fake.clone(), mem_store(), vec![], true);
-        cp.handle(topic.into(), req("GetConfig", json!({}))).await;
-        assert_eq!(fake.replies().len(), 1);
-        assert_eq!(fake.only_reply().1.body["config"], cp.config.raw);
-
-        // Disabled → unroutable, no reply.
-        let fake = FakeMsg::new();
-        let cp = plane(fake.clone(), mem_store(), vec![], false);
-        cp.handle(topic.into(), req("GetConfig", json!({}))).await;
-        assert!(fake.replies().is_empty());
-    }
-
     // ---- get-status -----------------------------------------------------------------------------
 
     fn seed_status(store: &Arc<dyn StateStore>) {
@@ -1191,17 +920,11 @@ mod tests {
     async fn get_status_for_one_instance_reports_store_and_live_state() {
         let store = mem_store();
         seed_status(&store);
-        let fake = FakeMsg::new();
         let inst = FakeInstance::new("i1", true, true);
-        let cp = plane(fake.clone(), store, vec![inst], false);
+        let (_rec, cp) = plane(store, vec![inst]);
 
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/i1/status".into(),
-            req("GetStatus", json!({})),
-        )
-        .await;
-
-        let body = fake.only_reply().1.body;
+        let body = cp.on_get_status(req("get-status", json!({ "instance": "i1" }))).await.unwrap();
+        let body = body.unwrap();
         assert_eq!(body["instance"], json!("i1"));
         assert_eq!(body["active"], json!(true));
         assert_eq!(body["awaiting"]["count"], json!(2));
@@ -1217,17 +940,13 @@ mod tests {
     async fn get_status_all_wraps_every_instance_with_summary() {
         let store = mem_store();
         seed_status(&store);
-        let fake = FakeMsg::new();
         let instances: Vec<Arc<dyn InstanceControl>> = vec![
             FakeInstance::new("i1", true, true),
             FakeInstance::new("i2", false, true),
         ];
-        let cp = plane(fake.clone(), store, instances, false);
+        let (_rec, cp) = plane(store, instances);
 
-        cp.handle("gw-01/file-replicator/cmd/status".into(), req("GetStatus", json!({})))
-            .await;
-
-        let body = fake.only_reply().1.body;
+        let body = cp.on_get_status(req("get-status", json!({}))).await.unwrap().unwrap();
         assert_eq!(body["component"], json!("com.mbreissi.edgecommons.FileReplicator"));
         assert_eq!(body["thing"], json!("gw-01"));
         assert_eq!(body["instances"].as_array().unwrap().len(), 2);
@@ -1236,17 +955,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_status_unknown_instance_is_error() {
-        let fake = FakeMsg::new();
-        let cp = plane(fake.clone(), mem_store(), vec![FakeInstance::new("i1", true, true)], false);
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/nope/status".into(),
-            req("GetStatus", json!({})),
-        )
-        .await;
-        let body = fake.only_reply().1.body;
-        assert_eq!(body["ok"], json!(false));
-        assert_eq!(body["error"], json!("unknown instance"));
+    async fn get_status_unknown_instance_is_a_coded_error() {
+        let (_rec, cp) = plane(mem_store(), vec![FakeInstance::new("i1", true, true)]);
+        let err = cp
+            .on_get_status(req("get-status", json!({ "instance": "nope" })))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ERR_UNKNOWN_INSTANCE);
     }
 
     // ---- Feature A: disabled-instance visibility in get-status (`src/permission.rs`) ---------------
@@ -1262,14 +977,13 @@ mod tests {
 
     #[tokio::test]
     async fn get_status_scoped_reports_disabled_instance_with_reason() {
-        let fake = FakeMsg::new();
-        let cp = plane(fake.clone(), mem_store(), vec![], false).with_disabled(vec![disabled_info("bad")]);
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/bad/status".into(),
-            req("GetStatus", json!({})),
-        )
-        .await;
-        let body = fake.only_reply().1.body;
+        let (_rec, cp) = plane(mem_store(), vec![]);
+        let cp = cp.with_disabled(vec![disabled_info("bad")]);
+        let body = cp
+            .on_get_status(req("get-status", json!({ "instance": "bad" })))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(body["instance"], json!("bad"));
         assert_eq!(body["active"], json!(false));
         assert_eq!(body["disabled"], json!(true));
@@ -1281,29 +995,23 @@ mod tests {
     #[tokio::test]
     async fn get_status_scoped_still_errors_for_a_truly_unknown_id() {
         // A disabled-instance entry for "bad" must not make every OTHER unknown id resolve too.
-        let fake = FakeMsg::new();
-        let cp = plane(fake.clone(), mem_store(), vec![], false).with_disabled(vec![disabled_info("bad")]);
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/nope/status".into(),
-            req("GetStatus", json!({})),
-        )
-        .await;
-        let body = fake.only_reply().1.body;
-        assert_eq!(body["error"], json!("unknown instance"));
+        let (_rec, cp) = plane(mem_store(), vec![]);
+        let cp = cp.with_disabled(vec![disabled_info("bad")]);
+        let err = cp
+            .on_get_status(req("get-status", json!({ "instance": "nope" })))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ERR_UNKNOWN_INSTANCE);
     }
 
     #[tokio::test]
     async fn get_status_component_roster_includes_disabled() {
         let store = mem_store();
         seed_status(&store);
-        let fake = FakeMsg::new();
-        let cp = plane(fake.clone(), store, vec![FakeInstance::new("i1", true, true)], false)
-            .with_disabled(vec![disabled_info("bad")]);
+        let (_rec, cp) = plane(store, vec![FakeInstance::new("i1", true, true)]);
+        let cp = cp.with_disabled(vec![disabled_info("bad")]);
 
-        cp.handle("gw-01/file-replicator/cmd/status".into(), req("GetStatus", json!({})))
-            .await;
-
-        let body = fake.only_reply().1.body;
+        let body = cp.on_get_status(req("get-status", json!({}))).await.unwrap().unwrap();
         assert_eq!(body["instances"].as_array().unwrap().len(), 2, "live + disabled");
         assert_eq!(body["summary"]["instances"], json!(2));
         assert_eq!(body["summary"]["active"], json!(1), "the disabled instance is never active");
@@ -1323,15 +1031,13 @@ mod tests {
         // OTHER instances in the component are disabled.
         let store = mem_store();
         seed_status(&store);
-        let fake = FakeMsg::new();
-        let cp = plane(fake.clone(), store, vec![FakeInstance::new("i1", true, true)], false)
-            .with_disabled(vec![disabled_info("bad")]);
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/i1/status".into(),
-            req("GetStatus", json!({})),
-        )
-        .await;
-        let body = fake.only_reply().1.body;
+        let (_rec, cp) = plane(store, vec![FakeInstance::new("i1", true, true)]);
+        let cp = cp.with_disabled(vec![disabled_info("bad")]);
+        let body = cp
+            .on_get_status(req("get-status", json!({ "instance": "i1" })))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(body.get("disabled").is_none(), "a live instance's doc has no `disabled` key at all");
     }
 
@@ -1339,32 +1045,22 @@ mod tests {
 
     #[tokio::test]
     async fn trigger_all_scans_every_instance_and_emits_component_event() {
-        let fake = FakeMsg::new();
         let i1 = FakeInstance::new("i1", true, true);
         let i2 = FakeInstance::new("i2", true, true);
-        let cp = plane(
-            fake.clone(),
-            mem_store(),
-            vec![i1.clone(), i2.clone()],
-            false,
-        );
+        let (rec, cp) = plane(mem_store(), vec![i1.clone(), i2.clone()]);
 
-        cp.handle(
-            "gw-01/file-replicator/cmd/trigger".into(),
-            req("Trigger", json!({ "ignoreWindow": true })),
-        )
-        .await;
+        let body = cp
+            .on_trigger(req("trigger", json!({ "ignoreWindow": true })))
+            .await
+            .unwrap()
+            .unwrap();
 
         // The reply is sent immediately ("accepted + counts"); the scans run as detached tasks.
-        let body = fake.only_reply().1.body;
-        assert_eq!(body["ok"], json!(true));
         assert_eq!(body["scope"], json!("all"));
         assert_eq!(body["triggered"], json!(2));
         assert_eq!(body["skipped"], json!([]));
         assert_eq!(body["ignoreWindow"], json!(true));
-        assert!(fake
-            .published_topics()
-            .contains(&"gw-01/file-replicator/evt/ScheduleTriggered".to_string()));
+        assert_eq!(rec.events_named("ScheduleTriggered").len(), 1, "one component-level event");
         eventually(|| {
             i1.triggers.load(Ordering::SeqCst) == 1 && i2.triggers.load(Ordering::SeqCst) == 1
         })
@@ -1375,24 +1071,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trigger_one_scans_only_that_instance_and_emits_instance_event() {
-        let fake = FakeMsg::new();
+    async fn trigger_one_scans_only_that_instance_and_notifies_it() {
         let i1 = FakeInstance::new("i1", true, true);
         let i2 = FakeInstance::new("i2", true, true);
-        let cp = plane(fake.clone(), mem_store(), vec![i1.clone(), i2.clone()], false);
+        let (rec, cp) = plane(mem_store(), vec![i1.clone(), i2.clone()]);
 
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/i1/trigger".into(),
-            req("Trigger", json!({})),
-        )
-        .await;
+        let body = cp
+            .on_trigger(req("trigger", json!({ "instance": "i1" })))
+            .await
+            .unwrap()
+            .unwrap();
 
-        let body = fake.only_reply().1.body;
         assert_eq!(body["scope"], json!("i1"));
         assert_eq!(body["triggered"], json!(1));
-        assert!(fake
-            .published_topics()
-            .contains(&"gw-01/file-replicator/evt/instances/i1/ScheduleTriggered".to_string()));
+        assert_eq!(i1.notified_named("ScheduleTriggered").len(), 1, "notified via InstanceControl, not a duplicate emitter");
+        assert!(rec.events_named("ScheduleTriggered").is_empty(), "the component-level emitter is untouched for a scoped trigger");
         eventually(|| i1.triggers.load(Ordering::SeqCst) == 1).await;
         assert_eq!(i2.triggers.load(Ordering::SeqCst), 0, "only i1 triggered");
         // No `ignoreWindow` in the request → the scan respects the schedule gate (default false).
@@ -1400,313 +1093,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trigger_unknown_instance_is_error_and_scans_nothing() {
-        let fake = FakeMsg::new();
+    async fn trigger_unknown_instance_is_a_coded_error_and_scans_nothing() {
         let i1 = FakeInstance::new("i1", true, true);
-        let cp = plane(fake.clone(), mem_store(), vec![i1.clone()], false);
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/nope/trigger".into(),
-            req("Trigger", json!({})),
-        )
-        .await;
+        let (_rec, cp) = plane(mem_store(), vec![i1.clone()]);
+        let err = cp
+            .on_trigger(req("trigger", json!({ "instance": "nope" })))
+            .await
+            .unwrap_err();
         assert_eq!(i1.triggers.load(Ordering::SeqCst), 0);
-        assert_eq!(fake.only_reply().1.body["ok"], json!(false));
-    }
-
-    // ---- set-activation -------------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn set_activation_deactivate_persists_by_default_and_emits_event() {
-        let fake = FakeMsg::new();
-        let i1 = FakeInstance::new("i1", true, true);
-        let cp = plane(fake.clone(), mem_store(), vec![i1.clone()], false);
-
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/i1/activation".into(),
-            req("SetActivation", json!({ "active": false })),
-        )
-        .await;
-
-        assert_eq!(*i1.last_apply.lock().unwrap(), Some((false, true)), "persist defaults true");
-        assert!(!i1.is_active());
-        let body = fake.only_reply().1.body;
-        assert_eq!(body["ok"], json!(true));
-        assert_eq!(body["active"], json!(false));
-        assert_eq!(body["persisted"], json!(true));
-        assert_eq!(body["configuredEnabled"], json!(true));
-        assert!(fake
-            .published_topics()
-            .contains(&"gw-01/file-replicator/evt/instances/i1/InstanceDeactivated".to_string()));
-    }
-
-    #[tokio::test]
-    async fn set_activation_activate_non_persistent_flips_runtime_only() {
-        let fake = FakeMsg::new();
-        let i1 = FakeInstance::new("i1", false, false);
-        let cp = plane(fake.clone(), mem_store(), vec![i1.clone()], false);
-
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/i1/activation".into(),
-            req("SetActivation", json!({ "active": true, "persist": false })),
-        )
-        .await;
-
-        assert_eq!(*i1.last_apply.lock().unwrap(), Some((true, false)));
-        assert!(i1.is_active());
-        let body = fake.only_reply().1.body;
-        assert_eq!(body["persisted"], json!(false));
-        assert!(fake
-            .published_topics()
-            .contains(&"gw-01/file-replicator/evt/instances/i1/InstanceActivated".to_string()));
-    }
-
-    #[tokio::test]
-    async fn set_activation_reset_reverts_to_configured() {
-        let fake = FakeMsg::new();
-        let i1 = FakeInstance::new("i1", false, true); // runtime off, config on
-        let cp = plane(fake.clone(), mem_store(), vec![i1.clone()], false);
-
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/i1/activation".into(),
-            req("SetActivation", json!({ "reset": true })),
-        )
-        .await;
-
-        assert_eq!(i1.resets.load(Ordering::SeqCst), 1);
-        assert!(i1.is_active(), "reverted to configured enabled=true");
-        let body = fake.only_reply().1.body;
-        assert_eq!(body["reset"], json!(true));
-        assert_eq!(body["active"], json!(true));
-    }
-
-    #[tokio::test]
-    async fn set_activation_missing_active_and_reset_is_error() {
-        let fake = FakeMsg::new();
-        let i1 = FakeInstance::new("i1", true, true);
-        let cp = plane(fake.clone(), mem_store(), vec![i1], false);
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/i1/activation".into(),
-            req("SetActivation", json!({})),
-        )
-        .await;
-        let body = fake.only_reply().1.body;
-        assert_eq!(body["ok"], json!(false));
-        assert!(body["error"].as_str().unwrap().contains("active"));
-    }
-
-    #[tokio::test]
-    async fn set_activation_unknown_instance_is_error() {
-        let fake = FakeMsg::new();
-        let cp = plane(fake.clone(), mem_store(), vec![FakeInstance::new("i1", true, true)], false);
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/nope/activation".into(),
-            req("SetActivation", json!({ "active": true })),
-        )
-        .await;
-        assert_eq!(fake.only_reply().1.body["error"], json!("unknown instance"));
-    }
-
-    #[tokio::test]
-    async fn set_activation_handler_error_is_reported() {
-        let fake = FakeMsg::new();
-        let cp = plane(fake.clone(), mem_store(), vec![FakeInstance::failing("i1")], false);
-
-        // apply path error
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/i1/activation".into(),
-            req("SetActivation", json!({ "active": true })),
-        )
-        .await;
-        assert_eq!(fake.only_reply().1.body["error"], json!("apply failed"));
-
-        // reset path error
-        let fake = FakeMsg::new();
-        let cp = plane(fake.clone(), mem_store(), vec![FakeInstance::failing("i1")], false);
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/i1/activation".into(),
-            req("SetActivation", json!({ "reset": true })),
-        )
-        .await;
-        assert_eq!(fake.only_reply().1.body["error"], json!("reset failed"));
-    }
-
-    // ---- routing / reply edge cases -------------------------------------------------------------
-
-    #[tokio::test]
-    async fn unroutable_topic_is_ignored_without_reply() {
-        let fake = FakeMsg::new();
-        let cp = plane(fake.clone(), mem_store(), vec![], false);
-        cp.handle("gw-01/file-replicator/cmd/frobnicate".into(), req("X", json!({})))
-            .await;
-        cp.handle("other/thing/cmd/config".into(), req("X", json!({}))).await;
-        assert!(fake.replies().is_empty());
-    }
-
-    #[tokio::test]
-    async fn action_runs_without_reply_when_request_has_no_reply_to() {
-        let fake = FakeMsg::new();
-        let i1 = FakeInstance::new("i1", true, true);
-        let cp = plane(fake.clone(), mem_store(), vec![i1.clone()], false);
-        // No reply_to on this request.
-        let request = MessageBuilder::new("Trigger", "1.0").payload(json!({})).build();
-        cp.handle("gw-01/file-replicator/cmd/trigger".into(), request).await;
-        eventually(|| i1.triggers.load(Ordering::SeqCst) == 1).await; // action still ran
-        assert!(fake.replies().is_empty(), "no reply without reply_to");
-    }
-
-    #[tokio::test]
-    async fn reply_publish_failure_is_swallowed() {
-        let fake = FakeMsg::new();
-        fake.fail_reply.store(true, Ordering::SeqCst);
-        let cp = plane(fake.clone(), mem_store(), vec![], false);
-        // Must not panic or propagate even though the transport returns Err.
-        cp.handle("gw-01/file-replicator/cmd/config".into(), req("GetConfig", json!({})))
-            .await;
-        assert!(fake.replies().is_empty());
-    }
-
-    // ---- start / stop / degraded ----------------------------------------------------------------
-
-    #[tokio::test]
-    async fn start_subscribes_command_space_and_legacy_when_enabled() {
-        let fake = FakeMsg::new();
-        let cp = Arc::new(plane(fake.clone(), mem_store(), vec![], true));
-        cp.clone().start().await.unwrap();
-        let subs = fake.subscribed.lock().unwrap().clone();
-        assert!(subs.contains(&"gw-01/file-replicator/cmd/#".to_string()));
-        assert!(subs.contains(&"ggcommons/gw-01/config/get/FileReplicator".to_string()));
-
-        cp.stop().await;
-        let uns = fake.unsubscribed.lock().unwrap().clone();
-        assert!(uns.contains(&"gw-01/file-replicator/cmd/#".to_string()));
-        assert!(uns.contains(&"ggcommons/gw-01/config/get/FileReplicator".to_string()));
-    }
-
-    #[tokio::test]
-    async fn start_without_legacy_subscribes_only_command_space() {
-        let fake = FakeMsg::new();
-        let cp = Arc::new(plane(fake.clone(), mem_store(), vec![], false));
-        cp.clone().start().await.unwrap();
-        assert_eq!(fake.subscribed.lock().unwrap().clone(), vec!["gw-01/file-replicator/cmd/#"]);
-    }
-
-    #[tokio::test]
-    async fn messaging_absent_is_a_graceful_no_op() {
-        // No messaging: start subscribes nothing, actions still run, replies are skipped.
-        let topics = Arc::new(Topics::from_prefix("gw-01/file-replicator"));
-        let i1 = FakeInstance::new("i1", true, true);
-        let cp = Arc::new(ControlPlane::new(
-            None,
-            topics.clone(),
-            cfg(),
-            mem_store(),
-            vec![i1.clone()],
-            Events::disabled(),
-            true,
-        ));
-        cp.clone().start().await.unwrap(); // no-op
-        cp.stop().await; // no-op
-        cp.handle("gw-01/file-replicator/cmd/instances/i1/trigger".into(), req("Trigger", json!({})))
-            .await;
-        eventually(|| i1.triggers.load(Ordering::SeqCst) == 1).await; // action ran even without messaging
-    }
-
-    #[tokio::test]
-    async fn build_resolves_prefix_events_and_legacy_from_config() {
-        let fake = FakeMsg::new();
-        let config = cfg();
-        let global = GlobalCfg {
-            topics: Some(crate::config::TopicsCfg {
-                prefix: Some("plant/{ThingName}/file-replicator".to_string()),
-                legacy_config_topic: Some(true),
-            }),
-            ..Default::default()
-        };
-        let cp = ControlPlane::build(
-            Some(fake.clone() as Arc<dyn MessagingService>),
-            &config,
-            &global,
-            mem_store(),
-            vec![],
-        );
-        assert_eq!(cp.topics.prefix(), "plant/gw-01/file-replicator");
-        assert!(cp.legacy_enabled);
-        // Config command under the resolved prefix routes.
-        assert_eq!(
-            cp.route("plant/gw-01/file-replicator/cmd/config"),
-            Some(Command::GetConfig)
-        );
-    }
-
-    // ---- fake trait coverage --------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn fake_messaging_secondary_methods_are_exercised() {
-        // Cover the fake's non-core surface so the control module's test-support does not drag its
-        // own coverage down (mirrors the event module's approach).
-        let fake = FakeMsg::new();
-        let m = MessageBuilder::new("T", "1.0").reply_to("r").build();
-        fake.publish_to_iot_core("t/iot", &m, Qos::AtLeastOnce).await.unwrap();
-        fake.publish_raw("t/raw", &json!({ "x": 1 })).await.unwrap();
-        fake.publish_to_iot_core_raw("t/rawiot", &json!({ "x": 2 }), Qos::AtMostOnce).await.unwrap();
-        let h = message_handler(|_t, _m| async {});
-        fake.subscribe_to_iot_core("f/#", h, Qos::AtLeastOnce, 8, 1).await.unwrap();
-        fake.unsubscribe_from_iot_core("f/#").await.unwrap();
-        fake.reply_to_iot_core(&m, MessageBuilder::new("R", "1.0").build()).await.unwrap();
-        assert!(fake.connected());
-        assert_eq!(fake.published.lock().unwrap().len(), 3);
-        assert_eq!(fake.replies().len(), 1);
-    }
-
-    // ---- P3 review-finding regressions ----------------------------------------------------------
-
-    #[tokio::test]
-    async fn subscribed_handler_dispatches_command_and_replies() {
-        // The subscribe→dispatch→reply wiring (the closure built in `start`) was previously only
-        // proven by the self-skipping EMQX suite. Drive it through the recorded handler, no broker.
-        let fake = FakeMsg::new();
-        let cp = Arc::new(plane(fake.clone(), mem_store(), vec![], false));
-        cp.clone().start().await.unwrap();
-        fake.deliver("gw-01/file-replicator/cmd/config", req("GetConfig", json!({})))
-            .await;
-        let (to, reply) = fake.only_reply();
-        assert_eq!(to, "reply/here");
-        assert_eq!(reply.header.name, REPLY_MESSAGE_NAME);
-        assert_eq!(reply.body["ok"], json!(true));
-        assert_eq!(reply.body["config"], cp.config.raw);
+        assert_eq!(err.code, ERR_UNKNOWN_INSTANCE);
     }
 
     #[tokio::test]
     async fn trigger_deactivated_instance_reports_skipped_and_scans_nothing() {
         // Triggering a deactivated instance must not falsely ack `triggered:1` — its tick is a no-op.
-        let fake = FakeMsg::new();
         let i1 = FakeInstance::new("i1", false, true); // deactivated
-        let cp = plane(fake.clone(), mem_store(), vec![i1.clone()], false);
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/i1/trigger".into(),
-            req("Trigger", json!({})),
-        )
-        .await;
-        let body = fake.only_reply().1.body;
-        assert_eq!(body["ok"], json!(true));
+        let (_rec, cp) = plane(mem_store(), vec![i1.clone()]);
+        let body = cp
+            .on_trigger(req("trigger", json!({ "instance": "i1" })))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(body["triggered"], json!(0));
         assert_eq!(body["skipped"], json!("inactive"));
         assert_eq!(i1.triggers.load(Ordering::SeqCst), 0, "no scan forced on a deactivated instance");
         assert!(
-            !fake.published_topics().iter().any(|t| t.ends_with("/ScheduleTriggered")),
-            "no ScheduleTriggered emitted for a skipped instance"
+            i1.notified_named("ScheduleTriggered").is_empty(),
+            "no ScheduleTriggered notified for a skipped instance"
         );
     }
 
     #[tokio::test]
     async fn trigger_all_counts_only_active_instances() {
-        let fake = FakeMsg::new();
         let on = FakeInstance::new("on", true, true);
         let off = FakeInstance::new("off", false, true);
-        let cp = plane(fake.clone(), mem_store(), vec![on.clone(), off.clone()], false);
-        cp.handle("gw-01/file-replicator/cmd/trigger".into(), req("Trigger", json!({})))
-            .await;
-        let body = fake.only_reply().1.body;
+        let (_rec, cp) = plane(mem_store(), vec![on.clone(), off.clone()]);
+        let body = cp.on_trigger(req("trigger", json!({}))).await.unwrap().unwrap();
         assert_eq!(body["triggered"], json!(1));
         assert_eq!(body["instances"], json!(["on"]));
         assert_eq!(body["skipped"], json!(["off"]));
@@ -1714,97 +1136,148 @@ mod tests {
         assert_eq!(off.triggers.load(Ordering::SeqCst), 0, "inactive instance never triggered");
     }
 
+    // ---- set-activation -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn set_activation_deactivate_persists_by_default_and_notifies() {
+        let i1 = FakeInstance::new("i1", true, true);
+        let (_rec, cp) = plane(mem_store(), vec![i1.clone()]);
+
+        let body = cp
+            .on_set_activation(req("set-activation", json!({ "instance": "i1", "active": false })))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(*i1.last_apply.lock().unwrap(), Some((false, true)), "persist defaults true");
+        assert!(!i1.is_active());
+        assert_eq!(body["active"], json!(false));
+        assert_eq!(body["persisted"], json!(true));
+        assert_eq!(body["configuredEnabled"], json!(true));
+        assert_eq!(i1.notified_named("InstanceDeactivated").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_activation_activate_non_persistent_flips_runtime_only() {
+        let i1 = FakeInstance::new("i1", false, false);
+        let (_rec, cp) = plane(mem_store(), vec![i1.clone()]);
+
+        let body = cp
+            .on_set_activation(req(
+                "set-activation",
+                json!({ "instance": "i1", "active": true, "persist": false }),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(*i1.last_apply.lock().unwrap(), Some((true, false)));
+        assert!(i1.is_active());
+        assert_eq!(body["persisted"], json!(false));
+        assert_eq!(i1.notified_named("InstanceActivated").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_activation_reset_reverts_to_configured() {
+        let i1 = FakeInstance::new("i1", false, true); // runtime off, config on
+        let (_rec, cp) = plane(mem_store(), vec![i1.clone()]);
+
+        let body = cp
+            .on_set_activation(req("set-activation", json!({ "instance": "i1", "reset": true })))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(i1.resets.load(Ordering::SeqCst), 1);
+        assert!(i1.is_active(), "reverted to configured enabled=true");
+        assert_eq!(body["reset"], json!(true));
+        assert_eq!(body["active"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn set_activation_missing_active_and_reset_is_a_coded_error() {
+        let i1 = FakeInstance::new("i1", true, true);
+        let (_rec, cp) = plane(mem_store(), vec![i1]);
+        let err = cp
+            .on_set_activation(req("set-activation", json!({ "instance": "i1" })))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ERR_INVALID_REQUEST);
+        assert!(err.message.contains("active"));
+    }
+
+    #[tokio::test]
+    async fn set_activation_missing_instance_is_a_coded_error() {
+        let (_rec, cp) = plane(mem_store(), vec![FakeInstance::new("i1", true, true)]);
+        let err = cp
+            .on_set_activation(req("set-activation", json!({ "active": true })))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ERR_INSTANCE_REQUIRED, "set-activation has no \"all\" form");
+    }
+
+    #[tokio::test]
+    async fn set_activation_unknown_instance_is_a_coded_error() {
+        let (_rec, cp) = plane(mem_store(), vec![FakeInstance::new("i1", true, true)]);
+        let err = cp
+            .on_set_activation(req("set-activation", json!({ "instance": "nope", "active": true })))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ERR_UNKNOWN_INSTANCE);
+    }
+
+    #[tokio::test]
+    async fn set_activation_handler_error_is_reported() {
+        let (_rec, cp) = plane(mem_store(), vec![FakeInstance::failing("i1")]);
+
+        // apply path error
+        let err = cp
+            .on_set_activation(req("set-activation", json!({ "instance": "i1", "active": true })))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ERR_ACTIVATION_FAILED);
+        assert!(err.message.contains("apply failed"));
+
+        // reset path error
+        let (_rec, cp) = plane(mem_store(), vec![FakeInstance::failing("i1")]);
+        let err = cp
+            .on_set_activation(req("set-activation", json!({ "instance": "i1", "reset": true })))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("reset failed"));
+    }
+
     #[tokio::test]
     async fn set_activation_tolerates_greengrass_numeric_bools() {
         // A numeric `persist`/`active` (Greengrass delivers config/message numbers as doubles) must NOT
         // fail whole-body deserialization and silently drop the command (which used to reply a
         // misleading "requires active" while the instance kept replicating).
-        let fake = FakeMsg::new();
         let i1 = FakeInstance::new("i1", true, true);
-        let cp = plane(fake.clone(), mem_store(), vec![i1.clone()], false);
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/i1/activation".into(),
-            req("SetActivation", json!({ "active": false, "persist": 1 })),
-        )
-        .await;
+        let (_rec, cp) = plane(mem_store(), vec![i1.clone()]);
+        let body = cp
+            .on_set_activation(req(
+                "set-activation",
+                json!({ "instance": "i1", "active": false, "persist": 1 }),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(*i1.last_apply.lock().unwrap(), Some((false, true)), "numeric persist:1 → true");
         assert!(!i1.is_active(), "numeric active:false honored, not dropped");
-        let body = fake.only_reply().1.body;
-        assert_eq!(body["ok"], json!(true));
         assert_eq!(body["active"], json!(false));
         assert_eq!(body["persisted"], json!(true));
     }
 
     #[tokio::test]
-    async fn set_activation_republishes_retained_state_snapshot() {
-        // After a deactivate the retained `state/instances/{id}` must be republished (a deactivated
-        // tick never republishes), or the snapshot would stay `active:true` forever.
-        let fake = FakeMsg::new();
-        let i1 = FakeInstance::new("i1", true, true);
-        let cp = plane(fake.clone(), mem_store(), vec![i1], false);
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/i1/activation".into(),
-            req("SetActivation", json!({ "active": false })),
-        )
-        .await;
-        let inst_state = fake
-            .published_messages()
-            .into_iter()
-            .rfind(|(t, m)| {
-                t == "gw-01/file-replicator/state/instances/i1"
-                    && m.header.name == crate::events::STATE_MESSAGE_NAME
-            })
-            .expect("a per-instance state snapshot republished after deactivation");
-        assert_eq!(inst_state.1.body["instance"], json!("i1"));
-        assert_eq!(inst_state.1.body["active"], json!(false), "snapshot reflects the new state");
-        assert!(
-            fake.published_messages().iter().any(|(t, m)| t == "gw-01/file-replicator/state"
-                && m.header.name == crate::events::STATE_MESSAGE_NAME),
-            "component roster snapshot also refreshed"
-        );
-    }
-
-    #[tokio::test]
     async fn get_status_reports_configured_schedule_mode_and_omits_link() {
-        let fake = FakeMsg::new();
         let i1 = FakeInstance::with_schedule("i1", true, true, "window");
-        let cp = plane(fake.clone(), mem_store(), vec![i1], false);
-        cp.handle(
-            "gw-01/file-replicator/cmd/instances/i1/status".into(),
-            req("GetStatus", json!({})),
-        )
-        .await;
-        let body = fake.only_reply().1.body;
+        let (_rec, cp) = plane(mem_store(), vec![i1]);
+        let body = cp
+            .on_get_status(req("get-status", json!({ "instance": "i1" })))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(body["schedule"]["mode"], json!("window"), "configured mode, not a literal");
         assert!(body.get("link").is_none(), "link omitted until the P4 circuit-breaker exists");
-    }
-
-    #[tokio::test]
-    async fn publish_initial_state_snapshots_every_instance_and_the_component() {
-        // An idle component (nothing ticked yet) must still publish every instance's current state at
-        // startup so a fresh subscriber renders it.
-        let fake = FakeMsg::new();
-        let instances: Vec<Arc<dyn InstanceControl>> = vec![
-            FakeInstance::new("i1", true, true),
-            FakeInstance::with_schedule("i2", false, true, "window"),
-        ];
-        let cp = plane(fake.clone(), mem_store(), instances, false);
-        cp.publish_initial_state(now_ms()).await;
-        let states: Vec<(String, Message)> = fake
-            .published_messages()
-            .into_iter()
-            .filter(|(_, m)| m.header.name == crate::events::STATE_MESSAGE_NAME)
-            .collect();
-        assert!(states.iter().any(|(t, _)| t == "gw-01/file-replicator/state/instances/i1"));
-        let i2 = states
-            .iter()
-            .find(|(t, _)| t == "gw-01/file-replicator/state/instances/i2")
-            .expect("i2 state snapshot");
-        assert_eq!(i2.1.body["schedule"]["mode"], json!("window"));
-        assert_eq!(i2.1.body["active"], json!(false));
-        assert!(
-            states.iter().any(|(t, _)| t == "gw-01/file-replicator/state"),
-            "component roster snapshot published"
-        );
     }
 }

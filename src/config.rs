@@ -22,8 +22,13 @@
 //! (`file_replicator::schedule`) consumes the cron/window schedule payloads
 //! (`CronSchedule`/`WindowSchedule`/`WindowClose`). What remains unconsumed is genuinely future
 //! scope, so the few types it covers carry a **narrow, reason-tagged** `allow(dead_code)`: the S3
-//! egress model (`S3Egress`/`MultipartCfg`, P2) and the UNS topic override (`TopicsCfg` +
-//! `InstanceCfg::topics`, P3). They are removed as each phase wires them in.
+//! egress model (`S3Egress`/`MultipartCfg`, P2). They are removed as each phase wires them in.
+//!
+//! **UNS migration note**: the old `TopicsCfg` (`component.global.topics.prefix` /
+//! `InstanceCfg.topics` / `legacyConfigTopic`) is REMOVED, not deprecated — topics are now minted by
+//! the ggcommons UNS grammar (`ecv1/{device}/{component}/{instance}/{class}`), which has no
+//! configurable prefix and no legacy-alias concept (see `crate::control`/`crate::events` module
+//! docs).
 
 use std::path::PathBuf;
 
@@ -165,11 +170,6 @@ pub struct InstanceCfg {
     pub retry: Option<RetryCfg>,
     /// Concurrency + bandwidth caps (per-instance; global caps live under `component.global`).
     pub limits: Option<LimitsCfg>,
-    /// Per-instance UNS topic override (default is `component.global.topics.prefix`).
-    // P3: parsed and read (to warn on use), but a per-instance `prefix` override is DEFERRED — it
-    // would split an instance's command surface from its event/state stream (DESIGN §15.7); the whole
-    // component shares the component prefix in P3. The component-wide `global.topics.prefix` IS honored.
-    pub topics: Option<TopicsCfg>,
     /// Per-instance override of `component.global.onPermissionError` (`None` inherits the component
     /// default — see [`PermissionPolicy`] and [`resolve_permission_policy`]). Parsed leniently: a typo'd
     /// value warns and falls back to `None` (inherit) rather than dropping the whole instance.
@@ -749,20 +749,6 @@ pub struct LimitsCfg {
     pub max_bandwidth: Option<String>,
 }
 
-/// UNS topic override (DESIGN §15).
-// P3 (control/events on the unified namespace): read by the topic builder, not the engine.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TopicsCfg {
-    /// Topic prefix template (default `{ThingName}/file-replicator`).
-    pub prefix: Option<String>,
-    /// Also answer the core `ggcommons/{thing}/config/get/{ComponentName}` GetConfiguration topic
-    /// (DESIGN §15.6). Off by default; opt in with `legacyConfigTopic: true` under
-    /// `component.global.topics`. Consumed by the P3 control plane, not the engine.
-    pub legacy_config_topic: Option<bool>,
-}
-
 /// Component-global config subtree (`component.global`, DESIGN §7.2): aggregate concurrency +
 /// bandwidth caps and cross-instance defaults. Every field is optional; an absent `component.global`
 /// yields all-defaults.
@@ -774,9 +760,6 @@ pub struct GlobalCfg {
     pub limits: Option<LimitsCfg>,
     /// Cross-instance defaults (currently the fallback retry policy).
     pub defaults: Option<GlobalDefaults>,
-    /// Global UNS topic prefix. P3 (control/events): consumed by the topic builder, not the engine.
-    #[allow(dead_code)]
-    pub topics: Option<TopicsCfg>,
     /// Component-wide default startup-validation / runtime permission-error policy (an instance's own
     /// `onPermissionError` wins — see [`resolve_permission_policy`]). Defaults to `disableInstance`.
     /// Parsed leniently so a typo'd value falls back to the default WITHOUT dropping the rest of

@@ -210,7 +210,6 @@ async fn fanout_two_local_dests_both_receive_content_source_completes_once() {
         },
         retry: None,
         limits: None,
-        topics: None,
         on_permission_error: None,
         priority: 100,
     };
@@ -283,7 +282,6 @@ async fn one_permanently_failing_dest_blocks_completion_but_preserves_the_other_
         },
         retry: None,
         limits: None,
-        topics: None,
         on_permission_error: None,
         priority: 100,
     };
@@ -403,7 +401,6 @@ async fn crash_mid_fanout_recovers_by_delivering_only_the_remaining_destination(
         },
         retry: None,
         limits: None,
-        topics: None,
         on_permission_error: None,
         priority: 100,
     };
