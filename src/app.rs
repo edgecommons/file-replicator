@@ -132,6 +132,21 @@ impl App {
             tracing::error!(instance = %id, "duplicate instance id; skipping (ids must be unique)");
         }
 
+        // #1c: report each instance's SOURCE-DIRECTORY availability at the instance level via the main
+        // state keepalive's instances[] (the file-replicator's per-instance liveness — it is a
+        // control-plane component with no data class, so connectivity IS the instance-level signal). The
+        // provider stats each configured ingress path at call time (cheap, non-blocking); an id whose
+        // watched directory is missing/unreadable reports disconnected.
+        {
+            let source_dirs: Vec<(String, std::path::PathBuf)> = instances_cfg
+                .iter()
+                .map(|c| (c.id.clone(), c.ingress.path.clone()))
+                .collect();
+            gg.set_instance_connectivity_provider(Some(std::sync::Arc::new(move || {
+                source_dir_connectivity(&source_dirs)
+            })));
+        }
+
         // Cross-cutting backend deps (DESIGN §11.5): the credential service (for a `{"$secret":"…"}`
         // egress) rides in here; each instance threads its own store in `Instance::build`. Building it
         // once and cloning per instance keeps a single shared credential handle.
@@ -321,9 +336,42 @@ impl App {
     }
 }
 
+/// Map configured (instance id, ingress source dir) pairs to their per-instance connectivity for the
+/// #1c `state` `instances[]`: an instance whose watched source directory is present + a directory
+/// reports connected (with the path as the detail), else disconnected.
+fn source_dir_connectivity(
+    dirs: &[(String, std::path::PathBuf)],
+) -> Vec<ggcommons::heartbeat::InstanceConnectivity> {
+    dirs.iter()
+        .map(|(id, path)| {
+            ggcommons::heartbeat::InstanceConnectivity::new(
+                id.clone(),
+                path.is_dir(),
+                Some(path.display().to_string()),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_dir_connectivity_reports_per_instance_availability() {
+        let present = std::env::temp_dir(); // an existing directory
+        let absent = present.join("file-replicator-no-such-dir-xyz-1c");
+        let conns = source_dir_connectivity(&[
+            ("in".to_string(), present.clone()),
+            ("gone".to_string(), absent.clone()),
+        ]);
+        assert_eq!(conns.len(), 2);
+        assert_eq!(conns[0].instance, "in");
+        assert!(conns[0].connected, "an existing dir reports connected");
+        assert_eq!(conns[0].detail, Some(present.display().to_string()));
+        assert_eq!(conns[1].instance, "gone");
+        assert!(!conns[1].connected, "a missing source dir reports disconnected");
+    }
     use crate::config::{EgressCfg, IngressCfg, LocalEgress, ScheduleCfg};
 
     fn cfg(id: &str, path: &str) -> InstanceCfg {
