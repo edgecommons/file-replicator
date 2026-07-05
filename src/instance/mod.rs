@@ -259,7 +259,7 @@ impl Instance {
                 if l.path.starts_with(&cfg.ingress.path) {
                     tracing::debug!(
                         instance = %cfg.id, dest = %l.path.display(),
-                        "local egress is under the watch root; pruning it from discovery (FR-ING-8)"
+                        "local egress is under the watch root; pruning it from discovery"
                     );
                     skip.push(l.path.clone());
                 }
