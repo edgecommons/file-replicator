@@ -64,9 +64,33 @@ flow to a time span, for bandwidth conservation. Work outside the window waits; 
 window close either finishes or pauses/resumes next window. (DESIGN §12.)
 
 ## Resilience across long outages
-Retries are **time-governed** (`giveUpAfter`, default 7 days) rather than attempt-capped, uploads **resume**
-from persisted checkpoints, and a **disconnection circuit-breaker** avoids a reconnect thundering-herd —
-so a multi-hour to ~2-day outage is tolerated without loss. (DESIGN §13.4.)
+Two mechanisms carry a transfer across a destination being unreachable for a long time, and **both ship
+today**:
+
+- **Time-governed retries.** A failed attempt is retried on an exponential backoff (`retry.baseDelayMs` →
+  `retry.maxDelayMs`) and the item keeps retrying until a **time budget** — `retry.giveUpAfter`, default
+  **7 days** — elapses, *not* until some attempt count is reached. (`retry.maxAttempts` is an optional extra
+  hard cap; by default there is none — retries are purely time-governed.) So an endpoint that is down for
+  hours to a couple of days is simply retried across the outage rather than exhausted early. When the budget
+  finally expires the file becomes Failed and follows `completion.onExhausted` (retain-in-place or
+  quarantine).
+- **Resumable, checkpointed transfers.** In-flight progress is checkpointed to the durable store, so a
+  transfer interrupted by a crash, a restart, or the destination dropping mid-upload **resumes from where it
+  left off** rather than re-sending the whole file — S3 persists multipart parts, and HTTP / SFTP / FTPS /
+  GCS / Azure each resume through their backend's ranged-PUT / append / session / staged-block mechanism (see
+  [Reference › Destinations](reference/destinations.md)).
+
+Together these tolerate a multi-hour-to-multi-day outage without loss. (DESIGN §13.4.)
+
+> **Deferred — the disconnection circuit-breaker.** DESIGN §13.4 also specifies a destination
+> *circuit-breaker* that would trip after repeated failures and stagger reconnects to avoid a reconnect
+> thundering-herd, surfacing `Disconnected`/`Reconnected` alarm events and a `get-status` `link` field. **It
+> is not implemented.** The `Disconnected`/`Reconnected` variants exist in `src/events.rs` but are marked
+> `Deferred` and are never emitted, and `get-status` deliberately omits the `link` field until it lands (see
+> `CLAUDE.md` and [Reference › Messaging interface](reference/messaging-interface.md)). Today's long-outage
+> tolerance rests entirely on the two shipped mechanisms above — each failing transfer independently backs
+> off and retries on its own schedule within the `giveUpAfter` budget, with no shared breaker gating
+> reconnects.
 
 ## Cross-instance priority
 Every instance shares two process-wide governors (DESIGN §8.3): the global bandwidth token bucket, and

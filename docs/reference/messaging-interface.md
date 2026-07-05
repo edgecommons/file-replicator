@@ -68,7 +68,7 @@ severity + type — the topic and the body can never disagree (DESIGN-class-faca
 | `schedule-triggered` | info | — | `scope` (`"all"` or an instance id) |
 | `window-opened` / `window-closed` | info | — | `window` (the schedule's human-readable label) |
 | `schedule-complete` | info | — | `mode` (`"cron"` \| `"window"`) |
-| `disconnected` | critical | `raise_alarm` | `link` — **deferred** (the P4 destination circuit-breaker; `Reconnected` `clear_alarm`s the SAME `disconnected` channel once built) |
+| `disconnected` | critical | `raise_alarm` | `link` — **deferred** (the DESIGN §13.4 destination circuit-breaker; `Reconnected` `clear_alarm`s the SAME `disconnected` channel once built) |
 | `permission-denied` | critical | — | `path`, `role` (`ingress`\|`egress`\|`archive`\|`failed`) (`message` carries the error) |
 
 `permission-denied` — a directory/target the instance depends on is unreadable/unwritable, at startup or

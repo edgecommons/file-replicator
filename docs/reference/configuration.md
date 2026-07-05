@@ -2,10 +2,10 @@
 
 The canonical configuration reference. There is no per-component JSON schema in the ecosystem; **this
 document is the source of truth**, and it is validated against the parser in `src/config.rs` (not against
-other docs). Fields are added here as each phase implements them; the component has shipped through P6
-(DESIGN §21), so most of the parser's actual field surface — including the P5 destinations and P6
-multi-destination `egress` — is ahead of what's documented below; treat gaps here as a docs lag, not an
-implementation gap.
+other docs). It covers the full shipped field surface (through P6, DESIGN §21): the component config, all
+seven `egress` backends, scheduling, completion, retry, limits, and permission policy. Per-backend
+destination fields (all of them) are tabulated in [Reference › Destinations](destinations.md); the
+`get-status` and event payloads in [Reference › Data types](data-types.md).
 
 The component owns the `component` section (`component.global` + `component.instances[]`). Sibling sections
 (`messaging`, `credentials`, `logging`, `heartbeat`, `metricEmission`, `health`, `tags`) are parsed by the
@@ -58,13 +58,27 @@ The component owns the `component` section (`component.global` + `component.inst
 > [Explanation › Discovery](../explanation.md).
 
 ### `egress` (item)
-`type` selects the backend: `local` \| `s3` (both on by default) \| `sftp` \| `ftps` \| `http` \| `azure` \|
-`gcs` (all implemented, each behind its own off-by-default cargo feature — `dest-sftp`/`dest-ftps`/
-`dest-http`/`dest-azure`/`dest-gcs`). See [Reference › Destinations](destinations.md) for per-backend
-fields. `local`: `path`,
-`fsync`. `s3`: `bucket`, `prefix`, `region`, `endpointUrl`, `credentials` (`$secret`; optional — ambient
-by default), `storageClass`, `sse`/`kmsKeyId`, `accelerate`, `unsignedPayload`, `checksumAlgorithm`,
-`multipart.{thresholdBytes,partSizeBytes,maxConcurrentParts}`.
+`egress` is an ordered list of `N >= 1` destination items; each fans out independently and a file completes
+only once **every** item verifies. `type` selects the backend:
+
+| `type` | Feature (default?) | Required fields | Full field table |
+|---|---|---|---|
+| `local` | built-in (always) | `path` | [destinations › local](destinations.md#local) |
+| `s3` | `dest-s3` (**on**) | `bucket` | [destinations › s3](destinations.md#s3) |
+| `sftp` | `dest-sftp` (off) | `host` | [destinations › sftp](destinations.md#sftp) |
+| `ftps` | `dest-ftps` (off) | `host` | [destinations › ftps](destinations.md#ftps) |
+| `http` | `dest-http` (off) | `url` | [destinations › http](destinations.md#http-httphttps) |
+| `azure` | `dest-azure` (off) | `account`, `container` | [destinations › azure](destinations.md#azure-azure-blob) |
+| `gcs` | `dest-gcs` (off) | `bucket` | [destinations › gcs](destinations.md#gcs-google-cloud-storage) |
+
+All backends are implemented; the off-by-default ones join the build only when their `dest-*` cargo feature
+is enabled. Every full field table (all fields, types, defaults) lives in
+[Reference › Destinations](destinations.md). Quick summary of the two default-on backends: `local`: `path`,
+`fsync`. `s3`: `bucket`, `prefix`, `region`, `endpointUrl`, `credentials` (`$secret`; optional — ambient by
+default), `storageClass`, `sse`/`kmsKeyId`, `accelerate`, `unsignedPayload`, `checksumAlgorithm`,
+`multipart.{thresholdBytes,partSizeBytes,maxConcurrentParts}`. Across every non-`local` backend,
+`checksumAlgorithm` defaults to `CRC32C` (alt `SHA256`) and `credentials` is an optional `{"$secret":"…"}`
+vault ref; ambient plaintext secrets are supported but redacted in logs/`Debug` (FR-CFG-5).
 
 ### `schedule`
 `mode`: `immediate` (default) \| `cron` (`expression`, `timezone`) \| `window` (`open`, `close` **or**

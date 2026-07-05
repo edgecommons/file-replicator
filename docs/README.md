@@ -10,11 +10,8 @@ unified namespace for realtime UIs. Runs standalone (**HOST**), on **Greengrass*
 
 > **Status: implemented through P6** (local + S3 + control/events/UNS + cron/window scheduling + SFTP/
 > FTPS/HTTP/Azure/GCS + multi-destination fan-out — see `DESIGN.md` §21 and `git log`). Only P7 (optional
-> core promotion) is outstanding. The authoritative specification is
-> [`DESIGN.md`](https://github.com/edgecommons/file-replicator/blob/main/DESIGN.md) in the repo root. These
-> docs are authored per implementation phase and validated against the source, but as of P6 several pages
-> still describe an earlier phase than what's shipped — start with the design doc and `src/` for anything
-> that looks out of date here.
+> core promotion) is outstanding. These docs are validated against `src/`; the deep design rationale lives
+> in [`DESIGN.md`](https://github.com/edgecommons/file-replicator/blob/main/DESIGN.md) in the repo root.
 
 ## Where to go
 
@@ -26,4 +23,5 @@ unified namespace for realtime UIs. Runs standalone (**HOST**), on **Greengrass*
 | Understand the design & concepts | [Explanation](explanation.md) |
 | Look up every config field | [Reference › Configuration](reference/configuration.md) |
 | Integrate with control/events | [Reference › Messaging interface](reference/messaging-interface.md) |
-| Compare destination backends | [Reference › Destinations](reference/destinations.md) |
+| Compare destination backends + every field | [Reference › Destinations](reference/destinations.md) |
+| Parse `get-status` + event `context` payloads | [Reference › Data types](reference/data-types.md) |
