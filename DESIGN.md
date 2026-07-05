@@ -16,6 +16,33 @@ coverage (`.github/workflows/ci.yml`); only P7 (optional) remains. Inline notes 
 tagged with a phase (e.g. "P3 status", "P5 note") already reflect the shipped code as of the phase they
 name and do not need correction — check `src/` before assuming a gap noted there has since been closed.
 
+> **STATUS BANNER — the UNS/messaging surface was migrated AFTER this doc's last revision (2026-07-03).**
+> §15–§17 below describe the component's ORIGINAL, hand-rolled `{thing}/file-replicator/{cmd|evt|state}/…`
+> topic scheme (`src/uns.rs`) and its retained-`state/…` interim. That whole surface was subsequently
+> **migrated onto the ggcommons UNS core + message-class facades** (commit `refactor: migrate the
+> UNS/messaging surface onto the new ggcommons core + facades`, and the `ggcommons` `v0.2.0` pin). As
+> shipped today:
+> - Topics are minted by `gg.commands()`/`gg.events()` at `ecv1/{device}/FileReplicator/{instance}/{class}`
+>   (`{class}` ∈ `cmd`·`evt`, plus the reserved library-owned `state`/`cfg`/`metric`/`log`). **`src/uns.rs`
+>   is deleted.**
+> - The `component.global.topics.prefix` / `InstanceCfg.topics` config and the `legacyConfigTopic` alias
+>   are **removed** (no configurable prefix, no core-`GetConfiguration` alias).
+> - The custom `get-config` verb is **retired** — the library's built-in `get-configuration` answers it,
+>   returning the **redacted** effective config. Instance scoping is now a request-**body** field, not a
+>   topic segment (`cmd/get-status` + `{instance?}`, not `cmd/instances/{id}/status`).
+> - The retained `state/…` snapshot is **dropped outright** — `state` is now a reserved, library-owned
+>   class carrying only the RUNNING/STOPPED keepalive. This **closes the FR-EVT-4 "no `publish_retained`"
+>   gap by removing the need for it**, not by adding retention; `get-status` remains the
+>   current-state-on-demand path (unchanged).
+>
+> The **authoritative current wire contract** is [`docs/reference/messaging-interface.md`](docs/reference/messaging-interface.md)
+> plus the `src/events.rs` / `src/control.rs` module docs. §15–§17's requirements & rationale stand as the
+> historical design record, but treat their concrete topic strings, every `src/uns.rs` /
+> `legacyConfigTopic` / `topics.prefix` / `get-config` reference, and every "retained pending" /
+> "non-retained interim" / "✅ shipped (P3, `src/uns.rs`)" status note as **superseded** by this migration.
+> The destination disconnection circuit-breaker (§13.4/§16 — `Event::Disconnected`/`Reconnected` `Deferred`
+> in `src/events.rs`) remains genuinely deferred and is unaffected by the migration.
+
 ### Changes since v0.1 (review round 1)
 
 | # | Your feedback | Where addressed |
@@ -207,7 +234,7 @@ IDs follow the ecosystem `FR-<AREA>-<n>` convention. RFC-2119 keywords.
 - **FR-EVT-1** — Publish lifecycle events on the UNS with intelligent defaults: file discovered/ready, upload started/progress(throttled)/completed/failed, file archived/deleted/quarantined, retries-exhausted, schedule-triggered, window-opened/closed, scan-complete, **instance-activated/deactivated**, component-ready.
 - **FR-EVT-2** — Progress events MUST be **throttled** (percent delta and/or time).
 - **FR-EVT-3** — Events MUST carry enough context (instance, relative path, size, bytes-done, destination, attempt) to drive a UI without extra lookups.
-- **FR-EVT-4** — Current per-instance/component **state** MUST be published **retained** so a fresh subscriber (edge UI or cloud) gets the latest snapshot on connect (§15, §17). **Implementation status (P3): a KNOWN GAP.** The ggcommons Rust `MessagingService` exposes no MQTT retain flag today, so state is published **non-retained** (best-effort): live subscribers see every snapshot on each transition, but a subscriber that connects *after* the last snapshot will not receive it. The reliable current-state-on-demand path is the `cmd/status` request/reply, which works regardless. Closing the gap needs a one-line, four-language ggcommons enhancement (`publish_retained`) — see the module docs in `src/events.rs`. We do NOT fake retention (no periodic republish spam).
+- **FR-EVT-4** — Current per-instance/component **state** was to be published **retained** so a fresh subscriber (edge UI or cloud) gets the latest snapshot on connect (§15, §17). **Implementation status — RESOLVED by the UNS-core migration (see §1 status banner), NOT by adding retention.** The component-specific retained `state/…` publish was **dropped outright**: `state` is now a reserved, library-owned UNS class carrying only the RUNNING/STOPPED keepalive (the platform-wide "retain dropped, LWT-only; a timestamped app-layer cache is the retain substitute" decision — edge-console mandate walk M7). The reliable current-state-on-demand path is the `get-status` command (a `gg.commands()` verb), unchanged and returning the exact same document a live subscriber used to be pushed. This closes the old "no `publish_retained`" gap by removing the need for it — see the `src/events.rs` / `src/control.rs` module docs.
 
 ---
 
@@ -917,11 +944,11 @@ the inconsistent `ggcommons/` root and add the `class` layer (§15.6).
 | Instance current state | state | `…/state/instances/{instance}` | **yes**¹ |
 | Component current state | state | `…/state` | **yes**¹ |
 
-¹ **Retained is the target; not yet met in P3.** The ggcommons Rust `MessagingService` has no retain
-flag, so `state/…` is published **non-retained** today (see FR-EVT-4 and `src/events.rs`). The
-component still publishes the current-state snapshot on every transition *and* an initial snapshot at
-startup, so live subscribers stay in sync; only the connect-after-the-fact case degrades (use
-`cmd/status` for reliable current state on demand).
+¹ **Superseded by the UNS-core migration (see §1 status banner).** This component-owned retained
+`state/…` publish was **dropped outright**, not shipped: under the UNS core `state` is a reserved,
+library-owned class (RUNNING/STOPPED keepalive only), so the whole "retained yes/pending" row above no
+longer applies. The reliable current-state path is the `get-status` command (see FR-EVT-4 and
+`docs/reference/messaging-interface.md`).
 
 Deepest topic = `…/cmd/instances/{instance}/activation` = **5 slashes** (well under 7). Replies use the
 request's `reply_to` (ephemeral) — no fixed reply topics.
@@ -959,8 +986,10 @@ flowchart LR
 `thing` is globally unique, so bridging (`#`, or per-thing) preserves distinctness with **no location segments
 needed**. Consumers select with wildcards: all file-replicator state across the fleet
 (`+/file-replicator/state/#`), one edge (`{thing}/file-replicator/#`), one instance
-(`+/file-replicator/evt/instances/{id}/#`). `state/…` is meant to give a dashboard the latest snapshot on
-connect via retain — still not met as of P6 (§15.3 footnote; non-retained interim). Location filtering
+(`+/file-replicator/evt/instances/{id}/#`). (This wildcard analysis is for the ORIGINAL scheme; the shipped
+UNS-core topics are `ecv1/{device}/FileReplicator/{instance}/{class}` — §1 banner.) The component-owned
+retained `state/…` snapshot was dropped (§15.3 footnote); a dashboard gets current state via `get-status`.
+Location filtering
 (site/enterprise) happens on the envelope `tags` (consumer-side or a cloud rule), since those aren't
 reliable enough to sit in the path.
 
@@ -968,57 +997,70 @@ reliable enough to sit in the path.
 
 Core publishes heartbeat/metrics under `ggcommons/{ThingName}/{ComponentName}/…` and answers
 `GetConfiguration` on `ggcommons/{ThingName}/config/get/{ComponentName}`. Our scheme intentionally keeps
-core's `{thing}/{component}` ordering — minus the `ggcommons/` root, plus the `class` layer. Plan (status as
-of P6, this repo's `git log`):
-1. **file-replicator** uses `{thing}/file-replicator/{class}/…` now. — ✅ shipped (P3, `src/uns.rs`).
-2. **Optional legacy alias:** also answer the core `ggcommons/{thing}/config/get/{component}` for
-   `GetConfiguration` so existing config-source clients keep working (`legacyConfigTopic: true`). — ✅
-   shipped (P3; `legacy_config_topic()` in `src/uns.rs`, wired in `src/control.rs`) — this was still framed
-   as a future "plan" step in earlier drafts of this doc.
-3. **Separate core proposal:** drop the `ggcommons/` root and adopt the `class` layer across core
-   (four-language parity) → one consistent, bridge-safe namespace ecosystem-wide. This is the proper home for
-   the "promote to core" idea (§16, §20-E). — ⬜ **not done via this proposal**: nothing from
-   file-replicator's UNS/control-surface design has been promoted into `ggcommons` (P7 remains unstarted,
-   §21). Note for anyone reconciling this later: `ggcommons` is independently mid-flight on a *much* larger,
-   differently-shaped UNS rework of its own (`ecv1/{device}/{component}/{instance}/{class}[/channel]`, see
-   `ggcommons/docs/platform/UNS-CANONICAL-DESIGN.md`, branch `feat/unified-namespace`, unmerged as of this
-   check) — that effort is unrelated to and does not incorporate this section's specific proposal.
+core's `{thing}/{component}` ordering — minus the `ggcommons/` root, plus the `class` layer. Plan
+(**superseded by the UNS-core migration — see §1 status banner; status as of the `ggcommons` `v0.2.0` pin**):
+1. **file-replicator** was to use `{thing}/file-replicator/{class}/…` (its own `src/uns.rs`). — This
+   *did* ship in P3, but has since been **replaced**: `src/uns.rs` is deleted and topics are minted by the
+   ggcommons UNS core at `ecv1/{device}/FileReplicator/{instance}/{class}`.
+2. **Optional legacy alias:** answer the core `GetConfiguration` on the old topic (`legacyConfigTopic:
+   true`). — Shipped in P3, then **retired** in the migration: no `legacy_config_topic()`, no
+   `legacyConfigTopic` config; the library's built-in `get-configuration` verb answers it.
+3. **Separate core proposal:** drop the `ggcommons/` root and adopt a fixed `class`-layered namespace
+   across core (four-language parity). — This is essentially what **happened**, but via `ggcommons`'s own
+   (much larger, differently-shaped) UNS rework — `ecv1/{device}/{component}/{instance}/{class}[/channel]`
+   (`ggcommons/docs/platform/UNS-CANONICAL-DESIGN.md`), now **merged and released as `ggcommons` `v0.2.0`**
+   and adopted here. It did **not** incorporate this section's specific `{thing}/file-replicator/…` proposal;
+   file-replicator migrated onto the core scheme instead. Promoting file-replicator's OWN control-surface
+   helper into core (P7, §21) remains **unstarted** and is largely moot now the core UNS itself exists.
 
 ### 15.7 Configurability & non-IoT-Core brokers
 
-Prefix defaults to `{ThingName}/file-replicator` (resolved via the ggcommons template resolver, which
-sanitizes for topic safety); overridable via `component.global.topics.prefix` (+ per-instance). Deployments on
-a *shared* non-IoT-Core broker that want an app namespace can prepend one here. **HOST note:** without IoT Core
-there's no ThingName-uniqueness enforcement, so set a unique `-t/--thing` per HOST deployment (the default
-identity would otherwise collide).
+> **Superseded by the UNS-core migration (see §1 status banner).** The configurable prefix described
+> below — `component.global.topics.prefix` and the per-instance `instances[].topics.prefix` — was
+> **removed** (the `TopicsCfg` struct is gone from `config.rs`). The shipped UNS grammar is fixed:
+> `ecv1/{device}/FileReplicator/{instance}/{class}`, minted by the library from the resolved `-t/--thing`
+> device id. There is no app-namespace prefix knob. The HOST-uniqueness guidance still applies (set a
+> unique `-t/--thing` per HOST deployment). The topic-budget/validity guard is now the library's concern,
+> not this component's. The original design text is retained below as the historical rationale.
 
-**Per-instance override — P3 status.** A `component.global.topics.prefix` (component-wide) override IS
-honored in P3. A *per-instance* `instances[].topics.prefix` override is parsed but **deferred**
-(warned and ignored): honoring only the instance's events/state on the override root while its
-`cmd/instances/{id}/…` control surface stays on the component root would split an instance's namespace
-into two half-reachable halves. In P3 the whole component — `cmd`, `evt`, and `state` — shares one
-prefix so the namespace is consistent and every instance is addressable at one root. (The builder in
-`uns.rs` still resolves an instance override for when the feature is enabled in a later phase.)
+Prefix defaulted to `{ThingName}/file-replicator` (resolved via the ggcommons template resolver, which
+sanitizes for topic safety); it *was* to be overridable via `component.global.topics.prefix` (+ per-instance).
+Deployments on a *shared* non-IoT-Core broker that want an app namespace could prepend one here. **HOST
+note:** without IoT Core there's no ThingName-uniqueness enforcement, so set a unique `-t/--thing` per HOST
+deployment (the default identity would otherwise collide).
 
-**Budget guard.** Every built topic — including the control-plane `cmd/#` subscribe filter and the
-legacy alias — passes an internal guard checking all three §15.1 rules (≤256 bytes, ≤7 slashes, no
-`$`-leading level). A violation warns but never panics (a hostile ThingName / over-long override
-prefix must not crash the engine); at worst the broker rejects the publish/subscribe.
+**Per-instance override.** A component-wide prefix override once shipped (P3) while a *per-instance*
+`instances[].topics.prefix` override was parsed-but-deferred (splitting an instance's namespace would leave
+it half-reachable). Both knobs were removed in the migration — the whole component shares one fixed root.
+
+**Budget guard.** The original scheme validated every built topic against the three §15.1 rules (≤256
+bytes, ≤7 slashes, no `$`-leading level), warning rather than panicking on a hostile/over-long input. Under
+the UNS core this validity guarantee is enforced by the library that mints the topics.
 
 ---
 
 ## 16. Control-message suite
 
-Uses the ggcommons request/reply primitive (`request`/`reply`, `reply_to`). Core has **no generic control
-framework** — each component wires its own handlers — so we build a small local **control dispatcher**
-(resource/verb → handler), structured to be liftable into core alongside the UNS proposal (§15.4, §20-E).
+> **Superseded by the UNS-core migration (see §1 status banner) — authoritative: `docs/reference/messaging-interface.md`.**
+> The hand-rolled local control dispatcher below was replaced by verb registrations on the ggcommons
+> **command inbox** (`gg.commands()`, `ecv1/{device}/FileReplicator/main/cmd/#`), which now provides the
+> generic control framework core previously lacked. Concretely: **`get-config` is retired** (the library's
+> built-in `get-configuration` verb answers it, redacted — plus `ping` / `reload-config`); the
+> instance-in-topic scoping (`…/cmd/instances/{id}/…`) became an instance **body field**
+> (`cmd/get-status` + `{instance?}`); verbs are `cmd/get-status`, `cmd/trigger`, `cmd/set-activation`. The
+> table below is the ORIGINAL design; the `get-status` reply *shape* it describes is still accurate.
 
-| Command | Topic (UNS) | Body | Reply |
+Uses the ggcommons request/reply primitive (`request`/`reply`, `reply_to`). At design time core had **no
+generic control framework** — each component wired its own handlers — so this speced a small local **control
+dispatcher** (resource/verb → handler), structured to be liftable into core alongside the UNS proposal
+(§15.4, §20-E). The command inbox (shipped in `ggcommons` `v0.2.0`) is that framework.
+
+| Command | Topic (as originally designed; see banner for shipped) | Body | Reply |
 |---|---|---|---|
-| **get-config** | `…/cmd/config` (+ legacy alias) | `{}` | effective config document |
-| **get-status** | `…/cmd/status` or `…/cmd/instances/{id}/status` | `{ }` / instance filter | statistics (below) |
-| **trigger** | `…/cmd/trigger` or `…/cmd/instances/{id}/trigger` | `{ ignoreWindow?: bool }` | accepted + counts |
-| **set-activation** | `…/cmd/instances/{id}/activation` | `{ active: bool, persist?: bool=true, reset?: bool }` | new effective state |
+| ~~**get-config**~~ (retired → library `get-configuration`) | ~~`…/cmd/config` (+ legacy alias)~~ | `{}` | redacted effective config document |
+| **get-status** | `…/cmd/status` (shipped: `cmd/get-status`, instance via body) | `{ }` / instance filter | statistics (below) |
+| **trigger** | `…/cmd/trigger` | `{ instance?, ignoreWindow?: bool }` | accepted + counts |
+| **set-activation** | `…/cmd/instances/{id}/activation` (shipped: `cmd/set-activation`, instance in body) | `{ active: bool, persist?: bool=true, reset?: bool }` | new effective state |
 
 `get-status` reply (per instance):
 
@@ -1049,8 +1091,13 @@ against an unreachable endpoint would be a lie — the field returns once it can
 
 ## 17. Status/event publishing (realtime UI)
 
-One-way events on the UNS `evt/…` (non-retained) + **retained** `state/…` snapshots. Envelope = standard
-ggcommons `Message`; `header.name = "FileReplicatorEvent"`, `version = "1.0"`; `body.event` discriminates.
+One-way events on the UNS `evt/…`. **The retained `state/…` snapshots described here were dropped in the
+UNS-core migration** (see §1 status banner / FR-EVT-4): `state` is a reserved, library-owned class, and
+`get-status` is the current-state-on-demand path. As shipped, events go through the `events()` facade,
+which derives the `evt/{severity}/{type}` channel from the body — the wire body is
+`{severity, type, message?, timestamp, context?}` (see `docs/reference/messaging-interface.md`), not the
+`header.name = "FileReplicatorEvent"` / `body.event` envelope this section originally sketched. The event
+*catalog* below (§17.1) is still accurate.
 
 ### 17.1 Event types (FR-EVT-1)
 
@@ -1074,11 +1121,11 @@ ggcommons `Message`; `header.name = "FileReplicatorEvent"`, `version = "1.0"`; `
   terminal (`bytes_done == size`) report to the throttle unconditionally, past the internal 4 MiB
   persist-checkpoint gate, so a small file (or the sub-4 MiB tail of a large one) still yields the
   0%/100% events. Between them the throttle applies the percent-step/interval gate.
-- **Retained state (FR-EVT-4):** after each transition — and at startup for an idle component — the
-  component republishes the compact per-instance state to `state/instances/{id}` (and the component
-  roster to `state`), so a UI/cloud subscriber renders correctly. **Interim (P3): non-retained** — a
-  late-connecting subscriber does not get the last snapshot until the next transition; see the FR-EVT-4
-  gap note and use `cmd/status` for reliable current state on demand.
+- **Retained state (FR-EVT-4) — DROPPED, not shipped:** this section originally speced a per-transition
+  republish of compact per-instance state to `state/instances/{id}`. The UNS-core migration removed it
+  outright (`state` is now a reserved, library-owned class carrying only the RUNNING/STOPPED keepalive —
+  see §1 status banner and the `src/events.rs` module docs). A UI/cloud subscriber gets current state via
+  the `get-status` command on demand.
 
 ---
 
@@ -1175,11 +1222,11 @@ rehash of the config keys.
 | **P0 — Scaffold** | Repo from the Rust template; config model; module stubs; CI caller + gate; docs shell; registry PR. | build/test/clippy green; empty engine runs on HOST. | ✅ shipped (`19e1ec8`) |
 | **P1 — Core engine (local)** | Watcher + readiness(stability) + durable store(**SQLite**) + worker + completion(delete/archive/**quarantine**) + integrity(checksum) + retry + **bandwidth cap** + **activation**, local dest, immediate mode. | Move files local→local, crash-safe, verified, bandwidth-limited, activate/deactivate persists; 3 platforms; ≥90% cov. | ✅ shipped (`1aafd3a`) |
 | **P2 — S3 destination** | Size-adaptive PutObject/multipart, parallel parts, **acceleration/trailing-checksum/unsigned-PUT**, resumable, **ambient creds**+`$secret`. | Validated vs floci + a real bucket; resume-after-kill + 2-day-outage sim proven. | ✅ shipped (`40b79e4`) |
-| **P3 — Control + events + UNS** | UNS topic layer; control dispatcher (get-config/get-status/trigger/set-activation); event publisher + current-state snapshots; metrics. | Live status + activation via control msg; UI-ready UNS stream + current-state snapshots (**retained pending the ggcommons `publish_retained` enhancement — interim: live/non-retained, FR-EVT-4**); cloud-bridge wildcard test. | ✅ shipped (`86d7f4f`) — the retained-state gap is still open (unchanged; see §15.3 footnote) |
+| **P3 — Control + events + UNS** | UNS topic layer; control dispatcher (get-config/get-status/trigger/set-activation); event publisher + current-state snapshots; metrics. | Live status + activation via control msg; UI-ready UNS stream; cloud-bridge wildcard test. | ✅ shipped (`86d7f4f`), then **migrated onto the ggcommons UNS core + facades** (`acc98c2`, `ggcommons` `v0.2.0`): `src/uns.rs`/`get-config`/`legacyConfigTopic`/`topics.prefix` retired, and the retained `state/…` snapshot **dropped** (no longer a pending `publish_retained` gap — §1 status banner / FR-EVT-4) |
 | **P4 — Scheduling & windows** | `croner` cron + window(open/close/duration) + `onWindowClose` pause/resume; English sugar. | Windowed uploads incl. overnight/DST; mid-window pause/resume proven. | ✅ shipped (`301082d`) — the destination disconnection circuit-breaker (§13.4) and its `get-status` `link`/window sub-fields were bundled with this phase in earlier drafts of this doc but are **still not implemented** (`Event::Disconnected`/`Reconnected` are `Deferred` enum variants in `src/events.rs`) |
 | **P5 — More destinations** | SFTP/FTPS, HTTP(S), then Azure/GCS (features off default until stable). | Each validated + resume where supported. | ✅ shipped (`a4f4bdb`) |
 | **P6 — Multi-destination fan-out** | Lift `len==1`; parallel fan-out + aggregate completion. | N-dest delivery, per-dest retry, single completion. | ✅ shipped (`830d5a2`) |
-| **P7 — Core promotion (optional)** | Extract UNS + control-surface helper → ggcommons (4-lang). | Parity + gates in all four langs. | ⬜ not started — no such promotion exists in `ggcommons` as of this check (a separate, independently-designed UNS rework is underway there on the unmerged `feat/unified-namespace` branch, unrelated to this proposal) |
+| **P7 — Core promotion (optional)** | Extract UNS + control-surface helper → ggcommons (4-lang). | Parity + gates in all four langs. | ⬜ not started — no such promotion exists in `ggcommons` (its UNS rework shipped as v0.2.0 on `main` but did not absorb file-replicator's UNS/control-surface helper; this P7 remains a separate, unstarted proposal) |
 
 Validation: HOST→Windows + EMQX/floci; GREENGRASS→lab-5950x; k8s→kind + lab-k3s; Rust `greengrass` build→WSL.
 
@@ -1266,7 +1313,7 @@ file-replicator/
 > follows:
 
 - ✅ **§14 (F)** — durable state = **SQLite** (decided, and shipped as `SqliteStore`, `src/state.rs`).
-- ✅ **§15 (H)** — UNS = `{thing}/file-replicator/{cmd|evt|state}/…` (revised per review; shipped in P3, `src/uns.rs`).
+- ✅ **§15 (H)** — UNS shipped in P3 as `{thing}/file-replicator/{cmd|evt|state}/…` (`src/uns.rs`), then **migrated onto the ggcommons UNS core** (`ecv1/{device}/FileReplicator/{instance}/{class}`; `src/uns.rs` deleted; retained-`state`/`get-config`/`legacyConfigTopic`/`topics.prefix` retired) — see §1 status banner.
 - ✅ **§12** — cron-first + English sugar shipped as designed in P4 (`src/schedule/{cron,sugar,window}.rs`); the open/close/duration window model is implemented and unit-tested.
 - ✅ **§13.3** — Failed-folder default resolved as `retainInPlace` (shipped default in `src/config.rs`'s `CompletionCfg`; `quarantine` is the opt-in).
 - ⚠️ **§13.4** — `giveUpAfter` default (7d) **shipped** (P1, time-governed retry); the long-outage **circuit-breaker** itself is **still not implemented** (`Event::Disconnected`/`Reconnected` remain `Deferred` in `src/events.rs`) — this part of the decision is still genuinely open, not just undocumented.

@@ -79,13 +79,10 @@ dest-gcs = ["dep:reqwest", "reqwest/json", "dep:base64", "ggcommons/credentials"
 # gh/git credential helper, and CI's reusable workflow rewrites the https URL with EDGECOMMONS_READ_TOKEN.
 #
 # UNS MIGRATION NOTE: this code REQUIRES the UNS core (top-level `identity`, `gg.uns()`, `gg.commands()`,
-# the reserved-class guard, the `data()`/`events()`/`app()` class facades), which today lives only on the
-# local `feat/unified-namespace` branch — not yet on the remote. Cargo must be able to load the
-# patched-over source, so the pin below is the current remote `main` (pre-UNS, a resolvable placeholder —
-# the same one the sibling `uns-bridge`/`telemetry-processor` pin). LOCAL DEV builds against the sibling
-# checkout via the gitignored `.cargo/config.toml` `paths` override, which replaces this source outright.
-# Do the real pin bump (to the UNS-core rev, regenerating Cargo.lock) once feat/unified-namespace lands on
-# main. A pure git-rev build does NOT compile until then.
+# the reserved-class guard, the `data()`/`events()`/`app()` class facades). The UNS core is now on the
+# remote `main`, released as v0.2.0 (`b1d8d85`), and the pin below points at it — so a pure git-rev build
+# resolves the UNS core and compiles. LOCAL DEV may still build against the sibling checkout via the
+# gitignored `.cargo/config.toml` `paths` override, which replaces this source outright.
 ggcommons = { git = "https://github.com/edgecommons/ggcommons.git", rev = "b1d8d85bed1e989928d083323ef8be98132d77d5", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "fs"] }
 serde = { version = "1", features = ["derive"] }

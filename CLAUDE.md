@@ -13,8 +13,8 @@ HOST / GREENGRASS / KUBERNETES via ggcommons (no platform branching).
 ## Current status
 **Implemented through P6 of the DESIGN §21 phase plan** (P0 scaffold → P1 local engine → P2 S3 → P3
 control+events+UNS → P4 cron/window scheduling → P5 SFTP/FTPS/HTTP/Azure/GCS → P6 multi-destination
-fan-out — see `git log --oneline` for the per-phase commits), **plus the UNS-core migration** (onto
-`ggcommons` branch `feat/unified-namespace`): `evt`/`cmd` now ride the library's `events()` facade +
+fan-out — see `git log --oneline` for the per-phase commits), **plus the UNS-core migration** (onto the
+`ggcommons` UNS core, released as v0.2.0 on `main`): `evt`/`cmd` now ride the library's `events()` facade +
 `commands()` inbox (`ecv1/{device}/FileReplicator/{instance}/{class}…`), replacing the old hand-rolled
 `{thing}/file-replicator/…` topic builder (`src/uns.rs`, deleted) — see
 `docs/reference/messaging-interface.md` for the current wire contract (topics/verbs/event catalog) and
