@@ -3,7 +3,7 @@
 Every backend implements one `Destination` trait (deliver → verify → complete, with resume + progress +
 bandwidth), so behaviour is uniform and backends are feature-gated. `type` in an `egress` item selects the
 backend; the field tables below are validated against `src/config.rs` (the `*Egress` structs). Full design
-in [`DESIGN.md`](https://github.com/edgecommons/file-replicator/blob/main/DESIGN.md) §10–§11.
+in [`DESIGN.md`](https://github.com/edgecommons/file-replicator/blob/main/DESIGN.md).
 
 An instance's `egress` is an **ordered list** of `N >= 1` entries. Each entry fans out independently and a
 file completes (source deleted/archived) only once **every** entry has delivered and verified.
@@ -26,7 +26,7 @@ all of them on). All are pure-Rust (rustls) — no OpenSSL/C toolchain.
 **`checksumAlgorithm`** (every backend except `local`) defaults to `CRC32C`; the alternative is `SHA256`
 (local always re-hashes). **`credentials`** everywhere is an optional `{"$secret": "name"}` vault reference;
 the shape it must resolve to is noted per backend. Ambient plaintext secret fields are supported but
-discouraged (and are redacted in any log/`Debug`/config dump — FR-CFG-5).
+discouraged (and are redacted in any log/`Debug`/config dump).
 
 ---
 
@@ -62,7 +62,7 @@ Also covers **NFS/SMB shares** — point `path` at the mount.
 Greengrass TokenExchangeService device role, Kubernetes IRSA / env / node role, or HOST env / shared
 profile / instance role. Provide `{"$secret": "name"}` to resolve explicit credentials from the vault
 (never logged). Least-privilege IAM: scope to `bucket/prefix/*` with the `PutObject`/multipart actions (+
-KMS if SSE-KMS). MinIO / S3-compatible endpoints work via `endpointUrl` with no new code. DESIGN §11.5.
+KMS if SSE-KMS). MinIO / S3-compatible endpoints work via `endpointUrl` with no new code.
 
 ## `sftp`
 
@@ -82,7 +82,7 @@ KMS if SSE-KMS). MinIO / S3-compatible endpoints work via `endpointUrl` with no 
 | `fsync` | bool | `false` | Best-effort `fsync@openssh.com` before rename, if the server supports it. |
 | `checksumAlgorithm` | string | `CRC32C` | Local re-hash (SFTP has no content-checksum echo). |
 
-**Host-key policy (NFR-7).** With no `hostKey` pinned and `insecureAcceptAnyHostKey` unset (the default),
+**Host-key policy.** With no `hostKey` pinned and `insecureAcceptAnyHostKey` unset (the default),
 the SSH handshake is **refused** (fail-closed). Set `insecureAcceptAnyHostKey: true` only as an explicit,
 documented escape hatch — it disables man-in-the-middle protection (a server presenting its own key is
 accepted; under password auth the credential could be captured).
@@ -140,7 +140,7 @@ accepted; under password auth the credential could be captured).
 | `endpointUrl` | string | — | Custom JSON/upload endpoint — fake-gcs-server (`http://127.0.0.1:4443`); absent = the public GCS JSON API. |
 | `accessToken` | string | — | Ambient OAuth2 access token (redacted). |
 | `anonymous` | bool | `false` | Send no `Authorization` header (fake-gcs-server, or an `allUsers`-public bucket). |
-| `credentials` | `$secret` | — | Resolves to `{"accessToken":"…"}`. Full service-account JWT / ADC discovery is a documented follow-up; this backend authenticates via a bearer access token only. |
+| `credentials` | `$secret` | — | Resolves to `{"accessToken":"…"}`. This backend authenticates via a bearer access token only (no service-account JWT / ADC discovery). |
 | `chunkBytes` | int | `8 MiB` | Resumable-upload chunk size, rounded down to the nearest 256 KiB (GCS alignment). |
 | `checksumAlgorithm` | string | `CRC32C` | Local re-hash; `CRC32C` is also compared directly against the object's `crc32c` metadata on verify (no re-download). |
 

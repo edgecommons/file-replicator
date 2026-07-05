@@ -75,9 +75,8 @@ The reply is always wrapped by the command contract: `{ "ok": true, "result": <d
 `failed.items[].state` is one of `failed` (retrying), `exhausted` (retry budget spent, retained in place),
 or `quarantined` (moved to `failedDir`). `quarantinedAt` is an RFC3339 UTC timestamp.
 
-> `link` (a destination-connectivity field) is **deliberately omitted** — it belongs to the deferred
-> circuit-breaker (see [explanation › Resilience](../explanation.md#resilience-across-long-outages)).
-> Do not depend on it.
+> There is no `link` (destination-connectivity) field — file-replicator has no destination circuit-breaker
+> (see [explanation › Resilience](../explanation.md#resilience-across-long-outages)). Do not depend on it.
 
 ### Disabled-instance document
 
@@ -141,7 +140,7 @@ object carries the event-specific data; its fields, across all event types, have
 | `window` | string | `window-opened`/`-closed` | The schedule's human-readable label (e.g. `0 22 * * * -> 0 6 * * *`). |
 | `mode` | string | `schedule-complete` | `"cron"` \| `"window"`. |
 | `role` | string | `permission-denied` | `ingress` \| `egress` \| `archive` \| `failed`. |
-| `link` | string | `disconnected` — **deferred, never emitted** | Destination link label (the deferred circuit-breaker). |
+| `link` | string | `disconnected` — not emitted | Destination link label (there is no destination circuit-breaker). |
 
 **`message` vs `context`.** For the events with a natural error string — `replication-failed`,
 `retries-exhausted`, `file-quarantined`, `permission-denied` — the error is promoted to the top-level

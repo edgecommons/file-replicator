@@ -135,7 +135,7 @@ items also show up in `get-status` under `failed.items[]` with `state: "quaranti
 
 ## Survive a multi-day disconnection
 
-Two shipped mechanisms tolerate an endpoint being down for hours to days — configure the time budget and
+Two mechanisms tolerate an endpoint being down for hours to days — configure the time budget and
 lean on resume:
 
 ```jsonc
@@ -148,11 +148,11 @@ lean on resume:
   ranged-PUT / append / session / staged blocks per backend), so a reconnect after a long gap continues
   rather than restarting the file.
 
-> **Not available (deferred):** the DESIGN §13.4 destination **circuit-breaker** (staggered reconnects,
-> `Disconnected`/`Reconnected` alarm events, the `get-status` `link` field) is **not implemented** — the
-> event variants in `src/events.rs` are marked `Deferred` and never emitted. Do not build alerting on a
-> `disconnected` event or a `link` status field; instead watch `replication-failed` events (each carries
-> `willRetry: true` and `nextAttemptAt`) and the `failed`/`inProgress` tallies from `get-status`. See
+> **No circuit-breaker.** There is no destination circuit-breaker (staggered reconnects,
+> `Disconnected`/`Reconnected` alarm events, or a `get-status` `link` field): no `disconnected` event is
+> emitted and `get-status` has no `link` field. Do not build alerting on those; instead watch
+> `replication-failed` events (each carries `willRetry: true` and `nextAttemptAt`) and the
+> `failed`/`inProgress` tallies from `get-status`. See
 > [explanation › Resilience](explanation.md#resilience-across-long-outages).
 
 ---

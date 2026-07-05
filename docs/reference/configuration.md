@@ -2,8 +2,8 @@
 
 The canonical configuration reference. There is no per-component JSON schema in the ecosystem; **this
 document is the source of truth**, and it is validated against the parser in `src/config.rs` (not against
-other docs). It covers the full shipped field surface (through P6, DESIGN §21): the component config, all
-seven `egress` backends, scheduling, completion, retry, limits, and permission policy. Per-backend
+other docs). It covers the full field surface: the component config, all seven `egress` backends,
+scheduling, completion, retry, limits, and permission policy. Per-backend
 destination fields (all of them) are tabulated in [Reference › Destinations](destinations.md); the
 `get-status` and event payloads in [Reference › Data types](data-types.md).
 
@@ -17,7 +17,7 @@ The component owns the `component` section (`component.global` + `component.inst
 | `defaults.retry` | object | — | Instance retry defaults (overridden per instance). See **retry**. |
 | `defaults.timezone` | string | UTC | Default schedule timezone. |
 | `limits.maxConcurrentFiles` | int | 64 | Global in-flight cap across all instances. |
-| `limits.maxBandwidth` | string | — | Global aggregate byte-rate cap, e.g. `"50MB/s"` (P1). |
+| `limits.maxBandwidth` | string | — | Global aggregate byte-rate cap, e.g. `"50MB/s"`. |
 | `onPermissionError` | `"disableInstance"` \| `"fatal"` \| `"retain"` | `"disableInstance"` | Component-wide default for what happens when an instance's ingress/egress/archive/failed directory fails a startup readable/writable check. An instance's own `onPermissionError` (below) overrides this. See **Permission handling** in `explanation.md`. |
 
 > There is no `topics.prefix`/`legacyConfigTopic` config anymore — topics are minted by the ggcommons UNS
@@ -28,14 +28,14 @@ The component owns the `component` section (`component.global` + `component.inst
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `id` | string | *(required)* | Stable instance id. |
-| `enabled` | bool | `true` | Initial activation; persisted runtime state may override (DESIGN §7.5). |
+| `enabled` | bool | `true` | Initial activation; persisted runtime state may override. |
 | `ingress` | object | *(required)* | Source + readiness. See below. |
-| `egress` | array | *(required)* | Destination list; `N >= 1` entries fan out independently and complete once every entry verifies (multi-destination fan-out shipped P6, DESIGN §20-B). See **egress**. |
+| `egress` | array | *(required)* | Destination list; `N >= 1` entries fan out independently and complete once every entry verifies. See **egress**. |
 | `schedule` | object | `{ "mode": "immediate" }` | See **schedule**. |
 | `completion` | object | defaults below | See **completion**. |
 | `retry` | object | global default | See **retry**. |
 | `limits` | object | — | `maxConcurrentFiles`, `maxBandwidth` (per-instance). |
-| `onPermissionError` | `"disableInstance"` \| `"fatal"` \| `"retain"` | inherits `component.global.onPermissionError` | Per-instance override of the component-wide permission-error policy. `disableInstance` skips just this instance (its siblings keep running); `fatal` aborts the whole component; `retain` starts the instance anyway, leaning on runtime dedup-logging + the `PermissionDenied` event for ongoing diagnostics. If **every** instance ends up disabled (or the set is empty), the component still fails fast (FR-CFG-4's "zero instances started" rule). |
+| `onPermissionError` | `"disableInstance"` \| `"fatal"` \| `"retain"` | inherits `component.global.onPermissionError` | Per-instance override of the component-wide permission-error policy. `disableInstance` skips just this instance (its siblings keep running); `fatal` aborts the whole component; `retain` starts the instance anyway, leaning on runtime dedup-logging + the `PermissionDenied` event for ongoing diagnostics. If **every** instance ends up disabled (or the set is empty), the component still fails fast (the "zero instances started" rule). |
 | `priority` | int | `100` | Cross-instance **global** concurrency-admission priority: under contention for the shared `component.global.limits.maxConcurrentFiles` cap, a **lower** number is admitted first (the same 0-255-ish convention as elsewhere; ties broken FIFO by enqueue order). Governs ONLY the global admission decision — it does not affect this instance's own `limits.maxConcurrentFiles` cap, and there is **no bandwidth weighting** by priority. Demand-adaptive: an instance not currently contending for a global slot reserves nothing, regardless of its priority. See **Cross-instance priority** in `explanation.md`. |
 
 ### `ingress`
@@ -78,12 +78,12 @@ is enabled. Every full field table (all fields, types, defaults) lives in
 default), `storageClass`, `sse`/`kmsKeyId`, `accelerate`, `unsignedPayload`, `checksumAlgorithm`,
 `multipart.{thresholdBytes,partSizeBytes,maxConcurrentParts}`. Across every non-`local` backend,
 `checksumAlgorithm` defaults to `CRC32C` (alt `SHA256`) and `credentials` is an optional `{"$secret":"…"}`
-vault ref; ambient plaintext secrets are supported but redacted in logs/`Debug` (FR-CFG-5).
+vault ref; ambient plaintext secrets are supported but redacted in logs/`Debug`.
 
 ### `schedule`
 `mode`: `immediate` (default) \| `cron` (`expression`, `timezone`) \| `window` (`open`, `close` **or**
 `durationMins`, `timezone`, `onWindowClose`: `pauseResume` (default) \| `finishCurrent`). Cron is standard
-cron, tz/DST-aware (DESIGN §12).
+cron, tz/DST-aware.
 
 ### `completion`
 | Key | Type | Default | Notes |
@@ -100,5 +100,5 @@ cron, tz/DST-aware (DESIGN §12).
 |---|---|---|---|
 | `baseDelayMs` | int | 1000 | Backoff base. |
 | `maxDelayMs` | int | 900000 | Backoff cap (15 min). |
-| `giveUpAfter` | string | `7d` | Time budget; governs long-outage tolerance (DESIGN §13.4). |
+| `giveUpAfter` | string | `7d` | Time budget; governs long-outage tolerance. |
 | `maxAttempts` | int | — | Optional hard cap (default: none — time-governed). |

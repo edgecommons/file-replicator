@@ -7,12 +7,12 @@ concepts as the implementation lands, validated against the code.
 ## The instance model
 An **instance** is one watched-directory specification (`component.instances[]`) — the unit of config,
 isolation, statistics, activation, and control. Instances run independently, so a slow or failing
-destination on one never stalls another. (DESIGN §3, §6.3.)
+destination on one never stalls another.
 
 ## Readiness — knowing a file is done
 A newly-observed file may still be mid-write. The **stability** strategy (default) waits for size+mtime to
 settle; `marker`, `rename`, and `glob` suit cooperative producers. Only *ready* files enter the durable
-queue. (DESIGN §9.)
+queue.
 
 ## Discovery — how files are noticed, and the latency to expect
 An instance finds files two ways, and it needs both:
@@ -50,22 +50,21 @@ filesystem where the watch may not fire and you need tighter bounds, **lower `re
 cheap directory walk; a few seconds is fine for most spools). Conversely, on a huge, slow, or high-latency
 spool you may *raise* it to reduce scan overhead, accepting a larger worst-case fallback latency. Watch the
 startup log to know which mode you're in: `OS file watch active` (low-latency) vs the `… periodic rescan
-only` warning (degraded). (DESIGN §6.3, §9.)
+only` warning (degraded).
 
 ## Durable, crash-safe movement
 Work items live in an embedded **SQLite** store (WAL). Every state transition is written **before** the
 side effect it authorizes (write-ahead), so a crash between "verified" and "source removed" is recovered
 idempotently on restart — never re-uploading, never losing the file. Object keys are stable/deterministic
-so re-delivery overwrites identically. (DESIGN §8.1, §13.2, §14.)
+so re-delivery overwrites identically.
 
 ## Scheduling vs windows
 `cron` releases ready work at each fire; a `window` (open→close cron, or open+duration) gates continuous
 flow to a time span, for bandwidth conservation. Work outside the window waits; a transfer crossing a
-window close either finishes or pauses/resumes next window. (DESIGN §12.)
+window close either finishes or pauses/resumes next window.
 
 ## Resilience across long outages
-Two mechanisms carry a transfer across a destination being unreachable for a long time, and **both ship
-today**:
+Two mechanisms carry a transfer across a destination being unreachable for a long time:
 
 - **Time-governed retries.** A failed attempt is retried on an exponential backoff (`retry.baseDelayMs` →
   `retry.maxDelayMs`) and the item keeps retrying until a **time budget** — `retry.giveUpAfter`, default
@@ -80,20 +79,16 @@ today**:
   GCS / Azure each resume through their backend's ranged-PUT / append / session / staged-block mechanism (see
   [Reference › Destinations](reference/destinations.md)).
 
-Together these tolerate a multi-hour-to-multi-day outage without loss. (DESIGN §13.4.)
+Together these tolerate a multi-hour-to-multi-day outage without loss.
 
-> **Deferred — the disconnection circuit-breaker.** DESIGN §13.4 also specifies a destination
-> *circuit-breaker* that would trip after repeated failures and stagger reconnects to avoid a reconnect
-> thundering-herd, surfacing `Disconnected`/`Reconnected` alarm events and a `get-status` `link` field. **It
-> is not implemented.** The `Disconnected`/`Reconnected` variants exist in `src/events.rs` but are marked
-> `Deferred` and are never emitted, and `get-status` deliberately omits the `link` field until it lands (see
-> `CLAUDE.md` and [Reference › Messaging interface](reference/messaging-interface.md)). Today's long-outage
-> tolerance rests entirely on the two shipped mechanisms above — each failing transfer independently backs
-> off and retries on its own schedule within the `giveUpAfter` budget, with no shared breaker gating
-> reconnects.
+> **No destination circuit-breaker.** file-replicator has no cross-transfer circuit-breaker that trips after
+> repeated failures or staggers reconnects: there are no `Disconnected`/`Reconnected` alarm events and
+> `get-status` has no `link` field (see [Reference › Messaging interface](reference/messaging-interface.md)).
+> Long-outage tolerance rests on the two mechanisms above — each failing transfer independently backs off and
+> retries on its own schedule within the `giveUpAfter` budget, with no shared breaker gating reconnects.
 
 ## Cross-instance priority
-Every instance shares two process-wide governors (DESIGN §8.3): the global bandwidth token bucket, and
+Every instance shares two process-wide governors: the global bandwidth token bucket, and
 the global concurrency cap (`component.global.limits.maxConcurrentFiles`, default 64) that bounds
 in-flight *files* across ALL instances at once. Under light load neither governor matters — every
 instance simply gets a slot/bytes as it asks. Under **contention** for the global concurrency cap
@@ -134,13 +129,11 @@ when it happens or what policy is configured:
    `role` one of `ingress`/`egress`/`archive`/`failed`) — an operator must never be silently starved of
    files with no signal why.
 2. It is logged **once**, not once per reconciliation rescan (and, on the egress side, not once per
-   file). Before this feature, an unreadable directory produced a `debug!` line on *every* scan —
-   indistinguishable from normal operation in the logs, and a genuine spam risk on a busy rescan
-   interval. A per-instance dedup log now tracks each distinct failing key and only re-logs on a real
-   state change: the first sighting, a later *recovery* (the key becomes accessible again — logged once,
-   at `INFO`, so "it's fixed" is as visible as "it broke"), or after a long quiet interval (an hour) for
-   a persistently-broken key so it never goes completely silent either. On the ingress side the key is
-   the watched directory path; on the egress side it is the **destination** — so a broken-permission
+   file). A per-instance dedup log tracks each distinct failing key and only re-logs on a real state
+   change: the first sighting, a later *recovery* (the key becomes accessible again — logged once, at
+   `INFO`, so "it's fixed" is as visible as "it broke"), or after a long quiet interval (an hour) for a
+   persistently-broken key so it never goes completely silent either. On the ingress side the key is the
+   watched directory path; on the egress side it is the **destination** — so a broken-permission
    destination logs/emits once for the destination, not once for every file it can't deliver (which also
    bounds the dedup state to the fixed number of configured destinations rather than growing per file).
 
@@ -149,11 +142,11 @@ egress directory (writable), and a configured `archiveDir`/`failedDir` (creatabl
 probed. A violation is resolved against `onPermissionError` (component-wide default `disableInstance`,
 overridable per instance — see the configuration reference):
 
-- **`disableInstance`** (the default) — skip just that instance. This reuses the existing "skip a
-  malformed instance, keep the rest running" behavior (FR-CFG-4): **instance isolation is the whole
-  point** — one operator's typo'd path must never take down every other instance's replication. A
-  disabled instance still shows up in `get-status` (component-wide and scoped-by-id), with
-  `disabled: true` and `disabledReason`, instead of silently vanishing or reading as "unknown instance".
+- **`disableInstance`** (the default) — skip just that instance, the same as a malformed instance:
+  **instance isolation is the whole point** — one operator's typo'd path must never take down every
+  other instance's replication. A disabled instance still shows up in `get-status` (component-wide and
+  scoped-by-id), with `disabled: true` and `disabledReason`, instead of silently vanishing or reading as
+  "unknown instance".
 - **`fatal`** — abort the whole component. An explicit opt-in for deployments that would rather fail
   loudly at startup than run in a visibly degraded state.
 - **`retain`** — start the instance anyway. It will keep hitting the same error on every rescan/transfer
@@ -161,8 +154,8 @@ overridable per instance — see the configuration reference):
   `PermissionDenied` events are what keeps an operator informed without watching logs.
 
 If **every** instance ends up disabled (or the configured set was empty to begin with), the component
-still fails to start — this is the same "fail only if zero instances start" rule P1 already applies to
-malformed config, now also reachable via an all-inaccessible instance set.
+still fails to start — the same "fail only if zero instances start" rule that applies to malformed
+config, reachable here via an all-inaccessible instance set.
 
 **Runtime.** A directory can also become inaccessible mid-run (unmounted, permissions changed under a
 running process). On the ingress side, the discovery scan keeps walking past an unreadable subdirectory
@@ -171,8 +164,8 @@ list but not open because of a *permission* denial is reported the same way. On 
 permission-denied delivery error is detected by how the backend **classifies** the failure (every
 destination funnels its errors through the same taxonomy, so a real read-only/`chmod 000` target is
 caught, not just a synthetic one), dedup-logged + surfaced as a `PermissionDenied` event once per
-destination, and then follows the **existing, unchanged** retry/quarantine decision — the permission
-handling here is observability, not a new failure-handling branch. (See `src/permission.rs`.)
+destination, and then follows the standard retry/quarantine decision — the permission handling here is
+observability, not a separate failure-handling path. (See `src/permission.rs`.)
 
 ## The unified namespace
 Commands and events ride the ggcommons UNS core: `ecv1/{device}/FileReplicator/{instance}/{cmd|evt}/…`

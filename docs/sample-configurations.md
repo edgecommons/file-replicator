@@ -44,7 +44,7 @@ reference: [Reference › Configuration](reference/configuration.md); every dest
 
 ```jsonc
 {
-  "tags": { "enterprise": "acme", "site": "site42" },   // in the envelope; NOT in topics (DESIGN §15)
+  "tags": { "enterprise": "acme", "site": "site42" },   // in the envelope; NOT in topics
   "component": {
     "global": { "defaults": { "retry": { "baseDelayMs": 1000, "maxDelayMs": 900000, "giveUpAfter": "7d" } } },
     "instances": [
@@ -173,7 +173,7 @@ Requires `dest-gcs`. Set `anonymous: true` (and drop `credentials`) for a fake-g
         "egress": [ {
           "type": "gcs", "bucket": "acme-cold-archive", "prefix": "site42/",
           // "endpointUrl": "http://127.0.0.1:4443",   // fake-gcs-server
-          "credentials": { "$secret": "gcs-token" },   // { "accessToken": "..." }  (bearer token; ADC/JWT is a follow-up)
+          "credentials": { "$secret": "gcs-token" },   // { "accessToken": "..." }  (bearer token only)
           "chunkBytes": 8388608,                        // rounded down to 256 KiB alignment
           "checksumAlgorithm": "CRC32C"                 // also compared against the object's crc32c metadata on verify
         } ],
@@ -213,7 +213,7 @@ independently, so a slow/failing one never stalls the others.
 ## 8. Multi-destination fan-out (one source → local + S3 + SFTP)
 
 The `egress` list holds `N >= 1` destinations. Each is delivered and verified independently, and the source
-is completed (here, archived) only once **every** destination has succeeded (P6, DESIGN §20-B).
+is completed (here, archived) only once **every** destination has succeeded.
 
 ```jsonc
 {
@@ -274,5 +274,5 @@ the ConfigMap is unchanged from the examples above — mount your watched source
 local-destination/archive/failed dirs into the pod per deployment (durable SQLite state lives on the `/data`
 PVC, so `replicas: 1` / `Recreate`).
 
-See [`DESIGN.md`](https://github.com/edgecommons/file-replicator/blob/main/DESIGN.md) §7 for additional
+See [`DESIGN.md`](https://github.com/edgecommons/file-replicator/blob/main/DESIGN.md) for additional
 annotated examples.
