@@ -61,10 +61,19 @@ jobs:
           # secret's allow-list. Rewrites the https git URL so cargo can fetch the private dep.
           EDGECOMMONS_READ_TOKEN: ${{ secrets.EDGECOMMONS_READ_TOKEN }}
         run: |
+          # Temporary compatibility while the core repo is still hosted at edgecommons/ggcommons.
+          git config --global \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/ggcommons.git".insteadOf \
+            "https://github.com/edgecommons/edgecommons.git"
+          git config --global \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/ggcommons".insteadOf \
+            "https://github.com/edgecommons/edgecommons"
           git config --global \
             url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/".insteadOf \
             "https://github.com/"
       - name: Coverage gate (90% lines; SDK/protocol-call seams + self-skipping integration tests excluded)
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         run: >
           cargo llvm-cov --features dest-s3,dest-sftp,dest-ftps,dest-http,dest-azure,dest-gcs
           --ignore-filename-regex '(testutil|dest.(s3|sftp|ftps|http|azure|gcs).client|p3_control_emqx|s3_floci|sftp_atmoz|azure_azurite|gcs_fakegcs|http_inprocess|p6_fanout|s3_real)\.rs'
