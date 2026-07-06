@@ -1,17 +1,17 @@
 //! # file-replicator — control-plane / event-stream integration tests against EMQX (DESIGN §15-§17)
 //!
 //! Drives the real Unified-Namespace control plane end-to-end over a **live MQTT broker** (the local
-//! `ggcommons-emqx`, plaintext `localhost:1883`, no auth): a REAL [`GgCommons`] runtime (`--platform
-//! HOST --transport MQTT`, built via [`GgCommonsBuilder`]) carries the `evt` stream and the `cmd`
-//! request/reply suite through the broker and back, through the ggcommons `events()` facade and
+//! `edgecommons-emqx`, plaintext `localhost:1883`, no auth): a REAL [`EdgeCommons`] runtime (`--platform
+//! HOST --transport MQTT`, built via [`EdgeCommonsBuilder`]) carries the `evt` stream and the `cmd`
+//! request/reply suite through the broker and back, through the edgecommons `events()` facade and
 //! `commands()` inbox — not a hand-rolled topic scheme. Everything the unit tests exercise with a
 //! recorder is here proven on the wire, on the real UNS grammar
 //! (`ecv1/{thing}/FileReplicator/{instance}/{class}…` — `FileReplicator` is the short component token
-//! ggcommons derives from `com.mbreissi.edgecommons.FileReplicator`, DESIGN-uns §2 D-U18).
+//! edgecommons derives from `com.mbreissi.edgecommons.FileReplicator`, DESIGN-uns §2 D-U18).
 //!
 //! Every test **self-skips** when the broker is unreachable (a fast TCP probe → `eprintln!` + return),
 //! so `cargo test` stays green on CI where EMQX is absent and the 90% coverage gate rests on the unit
-//! tests alone. When EMQX is up (`docker start ggcommons-emqx`), the suite asserts:
+//! tests alone. When EMQX is up (`docker start edgecommons-emqx`), the suite asserts:
 //!   1. `driving_replication_publishes_lifecycle_events` — a real replication publishes the lifecycle
 //!      events (`file-ready`/`replication-started`/`…-progress`/`…-completed`/`file-deleted`) on
 //!      `evt/{severity}/{type}` with the facade's body contract, and progress is **throttled** (few
@@ -37,9 +37,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ggcommons::messaging::{message_handler, Message, MessageBuilder, MessagingService};
-use ggcommons::prelude::*;
-use ggcommons::uns::UnsClass;
+use edgecommons::messaging::{message_handler, Message, MessageBuilder, MessagingService};
+use edgecommons::prelude::*;
+use edgecommons::uns::UnsClass;
 use serde_json::{json, Value};
 
 use file_replicator::admission::PriorityGate;
@@ -54,10 +54,10 @@ use file_replicator::instance::{now_ms, Instance};
 use file_replicator::ratelimit::TokenBucket;
 use file_replicator::state::{SqliteStore, StateStore};
 
-/// The component's reverse-DNS full name — ggcommons derives the SHORT UNS `component` token
+/// The component's reverse-DNS full name — edgecommons derives the SHORT UNS `component` token
 /// (`FileReplicator`) from the segment after the last `.` (DESIGN-uns §2, D-U18).
 const COMPONENT: &str = "com.mbreissi.edgecommons.FileReplicator";
-/// Broker address the standalone MQTT provider connects to (the local `ggcommons-emqx`).
+/// Broker address the standalone MQTT provider connects to (the local `edgecommons-emqx`).
 const BROKER: &str = "127.0.0.1:1883";
 
 /// True when EMQX's plaintext MQTT port answers a TCP connect within a short timeout.
@@ -87,11 +87,11 @@ fn unique(tag: &str) -> String {
     format!("fr-it-{tag}-{nanos:x}-{n}")
 }
 
-/// Build a REAL [`GgCommons`] runtime connected to the local EMQX broker over standalone MQTT, with a
+/// Build a REAL [`EdgeCommons`] runtime connected to the local EMQX broker over standalone MQTT, with a
 /// unique thing name + MQTT client id so parallel tests never collide. Writes the messaging/component
 /// config to a temp dir (the standard CLI contract needs real files for `-c FILE`), leaked for the
 /// process lifetime (read once at startup).
-async fn build_gg(thing: &str) -> GgCommons {
+async fn build_gg(thing: &str) -> EdgeCommons {
     let dir = tempfile::tempdir().expect("tempdir");
     let msg_path = dir.path().join("messaging.json");
     std::fs::write(
@@ -106,7 +106,7 @@ async fn build_gg(thing: &str) -> GgCommons {
     std::fs::write(&cfg_path, r#"{"component":{}}"#).expect("write component config");
     std::mem::forget(dir); // keep the temp files alive for the process (read once at startup)
 
-    GgCommonsBuilder::new(COMPONENT)
+    EdgeCommonsBuilder::new(COMPONENT)
         .args([
             "file-replicator",
             "--platform",
@@ -122,7 +122,7 @@ async fn build_gg(thing: &str) -> GgCommons {
         ])
         .build()
         .await
-        .expect("gg builds (is ggcommons-emqx up?)")
+        .expect("gg builds (is edgecommons-emqx up?)")
 }
 
 /// A thread-safe record of every `(topic, message)` a subscription received.
@@ -199,7 +199,7 @@ fn instance_cfg(id: &str, src: &Path, dst: &Path) -> InstanceCfg {
 
 /// Build one real [`Instance`] wired to `gg`'s own bound `events()` facade for `id` (minted once,
 /// mirroring `crate::app`'s wiring).
-fn build_instance(gg: &GgCommons, id: &str, src: &Path, dst: &Path, store: Arc<dyn StateStore>) -> Arc<Instance> {
+fn build_instance(gg: &EdgeCommons, id: &str, src: &Path, dst: &Path, store: Arc<dyn StateStore>) -> Arc<Instance> {
     let events = Events::new(gg.instance(id).expect("valid instance id").events());
     let inst = Instance::build(
         instance_cfg(id, src, dst),
@@ -216,7 +216,7 @@ fn build_instance(gg: &GgCommons, id: &str, src: &Path, dst: &Path, store: Arc<d
 }
 
 /// Start a control plane over `gg`'s command inbox driving `inst`.
-fn start_control(gg: &GgCommons, store: Arc<dyn StateStore>, inst: Arc<Instance>) -> Arc<ControlPlane> {
+fn start_control(gg: &EdgeCommons, store: Arc<dyn StateStore>, inst: Arc<Instance>) -> Arc<ControlPlane> {
     let main_events = Events::new(gg.events());
     let control = Arc::new(ControlPlane::new(
         gg.config(),
@@ -231,7 +231,7 @@ fn start_control(gg: &GgCommons, store: Arc<dyn StateStore>, inst: Arc<Instance>
 
 /// Issue a command request (topic minted via `gg.uns()`, `header.name` = the verb — the CommandInbox
 /// contract) and await its reply on the ephemeral `reply_to` topic (5 s deadline).
-async fn request(gg: &GgCommons, verb: &str, body: Value) -> Message {
+async fn request(gg: &EdgeCommons, verb: &str, body: Value) -> Message {
     let topic = gg.uns().topic_with_channel(UnsClass::Cmd, verb).expect("cmd topic");
     let req = MessageBuilder::new(verb, "1.0").payload(body).build();
     let fut = gg.messaging().expect("messaging").request(&topic, req).await.expect("publish request");

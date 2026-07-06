@@ -1,7 +1,7 @@
 //! # file-replicator — control-message dispatcher (DESIGN §16)
 //!
 //! **One-liner purpose**: The inbound half of the control plane — register `get-status` / `trigger`
-//! / `set-activation` on the ggcommons component **command inbox** (`gg.commands()`,
+//! / `set-activation` on the edgecommons component **command inbox** (`gg.commands()`,
 //! `ecv1/{device}/file-replicator/main/cmd/#`) and answer via the library's request/reply wrapping.
 //! The built-in `ping` / `reload-config` / `get-configuration` verbs (registered by the library)
 //! answer everything the old custom `cmd/config` verb used to.
@@ -10,7 +10,7 @@
 //! [`ControlPlane`] used to own its own `{prefix}/cmd/#` subscription, a hand-rolled topic router
 //! ([`crate::uns::parse_cmd`], now deleted), and its own reply envelope. All three are now the
 //! library's job: [`ControlPlane::register`] registers three verbs on the shared
-//! [`ggcommons::commands::CommandInbox`] (mirroring exactly how opcua-adapter/modbus-adapter register
+//! [`edgecommons::commands::CommandInbox`] (mirroring exactly how opcua-adapter/modbus-adapter register
 //! their `sb/*` verbs and telemetry-processor its `flush`/`get-stats`/`pause`/`resume` verbs) — the
 //! inbox handles the subscribe, the verb/topic routing, the reply envelope (with the request's
 //! `correlation_id`), and the normative `{"ok":true,"result":…}` / `{"ok":false,"error":{code,
@@ -62,9 +62,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ggcommons::commands::{command_handler, CommandError, CommandHandler, CommandInbox};
-use ggcommons::messaging::Message;
-use ggcommons::prelude::Config;
+use edgecommons::commands::{command_handler, CommandError, CommandHandler, CommandInbox};
+use edgecommons::messaging::Message;
+use edgecommons::prelude::Config;
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -796,7 +796,7 @@ mod tests {
     }
 
     fn req(name: &str, body: Value) -> Message {
-        ggcommons::messaging::MessageBuilder::new(name, "1.0")
+        edgecommons::messaging::MessageBuilder::new(name, "1.0")
             .reply_to("reply/here")
             .correlation_id("corr-1")
             .payload(body)

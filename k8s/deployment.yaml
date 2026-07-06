@@ -61,7 +61,7 @@ spec:
             readOnlyRootFilesystem: true
             capabilities: { drop: ["ALL"] }
           volumeMounts:
-            - { name: config, mountPath: /etc/ggcommons, readOnly: true }   # WHOLE volume, never subPath (hot-reload)
+            - { name: config, mountPath: /etc/edgecommons, readOnly: true }   # WHOLE volume, never subPath (hot-reload)
             - { name: data, mountPath: /data }                              # durable SQLite state + resume + archive/failed
             - { name: tmp, mountPath: /tmp }
       volumes:

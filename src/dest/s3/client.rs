@@ -4,7 +4,7 @@
 //! `CreateMultipartUpload`/`UploadPart`/`CompleteMultipartUpload`/`AbortMultipartUpload`,
 //! `HeadObject`). Those lines are unreachable in CI/unit runs, so this file is **excluded from the
 //! coverage gate** via `--ignore-filename-regex '(testutil|dest.s3.client)\.rs'` — the same
-//! "trait seams + fakes, exclude live-infra" convention ggcommons uses. It is exercised live by the
+//! "trait seams + fakes, exclude live-infra" convention edgecommons uses. It is exercised live by the
 //! self-skipping floci integration tests (`tests/s3_floci.rs`) and the org validation matrix
 //! (DESIGN §21); all *decision* logic it relies on lives in [`super`] and is unit-tested.
 //!

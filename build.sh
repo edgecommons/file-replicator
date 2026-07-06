@@ -9,19 +9,19 @@
 # (GDK creates those folders before calling us.)
 #
 # The on-device artifact is built with the `greengrass` feature (Greengrass IPC), which is Linux-only
-# (the SDK is a C-FFI crate needing libclang). Build on a Linux host (or WSL), or set GGCOMMONS_TARGET
+# (the SDK is a C-FFI crate needing libclang). Build on a Linux host (or WSL), or set EDGECOMMONS_TARGET
 # to a Linux triple you have a toolchain for, e.g.:
-#   GGCOMMONS_TARGET=x86_64-unknown-linux-gnu ./build.sh
+#   EDGECOMMONS_TARGET=x86_64-unknown-linux-gnu ./build.sh
 set -euo pipefail
 
 COMPONENT_NAME="com.mbreissi.edgecommons.FileReplicator"
 COMPONENT_VERSION="$(python3 -c 'import json; c = json.load(open("gdk-config.json"))["component"]; print(next(iter(c.values()))["version"])')"
 BIN_NAME="file-replicator"
 
-# Greengrass-mode features for the device build. Add ggcommons features as needed (e.g.
+# Greengrass-mode features for the device build. Add edgecommons features as needed (e.g.
 # "greengrass,cloudwatch"); destination features (dest-s3, ...) are added here as phases land.
-FEATURES="${GGCOMMONS_FEATURES:-greengrass}"
-TARGET="${GGCOMMONS_TARGET:-}"
+FEATURES="${EDGECOMMONS_FEATURES:-greengrass}"
+TARGET="${EDGECOMMONS_TARGET:-}"
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 
 echo "Building ${BIN_NAME} (release, features=${FEATURES})${TARGET:+ for ${TARGET}}..."

@@ -1,10 +1,10 @@
 # Container image for file-replicator, for the KUBERNETES (and HOST/Docker) platform.
-# Requires the ggcommons crate resolvable (cargo git dep on the private repo, or crates.io).
+# Requires the edgecommons crate resolvable (cargo git dep on the private repo, or crates.io).
 #
 # Multi-stage: stage 1 compiles the standalone release binary; stage 2 is a slim glibc runtime that
 # carries only the binary, run as a non-root user.
 #
-# Build (the cargo git dep needs network + git auth to fetch the private ggcommons repo —
+# Build (the cargo git dep needs network + git auth to fetch the private edgecommons repo —
 # pass a GITHUB_TOKEN or mount an SSH agent):
 #   docker build -t <image> .
 # Then push to your registry (or `kind load docker-image <image>` for a local cluster) and set

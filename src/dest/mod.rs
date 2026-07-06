@@ -51,7 +51,7 @@ pub use azure::AzureDest;
 pub use gcs::GcsDest;
 
 /// Process-wide handles a backend may need beyond its own egress config (DESIGN §11.5):
-/// the ggcommons credential service (for a `{"$secret":"…"}` egress reference) and the shared durable
+/// the edgecommons credential service (for a `{"$secret":"…"}` egress reference) and the shared durable
 /// [`StateStore`] (so the S3 backend can persist its multipart resume checkpoint — the [`Destination`]
 /// trait carries no store handle). Both are optional; the `local` backend ignores them. Feature-gated
 /// so a `--no-default-features` build without `dest-s3` neither references the credentials type nor
@@ -67,7 +67,7 @@ pub struct DestDeps {
         feature = "dest-azure",
         feature = "dest-gcs"
     ))]
-    pub credentials: Option<Arc<dyn ggcommons::credentials::CredentialService>>,
+    pub credentials: Option<Arc<dyn edgecommons::credentials::CredentialService>>,
     /// Shared durable store, threaded to backends that checkpoint resume state mid-transfer (S3, SFTP).
     pub store: Option<Arc<dyn StateStore>>,
 }
@@ -90,7 +90,7 @@ impl DestDeps {
     ))]
     pub fn with_credentials(
         mut self,
-        credentials: Option<Arc<dyn ggcommons::credentials::CredentialService>>,
+        credentials: Option<Arc<dyn edgecommons::credentials::CredentialService>>,
     ) -> Self {
         self.credentials = credentials;
         self

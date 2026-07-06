@@ -1,7 +1,7 @@
 //! # file-replicator — entry point
 //!
 //! An EdgeCommons **sink** component (AWS IoT Greengrass v2 / HOST / Kubernetes) built on the
-//! `ggcommons` Rust library. It watches local directories and replicates files to configured
+//! `edgecommons` Rust library. It watches local directories and replicates files to configured
 //! destinations. It initializes the runtime from the standard CLI contract
 //! (`-c`/`--platform`/`--transport`/`-t`), loads + parses the instance configuration, then hands
 //! control to [`app::App`], which builds one replication [`instance::Instance`] per
@@ -18,14 +18,14 @@
 //! ```
 
 use file_replicator::app;
-use ggcommons::prelude::*;
+use edgecommons::prelude::*;
 
 /// The component's full name (matches `recipe.yaml` / `gdk-config.json`).
 const COMPONENT_NAME: &str = "com.mbreissi.edgecommons.FileReplicator";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let gg = GgCommonsBuilder::new(COMPONENT_NAME)
+    let gg = EdgeCommonsBuilder::new(COMPONENT_NAME)
         .args(std::env::args_os())
         .build()
         .await?;

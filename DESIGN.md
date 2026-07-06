@@ -4,12 +4,12 @@
 > outstanding — see `git log --oneline` for the per-phase commits) · **Version:** 0.2 (revised after review
 > round 1) · **Date:** 2026-07-01 (design) / updated 2026-07-03 to flag implementation status
 > **Component:** `file-replicator` · **Full name:** `com.mbreissi.edgecommons.FileReplicator`
-> **Category:** `sink` (northbound delivery) · **Language:** Rust · **Library:** `ggcommons`
+> **Category:** `sink` (northbound delivery) · **Language:** Rust · **Library:** `edgecommons`
 > **Platforms:** HOST · GREENGRASS · KUBERNETES
 
 This document is the original review artifact, and its requirements/rationale remain authoritative. It
 captures **what** the component does (requirements) and **how** it is built (design), grounded in
-EdgeCommons conventions (`telemetry-processor` as the Rust template, the `ggcommons` library API, and the
+EdgeCommons conventions (`telemetry-processor` as the Rust template, the `edgecommons` library API, and the
 org registry/CI/docs plumbing). **This intro paragraph predates scaffolding and is now stale on that one
 point** — P0 through P6 of §21's phase plan have since been implemented and are CI-gated at 90% line
 coverage (`.github/workflows/ci.yml`); only P7 (optional) remains. Inline notes elsewhere in this document
@@ -19,8 +19,8 @@ name and do not need correction — check `src/` before assuming a gap noted the
 > **STATUS BANNER — the UNS/messaging surface was migrated AFTER this doc's last revision (2026-07-03).**
 > §15–§17 below describe the component's ORIGINAL, hand-rolled `{thing}/file-replicator/{cmd|evt|state}/…`
 > topic scheme (`src/uns.rs`) and its retained-`state/…` interim. That whole surface was subsequently
-> **migrated onto the ggcommons UNS core + message-class facades** (commit `refactor: migrate the
-> UNS/messaging surface onto the new ggcommons core + facades`, and the `ggcommons` `v0.2.0` pin). As
+> **migrated onto the edgecommons UNS core + message-class facades** (commit `refactor: migrate the
+> UNS/messaging surface onto the new edgecommons core + facades`, and the `edgecommons` `v0.2.0` pin). As
 > shipped today:
 > - Topics are minted by `gg.commands()`/`gg.events()` at `ecv1/{device}/FileReplicator/{instance}/{class}`
 >   (`{class}` ∈ `cmd`·`evt`, plus the reserved library-owned `state`/`cfg`/`metric`/`log`). **`src/uns.rs`
@@ -104,7 +104,7 @@ namespace so a realtime UI (edge or global) can be built on top.
 **Where it sits.** It is a **sink / northbound-delivery** component (`adapter | processor | sink`). The
 registry already reserves the `sink` category and the org profile/docs have a "Sinks — northbound delivery"
 section waiting for the first one. Its *data plane* is files on disk (not the MQTT bus); it speaks the
-standard ggcommons *control plane* (message envelope, config schema, health, metrics, credentials vault).
+standard edgecommons *control plane* (message envelope, config schema, health, metrics, credentials vault).
 
 **Design ethos.** Per the EdgeCommons "depth over simplest-case" principle, this covers the full capability
 surface (arrays not scalars, multi-destination-ready, cron + windows, resumable uploads, bandwidth caps,
@@ -118,7 +118,7 @@ activation, a complete control+event surface on a proper UNS). Where that adds r
 **Rust**, confirmed — the ecosystem-consistent choice (`telemetry-processor` is Rust) and a near-ideal fit:
 resource-constrained edge (small static binary, low RSS, no GC), clean `tokio` concurrency for parallel
 multipart uploads + per-instance isolation, precise streaming I/O with backpressure, and strong typing for
-data-loss-sensitive move-then-delete logic. It reuses the `ggcommons` Rust lib directly (messaging, config,
+data-loss-sensitive move-then-delete logic. It reuses the `edgecommons` Rust lib directly (messaging, config,
 credentials vault, health, metrics) with no FFI and one CI lane.
 
 **Toolchain note (updated 2026-07-01):** the earlier "pure-Rust to avoid a C compiler on Windows" driver is
@@ -135,7 +135,7 @@ cargo features so a build pulls only what it needs.
 
 | Term | Meaning |
 |---|---|
-| **Instance** | One watched-directory specification = one `component.instances[]` entry (the standard ggcommons instance idiom, as `telemetry-processor` uses routes). Unit of config, isolation, statistics, activation, and control. |
+| **Instance** | One watched-directory specification = one `component.instances[]` entry (the standard edgecommons instance idiom, as `telemetry-processor` uses routes). Unit of config, isolation, statistics, activation, and control. |
 | **Ingress** | The source: local directory, optional recursion, readiness policy, include/exclude globs. |
 | **Egress** | Destination(s): an ordered **list** of delivery targets. Originally v1 was to enforce exactly one, with the schema + engine multi-destination-ready for later (§20-B) — **multi-destination fan-out has since shipped (P6)**: `N >= 1` entries fan out independently. |
 | **Schedule** | *When* work runs: `immediate` (on arrival, default), `cron` (point trigger), or `window` (a recurring open→close span). |
@@ -240,7 +240,7 @@ IDs follow the ecosystem `FR-<AREA>-<n>` convention. RFC-2119 keywords.
 
 ## 5. Non-functional requirements
 
-- **NFR-1 (Platforms)** — HOST / GREENGRASS / KUBERNETES via the ggcommons resolver; no platform branching in engine code.
+- **NFR-1 (Platforms)** — HOST / GREENGRASS / KUBERNETES via the edgecommons resolver; no platform branching in engine code.
 - **NFR-2 (Coverage)** — Org **90% line-coverage gate** (`cargo llvm-cov --fail-under-lines 90`); live-infra paths excluded via trait seams + fakes.
 - **NFR-3 (Footprint)** — Idle RSS < 25 MiB; bounded memory under a 100k-file spool (streaming reads, state on disk).
 - **NFR-4 (Throughput)** — Saturate uplink for large files (parallel multipart, acceleration); handle high-count small-file spools via bounded concurrency + prefix parallelism.
@@ -258,12 +258,12 @@ IDs follow the ecosystem `FR-<AREA>-<n>` convention. RFC-2119 keywords.
 `main.rs` is ~40 lines — build the runtime, hand off to the app, await shutdown:
 
 ```rust
-use ggcommons::prelude::*;
+use edgecommons::prelude::*;
 const COMPONENT_NAME: &str = "com.mbreissi.edgecommons.FileReplicator";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let gg = GgCommonsBuilder::new(COMPONENT_NAME).args(std::env::args_os()).build().await?;
+    let gg = EdgeCommonsBuilder::new(COMPONENT_NAME).args(std::env::args_os()).build().await?;
     let app = app::ReplicatorApp::start(&gg).await?;
     app.run(&gg).await?;   // runs until gg.shutdown_signal()
     Ok(())
@@ -271,7 +271,7 @@ async fn main() -> anyhow::Result<()> {
 ```
 
 The library owns platform detection, config source, logging, metrics, heartbeat, health, SIGTERM, and
-hot-reload. Teardown is RAII on `GgCommons` drop.
+hot-reload. Teardown is RAII on `EdgeCommons` drop.
 
 ### 6.2 Module layout
 
@@ -358,7 +358,7 @@ flowchart TD
 
 Config is one JSON document from the platform's source (FILE/CONFIGMAP/GG_CONFIG). The component owns
 `component.*`; sibling sections (`messaging`, `credentials`, `logging`, `heartbeat`, `metricEmission`,
-`health`, `tags`) are standard ggcommons sections.
+`health`, `tags`) are standard edgecommons sections.
 
 ### 7.1 Instance sections
 
@@ -641,7 +641,7 @@ land as separately-toggleable, separately-crated backends (`russh`+`russh-sftp` 
 
 ### 10.3 Additional destination suggestions
 
-- **ggcommons durable stream / northbound MQTT** — publish an "arrived/replicated" notification or hand a
+- **edgecommons durable stream / northbound MQTT** — publish an "arrived/replicated" notification or hand a
   manifest to `gg.streams()` ("notify, don't move").
 - **Another edge node** — via SFTP/HTTP peer (no bespoke protocol needed).
 - **NFS/SMB mount** / **MinIO / S3-compatible** — the `local` dest on a mount, or the `s3` dest with a
@@ -759,7 +759,7 @@ Overnight windows (e.g. open `0 22 * * *`, close `0 6 * * *`) work because the n
   discard partial progress). This is the bandwidth-conservation use case (uploads pause during operating
   hours). Emits `WindowOpened` / `WindowClosed` / `ScheduleComplete`.
 
-We reuse the ggcommons credentials `SyncEngine` interval pattern (sleep in ≤1s steps so shutdown/reload are
+We reuse the edgecommons credentials `SyncEngine` interval pattern (sleep in ≤1s steps so shutdown/reload are
 honored promptly) for the scheduler tick rather than one long sleep.
 
 ---
@@ -921,7 +921,7 @@ IoT Core's topic limits.
 {thing}/{component}/{class}/{resource…}
 ```
 
-- **`{thing}`** — ggcommons ThingName; globally unique → collision-free across the fleet and after
+- **`{thing}`** — edgecommons ThingName; globally unique → collision-free across the fleet and after
   cloud-bridging, with no root needed.
 - **`{component}`** — the short registry slug **`file-replicator`** (not the 38-char reverse-DNS full name —
   saves bytes, reads better).
@@ -929,7 +929,7 @@ IoT Core's topic limits.
   current snapshot).
 
 This also *matches what core already does* for metrics (`{ThingName}/{ComponentName}/metric`) — we simply drop
-the inconsistent `ggcommons/` root and add the `class` layer (§15.6).
+the inconsistent `edgecommons/` root and add the `class` layer (§15.6).
 
 ### 15.3 Topic map
 
@@ -993,22 +993,22 @@ Location filtering
 (site/enterprise) happens on the envelope `tags` (consumer-side or a cloud rule), since those aren't
 reliable enough to sit in the path.
 
-### 15.6 Reconciling with ggcommons core
+### 15.6 Reconciling with edgecommons core
 
-Core publishes heartbeat/metrics under `ggcommons/{ThingName}/{ComponentName}/…` and answers
-`GetConfiguration` on `ggcommons/{ThingName}/config/get/{ComponentName}`. Our scheme intentionally keeps
-core's `{thing}/{component}` ordering — minus the `ggcommons/` root, plus the `class` layer. Plan
-(**superseded by the UNS-core migration — see §1 status banner; status as of the `ggcommons` `v0.2.0` pin**):
+Core publishes heartbeat/metrics under `edgecommons/{ThingName}/{ComponentName}/…` and answers
+`GetConfiguration` on `edgecommons/{ThingName}/config/get/{ComponentName}`. Our scheme intentionally keeps
+core's `{thing}/{component}` ordering — minus the `edgecommons/` root, plus the `class` layer. Plan
+(**superseded by the UNS-core migration — see §1 status banner; status as of the `edgecommons` `v0.2.0` pin**):
 1. **file-replicator** was to use `{thing}/file-replicator/{class}/…` (its own `src/uns.rs`). — This
    *did* ship in P3, but has since been **replaced**: `src/uns.rs` is deleted and topics are minted by the
-   ggcommons UNS core at `ecv1/{device}/FileReplicator/{instance}/{class}`.
+   edgecommons UNS core at `ecv1/{device}/FileReplicator/{instance}/{class}`.
 2. **Optional legacy alias:** answer the core `GetConfiguration` on the old topic (`legacyConfigTopic:
    true`). — Shipped in P3, then **retired** in the migration: no `legacy_config_topic()`, no
    `legacyConfigTopic` config; the library's built-in `get-configuration` verb answers it.
-3. **Separate core proposal:** drop the `ggcommons/` root and adopt a fixed `class`-layered namespace
-   across core (four-language parity). — This is essentially what **happened**, but via `ggcommons`'s own
+3. **Separate core proposal:** drop the `edgecommons/` root and adopt a fixed `class`-layered namespace
+   across core (four-language parity). — This is essentially what **happened**, but via `edgecommons`'s own
    (much larger, differently-shaped) UNS rework — `ecv1/{device}/{component}/{instance}/{class}[/channel]`
-   (`ggcommons/docs/platform/UNS-CANONICAL-DESIGN.md`), now **merged and released as `ggcommons` `v0.2.0`**
+   (`edgecommons/docs/platform/UNS-CANONICAL-DESIGN.md`), now **merged and released as `edgecommons` `v0.2.0`**
    and adopted here. It did **not** incorporate this section's specific `{thing}/file-replicator/…` proposal;
    file-replicator migrated onto the core scheme instead. Promoting file-replicator's OWN control-surface
    helper into core (P7, §21) remains **unstarted** and is largely moot now the core UNS itself exists.
@@ -1023,7 +1023,7 @@ core's `{thing}/{component}` ordering — minus the `ggcommons/` root, plus the 
 > unique `-t/--thing` per HOST deployment). The topic-budget/validity guard is now the library's concern,
 > not this component's. The original design text is retained below as the historical rationale.
 
-Prefix defaulted to `{ThingName}/file-replicator` (resolved via the ggcommons template resolver, which
+Prefix defaulted to `{ThingName}/file-replicator` (resolved via the edgecommons template resolver, which
 sanitizes for topic safety); it *was* to be overridable via `component.global.topics.prefix` (+ per-instance).
 Deployments on a *shared* non-IoT-Core broker that want an app namespace could prepend one here. **HOST
 note:** without IoT Core there's no ThingName-uniqueness enforcement, so set a unique `-t/--thing` per HOST
@@ -1042,7 +1042,7 @@ the UNS core this validity guarantee is enforced by the library that mints the t
 ## 16. Control-message suite
 
 > **Superseded by the UNS-core migration (see §1 status banner) — authoritative: `docs/reference/messaging-interface.md`.**
-> The hand-rolled local control dispatcher below was replaced by verb registrations on the ggcommons
+> The hand-rolled local control dispatcher below was replaced by verb registrations on the edgecommons
 > **command inbox** (`gg.commands()`, `ecv1/{device}/FileReplicator/main/cmd/#`), which now provides the
 > generic control framework core previously lacked. Concretely: **`get-config` is retired** (the library's
 > built-in `get-configuration` verb answers it, redacted — plus `ping` / `reload-config`); the
@@ -1050,10 +1050,10 @@ the UNS core this validity guarantee is enforced by the library that mints the t
 > (`cmd/get-status` + `{instance?}`); verbs are `cmd/get-status`, `cmd/trigger`, `cmd/set-activation`. The
 > table below is the ORIGINAL design; the `get-status` reply *shape* it describes is still accurate.
 
-Uses the ggcommons request/reply primitive (`request`/`reply`, `reply_to`). At design time core had **no
+Uses the edgecommons request/reply primitive (`request`/`reply`, `reply_to`). At design time core had **no
 generic control framework** — each component wired its own handlers — so this speced a small local **control
 dispatcher** (resource/verb → handler), structured to be liftable into core alongside the UNS proposal
-(§15.4, §20-E). The command inbox (shipped in `ggcommons` `v0.2.0`) is that framework.
+(§15.4, §20-E). The command inbox (shipped in `edgecommons` `v0.2.0`) is that framework.
 
 | Command | Topic (as originally designed; see banner for shipped) | Body | Reply |
 |---|---|---|---|
@@ -1140,7 +1140,7 @@ which derives the `evt/{severity}/{type}` channel from the body — the wire bod
   and `Retained` outcomes (`src/instance/worker.rs`'s `emit`). The rest of this list — discovery/in-progress/
   queue-depth/retry-count/bandwidth/link/activation/duration metrics — has no emission call anywhere in
   `src/` as of P6; treat them as still-designed, not shipped.
-- **Platform** entirely via the ggcommons resolver (HOST→FILE/MQTT, GG→GG_CONFIG/IPC, K8S→CONFIGMAP/MQTT);
+- **Platform** entirely via the edgecommons resolver (HOST→FILE/MQTT, GG→GG_CONFIG/IPC, K8S→CONFIGMAP/MQTT);
   no `#[cfg(platform)]` in engine code; cargo features gate backends + the Linux-only `greengrass` (IPC)
   feature (OFF by default). Health `/livez` `/readyz` `/startupz` + JSON logging from the library on k8s.
   `gg.set_ready(false)` until instances initialize.
@@ -1159,7 +1159,7 @@ which derives the `evt/{severity}/{type}` channel from the body — the wire bod
 
 ## 19. Documentation strategy
 
-**Your #13 — carry forward the docs lessons** (from the ggcommons docs audit + "depth over simplest-case"):
+**Your #13 — carry forward the docs lessons** (from the edgecommons docs audit + "depth over simplest-case"):
 the docs must **teach**, with **extensive real configuration samples and deep explanation**, not a syntax
 rehash of the config keys.
 
@@ -1222,11 +1222,11 @@ rehash of the config keys.
 | **P0 — Scaffold** | Repo from the Rust template; config model; module stubs; CI caller + gate; docs shell; registry PR. | build/test/clippy green; empty engine runs on HOST. | ✅ shipped (`19e1ec8`) |
 | **P1 — Core engine (local)** | Watcher + readiness(stability) + durable store(**SQLite**) + worker + completion(delete/archive/**quarantine**) + integrity(checksum) + retry + **bandwidth cap** + **activation**, local dest, immediate mode. | Move files local→local, crash-safe, verified, bandwidth-limited, activate/deactivate persists; 3 platforms; ≥90% cov. | ✅ shipped (`1aafd3a`) |
 | **P2 — S3 destination** | Size-adaptive PutObject/multipart, parallel parts, **acceleration/trailing-checksum/unsigned-PUT**, resumable, **ambient creds**+`$secret`. | Validated vs floci + a real bucket; resume-after-kill + 2-day-outage sim proven. | ✅ shipped (`40b79e4`) |
-| **P3 — Control + events + UNS** | UNS topic layer; control dispatcher (get-config/get-status/trigger/set-activation); event publisher + current-state snapshots; metrics. | Live status + activation via control msg; UI-ready UNS stream; cloud-bridge wildcard test. | ✅ shipped (`86d7f4f`), then **migrated onto the ggcommons UNS core + facades** (`acc98c2`, `ggcommons` `v0.2.0`): `src/uns.rs`/`get-config`/`legacyConfigTopic`/`topics.prefix` retired, and the retained `state/…` snapshot **dropped** (no longer a pending `publish_retained` gap — §1 status banner / FR-EVT-4) |
+| **P3 — Control + events + UNS** | UNS topic layer; control dispatcher (get-config/get-status/trigger/set-activation); event publisher + current-state snapshots; metrics. | Live status + activation via control msg; UI-ready UNS stream; cloud-bridge wildcard test. | ✅ shipped (`86d7f4f`), then **migrated onto the edgecommons UNS core + facades** (`acc98c2`, `edgecommons` `v0.2.0`): `src/uns.rs`/`get-config`/`legacyConfigTopic`/`topics.prefix` retired, and the retained `state/…` snapshot **dropped** (no longer a pending `publish_retained` gap — §1 status banner / FR-EVT-4) |
 | **P4 — Scheduling & windows** | `croner` cron + window(open/close/duration) + `onWindowClose` pause/resume; English sugar. | Windowed uploads incl. overnight/DST; mid-window pause/resume proven. | ✅ shipped (`301082d`) — the destination disconnection circuit-breaker (§13.4) and its `get-status` `link`/window sub-fields were bundled with this phase in earlier drafts of this doc but are **still not implemented** (`Event::Disconnected`/`Reconnected` are `Deferred` enum variants in `src/events.rs`) |
 | **P5 — More destinations** | SFTP/FTPS, HTTP(S), then Azure/GCS (features off default until stable). | Each validated + resume where supported. | ✅ shipped (`a4f4bdb`) |
 | **P6 — Multi-destination fan-out** | Lift `len==1`; parallel fan-out + aggregate completion. | N-dest delivery, per-dest retry, single completion. | ✅ shipped (`830d5a2`) |
-| **P7 — Core promotion (optional)** | Extract UNS + control-surface helper → ggcommons (4-lang). | Parity + gates in all four langs. | ⬜ not started — no such promotion exists in `ggcommons` (its UNS rework shipped as v0.2.0 on `main` but did not absorb file-replicator's UNS/control-surface helper; this P7 remains a separate, unstarted proposal) |
+| **P7 — Core promotion (optional)** | Extract UNS + control-surface helper → edgecommons (4-lang). | Parity + gates in all four langs. | ⬜ not started — no such promotion exists in `edgecommons` (its UNS rework shipped as v0.2.0 on `main` but did not absorb file-replicator's UNS/control-surface helper; this P7 remains a separate, unstarted proposal) |
 
 Validation: HOST→Windows + EMQX/floci; GREENGRASS→lab-5950x; k8s→kind + lab-k3s; Rust `greengrass` build→WSL.
 
@@ -1245,7 +1245,7 @@ Validation: HOST→Windows + EMQX/floci; GREENGRASS→lab-5950x; k8s→kind + la
   "description": "Rust reference sink: watches directories and replicates files to S3, local, SFTP/FTPS, HTTP, Azure Blob and GCS — on arrival or on cron schedules/windows — with resumable uploads, integrity verification, bandwidth caps, per-instance activation, and a full control/event surface on a unified namespace.",
   "status": "experimental",
   "platforms": ["GREENGRASS", "HOST", "KUBERNETES"],
-  "library": "ggcommons",
+  "library": "edgecommons",
   "topics": ["edgecommons", "edgecommons-sink", "aws-iot-greengrass", "iiot", "file-replication", "s3"]
 }
 ```
@@ -1254,9 +1254,9 @@ Validation: HOST→Windows + EMQX/floci; GREENGRASS→lab-5950x; k8s→kind + la
 
 | Crate | Purpose | Notes |
 |---|---|---|
-| `ggcommons` | the library | pinned by git rev; local sibling via `.cargo/config.toml` (gitignored) |
+| `edgecommons` | the library | pinned by git rev; local sibling via `.cargo/config.toml` (gitignored) |
 | `tokio` | async runtime | `rt-multi-thread,macros,signal,time,sync,fs` |
-| `notify` | filesystem watch | already used by the ggcommons config watcher |
+| `notify` | filesystem watch | already used by the edgecommons config watcher |
 | **`rusqlite`** (bundled) | durable state | **decided (§14) and shipped** (`SqliteStore`); WAL, statically linked. `redb`/`state-redb` was proposed as a fallback but never built — no such dependency/feature exists |
 | **`croner`** + `chrono` + `chrono-tz` | cron + windows, TZ/DST | pure-Rust; alternatives `cron`/`saffron` |
 | `globset` | include/exclude globs | pure-Rust |
@@ -1271,9 +1271,9 @@ Cargo features (batteries-included default; native/immature off — the `telemet
 
 ```toml
 default    = ["standalone", "dest-s3"]
-standalone = ["ggcommons/standalone"]
-greengrass = ["ggcommons/greengrass"]         # Linux-only IPC, OFF by default
-cloudwatch = ["ggcommons/cloudwatch"]
+standalone = ["edgecommons/standalone"]
+greengrass = ["edgecommons/greengrass"]         # Linux-only IPC, OFF by default
+cloudwatch = ["edgecommons/cloudwatch"]
 dest-s3    = ["dep:aws-sdk-s3", "dep:aws-config"]
 dest-sftp  = ["dep:russh", "dep:russh-sftp"]
 dest-http  = ["dep:reqwest"]
@@ -1313,7 +1313,7 @@ file-replicator/
 > follows:
 
 - ✅ **§14 (F)** — durable state = **SQLite** (decided, and shipped as `SqliteStore`, `src/state.rs`).
-- ✅ **§15 (H)** — UNS shipped in P3 as `{thing}/file-replicator/{cmd|evt|state}/…` (`src/uns.rs`), then **migrated onto the ggcommons UNS core** (`ecv1/{device}/FileReplicator/{instance}/{class}`; `src/uns.rs` deleted; retained-`state`/`get-config`/`legacyConfigTopic`/`topics.prefix` retired) — see §1 status banner.
+- ✅ **§15 (H)** — UNS shipped in P3 as `{thing}/file-replicator/{cmd|evt|state}/…` (`src/uns.rs`), then **migrated onto the edgecommons UNS core** (`ecv1/{device}/FileReplicator/{instance}/{class}`; `src/uns.rs` deleted; retained-`state`/`get-config`/`legacyConfigTopic`/`topics.prefix` retired) — see §1 status banner.
 - ✅ **§12** — cron-first + English sugar shipped as designed in P4 (`src/schedule/{cron,sugar,window}.rs`); the open/close/duration window model is implemented and unit-tested.
 - ✅ **§13.3** — Failed-folder default resolved as `retainInPlace` (shipped default in `src/config.rs`'s `CompletionCfg`; `quarantine` is the opt-in).
 - ⚠️ **§13.4** — `giveUpAfter` default (7d) **shipped** (P1, time-governed retry); the long-outage **circuit-breaker** itself is **still not implemented** (`Event::Disconnected`/`Reconnected` remain `Deferred` in `src/events.rs`) — this part of the decision is still genuinely open, not just undocumented.

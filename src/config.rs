@@ -1,7 +1,7 @@
 //! # file-replicator — configuration model
 //!
 //! Deserializes the component's own config subtree (`component.instances[]` / `component.global`)
-//! into typed structs. Sibling ggcommons sections (`messaging`, `credentials`, `logging`,
+//! into typed structs. Sibling edgecommons sections (`messaging`, `credentials`, `logging`,
 //! `heartbeat`, `metricEmission`, `health`, `tags`) are parsed by the library, not here.
 //!
 //! Conventions (mirrors `telemetry-processor`): `camelCase` field names; per-instance parse is
@@ -26,13 +26,13 @@
 //!
 //! **UNS migration note**: the old `TopicsCfg` (`component.global.topics.prefix` /
 //! `InstanceCfg.topics` / `legacyConfigTopic`) is REMOVED, not deprecated — topics are now minted by
-//! the ggcommons UNS grammar (`ecv1/{device}/{component}/{instance}/{class}`), which has no
+//! the edgecommons UNS grammar (`ecv1/{device}/{component}/{instance}/{class}`), which has no
 //! configurable prefix and no legacy-alias concept (see `crate::control`/`crate::events` module
 //! docs).
 
 use std::path::PathBuf;
 
-use ggcommons::prelude::Config;
+use edgecommons::prelude::Config;
 use serde::{Deserialize, Deserializer};
 
 // ---- lenient numeric deserializers (FR-CFG-3: Greengrass delivers config numbers as doubles) -----

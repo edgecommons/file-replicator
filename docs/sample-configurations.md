@@ -5,7 +5,7 @@ Complete, annotated configs for real scenarios. Each is validated against the co
 component never branches on platform); only how config/messaging/identity are *sourced* differs, covered in
 [§9 Per-platform](#9-per-platform-host--greengrass--kubernetes).
 
-Every instance lives under `component.instances[]`; the standard ggcommons sections (`messaging`,
+Every instance lives under `component.instances[]`; the standard edgecommons sections (`messaging`,
 `credentials`, `logging`, `heartbeat`, `metricEmission`, `tags`) sit alongside `component`. Full field
 reference: [Reference › Configuration](reference/configuration.md); every destination field:
 [Reference › Destinations](reference/destinations.md). The off-by-default backends (`sftp`/`ftps`/`http`/
@@ -268,7 +268,7 @@ file-replicator --platform GREENGRASS -c GG_CONFIG
 **KUBERNETES** — build the image (`Dockerfile`) and apply the manifests in `k8s/` (`kubectl apply -f k8s/`).
 **No CLI args are needed:** with `--platform auto` the library detects KUBERNETES from the projected
 ServiceAccount token, the config source defaults to `CONFIGMAP` (the ConfigMap is mounted as a whole
-directory at `/etc/ggcommons`), transport defaults to MQTT with broker config from that ConfigMap, and
+directory at `/etc/edgecommons`), transport defaults to MQTT with broker config from that ConfigMap, and
 identity comes from the Downward API; `s3` credentials come from IRSA (ambient). The `component` config in
 the ConfigMap is unchanged from the examples above — mount your watched source directory and any
 local-destination/archive/failed dirs into the pod per deployment (durable SQLite state lives on the `/data`

@@ -2,7 +2,7 @@
 //!
 //! **One-liner purpose**: The outbound half of the control plane — the [`Event`] catalog (DESIGN
 //! §17.1) plus the progress [`ProgressThrottle`] (unchanged engine logic), now emitted through the
-//! ggcommons [`EventsFacade`] (`gg.instance(id).events()` / `gg.events()`) instead of a hand-built
+//! edgecommons [`EventsFacade`] (`gg.instance(id).events()` / `gg.events()`) instead of a hand-built
 //! `{thing}/file-replicator/evt/…` topic.
 //!
 //! ## UNS migration (replaces the old `evt`/`state` scheme)
@@ -35,7 +35,7 @@
 //! document a live subscriber used to also get pushed to it.
 //!
 //! ## Testability (matches the sibling migrations)
-//! [`ggcommons::facades::EventsFacade`] has no public constructor outside the `ggcommons` crate (by
+//! [`edgecommons::facades::EventsFacade`] has no public constructor outside the `edgecommons` crate (by
 //! design — DESIGN-class-facades keeps the wire contract single-sourced there, and its OWN
 //! conformance vectors/unit tests already pin the topic/body shape byte-for-byte). So — exactly like
 //! telemetry-processor's `EvtEmitterProbe` and opcua-adapter/modbus-adapter's untouched test suites —
@@ -48,7 +48,7 @@
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
-use ggcommons::facades::{EventsFacade, Severity};
+use edgecommons::facades::{EventsFacade, Severity};
 use serde_json::{json, Map, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -443,7 +443,7 @@ impl ProgressThrottle {
 }
 
 /// The cloneable event emitter every instance/worker holds (and the component-level wiring for
-/// `ComponentReady`/scope-`all` events) — bound to exactly ONE ggcommons [`EventsFacade`] (an
+/// `ComponentReady`/scope-`all` events) — bound to exactly ONE edgecommons [`EventsFacade`] (an
 /// instance-scoped `gg.instance(id).events()`, or the component-level `gg.events()`). `disabled()`
 /// (no facade bound — messaging unavailable on this platform, DESIGN §6) makes every call a no-op,
 /// so the P1/P2 replication engine runs unchanged.
@@ -453,8 +453,8 @@ pub struct Events {
     /// Test-only recorder (see [`test_support::recording_events`]): when set, [`Self::emit`] records
     /// the [`Event`] value for in-process assertions instead of (or in addition to, though in
     /// practice `facade` is always `None` when this is `Some`) a real facade publish. `EventsFacade`
-    /// has no public constructor outside the ggcommons crate, so this is the only way component code
-    /// can assert "the engine raised event X" without going through a live `GgCommons`.
+    /// has no public constructor outside the edgecommons crate, so this is the only way component code
+    /// can assert "the engine raised event X" without going through a live `EdgeCommons`.
     #[cfg(test)]
     recorder: Option<Arc<Mutex<Vec<Event>>>>,
 }

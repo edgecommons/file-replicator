@@ -1,7 +1,7 @@
-# Component config for Kubernetes, mounted as a DIRECTORY at /etc/ggcommons so the CONFIGMAP source
+# Component config for Kubernetes, mounted as a DIRECTORY at /etc/edgecommons so the CONFIGMAP source
 # watches the kubelet ..data swap and hot-reloads in-process (no restart). config.json carries the
 # component config, the messaging block (in-cluster broker via Service DNS), and the standard
-# ggcommons sections. The component NAME comes from the compiled-in binary constant, not this file.
+# edgecommons sections. The component NAME comes from the compiled-in binary constant, not this file.
 # Edit and `kubectl apply -f k8s/` to drive a hot reload. See DESIGN.md §7 for the full instance shape.
 apiVersion: v1
 kind: ConfigMap
@@ -17,6 +17,7 @@ data:
       "messaging": { "local": { "host": "emqx.default.svc.cluster.local", "port": 1883, "clientId": "file-replicator" } },
       "tags": { "appId": "Demo", "site": "factory-1" },
       "component": {
+        "token": "file-replicator",
         "global": { "limits": { "maxConcurrentFiles": 8 } },
         "instances": []
       }

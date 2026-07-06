@@ -168,7 +168,7 @@ destination, and then follows the standard retry/quarantine decision — the per
 observability, not a separate failure-handling path. (See `src/permission.rs`.)
 
 ## The unified namespace
-Commands and events ride the ggcommons UNS core: `ecv1/{device}/FileReplicator/{instance}/{cmd|evt}/…`
+Commands and events ride the edgecommons UNS core: `ecv1/{device}/FileReplicator/{instance}/{cmd|evt}/…`
 (minted by the library's `commands()`/`events()` facades, not a hand-rolled topic builder — see
 `docs/reference/messaging-interface.md`). There is no dashboard-facing retained `state/…` snapshot: the
 UNS `state` class is reserved to the library's own RUNNING/STOPPED keepalive, and a dashboard wanting an

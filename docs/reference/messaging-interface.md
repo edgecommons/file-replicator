@@ -1,6 +1,6 @@
 # Reference — messaging interface (UNS)
 
-All command/event topics ride the ggcommons **Unified Namespace** core (`gg.commands()` / `gg.events()` /
+All command/event topics ride the edgecommons **Unified Namespace** core (`gg.commands()` / `gg.events()` /
 the automatic `state`/`cfg` keepalive) — minted by the library, not a hand-rolled topic builder. Full
 rationale in [`DESIGN.md`](https://github.com/edgecommons/file-replicator/blob/main/DESIGN.md); this page
 and the `crate::events`/`crate::control` module docs are the source of truth for the wire contract.
@@ -10,7 +10,7 @@ ecv1/{device}/{component}/{instance}/{class}[/{channel…}]
 ```
 
 - `{device}` — the resolved ThingName (`-t`/`--thing`).
-- `{component}` — the SHORT UNS token ggcommons derives from the full name (the segment after the last
+- `{component}` — the SHORT UNS token edgecommons derives from the full name (the segment after the last
   `.` — `com.mbreissi.edgecommons.FileReplicator` → **`FileReplicator`**), not the `file-replicator`
   registry slug.
 - `{instance}` — a `component.instances[].id`, or `main` for component-level traffic (the built-in
@@ -28,7 +28,7 @@ Registered on the single `main`-instance command inbox (`ecv1/{device}/FileRepli
 scoping an instance is a request-body field, not a topic segment (mirroring how opcua-adapter/
 modbus-adapter address their multi-instance `sb/*` verbs and telemetry-processor's `route`/`pause`/
 `resume`). Every reply is `{"ok": true, "result": <value>}` or `{"ok": false, "error": {"code",
-"message"}}` (the ggcommons command-inbox contract — the request's `header.name` MUST equal the verb).
+"message"}}` (the edgecommons command-inbox contract — the request's `header.name` MUST equal the verb).
 
 | Verb | Topic | Body | Result / error codes |
 |---|---|---|---|
@@ -89,6 +89,6 @@ answers `get-status` — `active: false`, `disabled: true`, `disabledReason` —
 
 ## Envelope
 
-The standard ggcommons `Message`: `header` (`name`/`version`/`timestamp`/`correlation_id`/`reply_to`?),
+The standard edgecommons `Message`: `header` (`name`/`version`/`timestamp`/`correlation_id`/`reply_to`?),
 top-level `identity` (`hier`/`path`/`component`/`instance`, stamped automatically), optional `tags`
 (config `tags`, metadata only), `body`.

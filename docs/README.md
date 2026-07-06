@@ -7,7 +7,7 @@ handles source lifecycle on
 completion (delete / archive / quarantine), retries with resumable partial uploads, throttles bandwidth,
 can be activated/deactivated per instance from the control plane, and publishes granular status events on a
 unified namespace for realtime UIs. Runs standalone (**HOST**), on **Greengrass** (IPC), and on
-**Kubernetes** (ConfigMap) via the `ggcommons` library.
+**Kubernetes** (ConfigMap) via the `edgecommons` library.
 
 > These docs are validated against `src/`. The deep design rationale lives in
 > [`DESIGN.md`](https://github.com/edgecommons/file-replicator/blob/main/DESIGN.md) in the repo root.

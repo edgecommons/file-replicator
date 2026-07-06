@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, TimeZone, Utc};
-use ggcommons::metrics::MetricService;
+use edgecommons::metrics::MetricService;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -1430,7 +1430,7 @@ mod tests {
 
         inst.tick(1_000).await;
 
-        // Instance-level discovery events (the facade-derived topic itself is ggcommons' own tested
+        // Instance-level discovery events (the facade-derived topic itself is edgecommons' own tested
         // concern — see the `crate::events` module docs' "Testability" note).
         let ready = fake.events_named("FileReady");
         assert_eq!(ready.len(), 1);

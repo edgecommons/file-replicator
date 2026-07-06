@@ -11,7 +11,7 @@ publish = false
 name = "file-replicator"
 path = "src/main.rs"
 
-# Runtime selection mirrors the ggcommons library (and telemetry-processor):
+# Runtime selection mirrors the edgecommons library (and telemetry-processor):
 #   - `standalone` (default): dual-broker MQTT — HOST/containers, no C-FFI IPC. Use for `cargo run`/`cargo test`.
 #   - `greengrass`: Greengrass IPC — the on-device build. Linux-only (C-FFI SDK); `build.sh` opts in.
 #
@@ -21,10 +21,10 @@ path = "src/main.rs"
 #   this block as each phase lands, so the P0 build stays light and toolchain-free.
 [features]
 default = ["standalone", "dest-s3"]
-standalone = ["ggcommons/standalone"]
-greengrass = ["ggcommons/greengrass"]
-cloudwatch = ["ggcommons/cloudwatch"]
-# P2 — S3 destination (DESIGN §11, §22.2). Pulls the pure-Rust (rustls) AWS SDK + the ggcommons
+standalone = ["edgecommons/standalone"]
+greengrass = ["edgecommons/greengrass"]
+cloudwatch = ["edgecommons/cloudwatch"]
+# P2 — S3 destination (DESIGN §11, §22.2). Pulls the pure-Rust (rustls) AWS SDK + the edgecommons
 # credentials subsystem (base `credentials` feature — pure local vault; NOT `credentials-aws`) so an
 # egress `{"$secret":"..."}` resolves through `gg.credentials()` → `get_aws_credentials`. Joins the
 # default feature set per DESIGN §22.2 (batteries-included; immature backends stay off).
@@ -38,27 +38,27 @@ dest-s3 = [
     "dep:async-stream",
     "dep:futures-core",
     "dep:bytes",
-    "ggcommons/credentials",
+    "edgecommons/credentials",
 ]
 # P5 — SFTP destination (DESIGN §10.3, §22.2). Pure-Rust SSH (`russh`/`russh-sftp` — no C toolchain),
 # so it stays Windows-clean like the rest of the P5 backends. Off by default (joins the build only when
-# asked); the ggcommons credentials subsystem resolves an optional `{"$secret":"..."}` egress override.
-dest-sftp = ["dep:russh", "dep:russh-sftp", "ggcommons/credentials"]
+# asked); the edgecommons credentials subsystem resolves an optional `{"$secret":"..."}` egress override.
+dest-sftp = ["dep:russh", "dep:russh-sftp", "edgecommons/credentials"]
 # P5 — FTPS destination (DESIGN §10.3, §22.2). `suppaftp` pinned to the `=6` line (the `10.x` line needs
 # rustc 1.88, above this crate's 1.85 MSRV) with the rustls TLS feature — no OpenSSL/C toolchain.
-dest-ftps = ["dep:suppaftp", "dep:rustls", "dep:rustls-native-certs", "ggcommons/credentials"]
+dest-ftps = ["dep:suppaftp", "dep:rustls", "dep:rustls-native-certs", "edgecommons/credentials"]
 # P5 — HTTP(S) destination (DESIGN §10.2/§10.3, §22.2). `reqwest` with rustls (no OpenSSL/C toolchain);
 # resume is a sequence of ranged `PUT`s (`Content-Range`), so no streaming-body/extra async-stream crate
-# is needed — see `dest/http/mod.rs`. The ggcommons credentials subsystem resolves an optional
+# is needed — see `dest/http/mod.rs`. The edgecommons credentials subsystem resolves an optional
 # `{"$secret":"..."}` egress override (bearer token or basic auth).
-dest-http = ["dep:reqwest", "ggcommons/credentials"]
+dest-http = ["dep:reqwest", "edgecommons/credentials"]
 # P5 — Azure Blob destination (DESIGN §10.2/§10.3, §22.2). `azure_storage_blobs`/`azure_storage`/
 # `azure_core` — a younger SDK line (the "legacy" azure-sdk-for-rust track), so kept OFF by default
 # (crate-maturity risk contained behind the `dest-azure` feature + `dest/azure/client.rs` coverage
 # seam, DESIGN §22.2). `enable_reqwest_rustls`+`hmac_rust` keep it pure-Rust (no OpenSSL/C toolchain),
-# matching the rest of this crate's TLS story. The ggcommons credentials subsystem resolves an optional
+# matching the rest of this crate's TLS story. The edgecommons credentials subsystem resolves an optional
 # `{"$secret":"..."}` egress override (account key or connection string).
-dest-azure = ["dep:azure_storage_blobs", "dep:azure_storage", "dep:azure_core", "dep:futures", "ggcommons/credentials"]
+dest-azure = ["dep:azure_storage_blobs", "dep:azure_storage", "dep:azure_core", "dep:futures", "edgecommons/credentials"]
 # P5 — GCS destination (DESIGN §10.2/§10.3, §22.2). GCS's resumable-upload protocol is plain HTTP
 # (initiate a session → chunked `PUT`s with `Content-Range`, checkpointed by persisting the session
 # URI), so this backend drives it directly over the same `reqwest` (rustls) client `dest-http` already
@@ -68,13 +68,13 @@ dest-azure = ["dep:azure_storage_blobs", "dep:azure_storage", "dep:azure_core", 
 # shared with `dest-http`/`dest-s3`'s optional deps (Cargo allows one optional dep gated by several
 # features). `reqwest/json` (a weak-dependency feature, only enabled when `dest-gcs` itself is — it
 # does not affect a `dest-http`-only build) turns on typed JSON responses for the object-metadata
-# `verify` call. Off by default (crate-maturity posture, matching `dest-azure`). The ggcommons
+# `verify` call. Off by default (crate-maturity posture, matching `dest-azure`). The edgecommons
 # credentials subsystem resolves an optional `{"$secret":"..."}` egress override (an OAuth2 access
 # token).
-dest-gcs = ["dep:reqwest", "reqwest/json", "dep:base64", "ggcommons/credentials"]
+dest-gcs = ["dep:reqwest", "reqwest/json", "dep:base64", "edgecommons/credentials"]
 
 [dependencies]
-# ggcommons Rust library, pinned to a commit on edgecommons/ggcommons (private). Building standalone needs
+# edgecommons Rust library, pinned to a commit on edgecommons/edgecommons (private). Building standalone needs
 # read access to that repo. The fetch goes through the git CLI (see .cargo/config.toml); locally use your
 # gh/git credential helper, and CI's reusable workflow rewrites the https URL with EDGECOMMONS_READ_TOKEN.
 #
@@ -83,7 +83,7 @@ dest-gcs = ["dep:reqwest", "reqwest/json", "dep:base64", "ggcommons/credentials"
 # remote `main`, released as v0.2.0 (`b1d8d85`), and the pin below points at it — so a pure git-rev build
 # resolves the UNS core and compiles. LOCAL DEV may still build against the sibling checkout via the
 # gitignored `.cargo/config.toml` `paths` override, which replaces this source outright.
-ggcommons = { git = "https://github.com/edgecommons/ggcommons.git", rev = "b1d8d85bed1e989928d083323ef8be98132d77d5", default-features = false }
+edgecommons = { git = "https://github.com/edgecommons/edgecommons.git", rev = "b1d8d85bed1e989928d083323ef8be98132d77d5", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -107,7 +107,7 @@ thiserror = "1"
 rand = "0.8"
 # CancellationToken for cooperative task shutdown.
 tokio-util = { version = "0.7", features = ["rt"] }
-# RFC3339 event/state timestamps (P3 control plane); same crate + version ggcommons uses for the
+# RFC3339 event/state timestamps (P3 control plane); same crate + version edgecommons uses for the
 # message-envelope timestamp, so features unify with no lock churn.
 time = { version = "0.3", features = ["formatting"] }
 
@@ -119,7 +119,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 chrono-tz = "0.10"
 
 # --- P2 S3 destination deps (optional; gated by `dest-s3`, DESIGN §22.2) ------------------------
-# Same 1.x line ggcommons uses for kinesis/cloudwatch; pure-Rust (rustls) — no extra toolchain.
+# Same 1.x line edgecommons uses for kinesis/cloudwatch; pure-Rust (rustls) — no extra toolchain.
 aws-config = { version = "1", optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
 # S3 flexible-checksum header codec (4-byte-BE CRC32C / 32-byte SHA-256 → base64).

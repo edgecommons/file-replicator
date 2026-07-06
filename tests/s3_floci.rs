@@ -79,42 +79,42 @@ macro_rules! require_floci {
 /// A fake credential service returning static floci test creds for any `{"$secret":"…"}` reference —
 /// exercises the `S3Dest` static-credentials path (DESIGN §11.5) without mutating process env.
 struct FlociCreds;
-impl ggcommons::credentials::CredentialService for FlociCreds {
-    fn get(&self, _n: &str) -> ggcommons::Result<Option<ggcommons::credentials::Secret>> {
+impl edgecommons::credentials::CredentialService for FlociCreds {
+    fn get(&self, _n: &str) -> edgecommons::Result<Option<edgecommons::credentials::Secret>> {
         Ok(None)
     }
     fn get_version(
         &self,
         _n: &str,
         _v: &str,
-    ) -> ggcommons::Result<Option<ggcommons::credentials::Secret>> {
+    ) -> edgecommons::Result<Option<edgecommons::credentials::Secret>> {
         Ok(None)
     }
-    fn exists(&self, _n: &str) -> ggcommons::Result<bool> {
+    fn exists(&self, _n: &str) -> edgecommons::Result<bool> {
         Ok(true)
     }
-    fn list(&self, _p: &str) -> ggcommons::Result<Vec<ggcommons::credentials::SecretMeta>> {
+    fn list(&self, _p: &str) -> edgecommons::Result<Vec<edgecommons::credentials::SecretMeta>> {
         Ok(vec![])
     }
-    fn versions(&self, _n: &str) -> ggcommons::Result<Vec<String>> {
+    fn versions(&self, _n: &str) -> edgecommons::Result<Vec<String>> {
         Ok(vec![])
     }
     fn put(
         &self,
         _n: &str,
         _v: &[u8],
-        _o: ggcommons::credentials::PutOptions,
-    ) -> ggcommons::Result<String> {
+        _o: edgecommons::credentials::PutOptions,
+    ) -> edgecommons::Result<String> {
         Ok("v1".into())
     }
-    fn delete(&self, _n: &str) -> ggcommons::Result<bool> {
+    fn delete(&self, _n: &str) -> edgecommons::Result<bool> {
         Ok(false)
     }
     fn get_aws_credentials(
         &self,
         _name: &str,
-    ) -> ggcommons::Result<Option<ggcommons::credentials::AwsCredentials>> {
-        Ok(Some(ggcommons::credentials::AwsCredentials {
+    ) -> edgecommons::Result<Option<edgecommons::credentials::AwsCredentials>> {
+        Ok(Some(edgecommons::credentials::AwsCredentials {
             access_key_id: "test".into(),
             secret_access_key: "test".into(),
             session_token: None,

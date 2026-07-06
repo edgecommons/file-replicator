@@ -9,7 +9,7 @@ destination fields (all of them) are tabulated in [Reference › Destinations](d
 
 The component owns the `component` section (`component.global` + `component.instances[]`). Sibling sections
 (`messaging`, `credentials`, `logging`, `heartbeat`, `metricEmission`, `health`, `tags`) are parsed by the
-`ggcommons` library — see the library docs.
+`edgecommons` library — see the library docs.
 
 ## `component.global`
 | Key | Type | Default | Notes |
@@ -20,7 +20,7 @@ The component owns the `component` section (`component.global` + `component.inst
 | `limits.maxBandwidth` | string | — | Global aggregate byte-rate cap, e.g. `"50MB/s"`. |
 | `onPermissionError` | `"disableInstance"` \| `"fatal"` \| `"retain"` | `"disableInstance"` | Component-wide default for what happens when an instance's ingress/egress/archive/failed directory fails a startup readable/writable check. An instance's own `onPermissionError` (below) overrides this. See **Permission handling** in `explanation.md`. |
 
-> There is no `topics.prefix`/`legacyConfigTopic` config anymore — topics are minted by the ggcommons UNS
+> There is no `topics.prefix`/`legacyConfigTopic` config anymore — topics are minted by the edgecommons UNS
 > core (`ecv1/{device}/FileReplicator/{instance}/{class}…`, fixed grammar, no override). See
 > [Reference › Messaging interface](messaging-interface.md).
 

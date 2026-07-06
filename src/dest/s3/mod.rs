@@ -327,7 +327,7 @@ pub fn handle_s3_checksum(handle: &serde_json::Value) -> Option<String> {
 
 // ---- credentials (DESIGN §11.5) -----------------------------------------------------------------
 
-use ggcommons::credentials::CredentialService;
+use edgecommons::credentials::CredentialService;
 
 /// How the S3 client authenticates.
 ///
@@ -340,7 +340,7 @@ use ggcommons::credentials::CredentialService;
 pub enum CredMode {
     /// The aws-config default provider chain (GG TES device role / k8s IRSA / HOST env-profile-role).
     Ambient,
-    /// Static keys resolved from the ggcommons vault via a `{"$secret":"…"}` egress reference.
+    /// Static keys resolved from the edgecommons vault via a `{"$secret":"…"}` egress reference.
     Static {
         access_key_id: String,
         secret_access_key: String,
@@ -373,7 +373,7 @@ impl std::fmt::Debug for CredMode {
 /// service (DESIGN §11.5):
 ///
 /// - absent → [`CredMode::Ambient`] (the default; no secret to manage);
-/// - `{"$secret":"name"}` → look the secret up as [`AwsCredentials`](ggcommons::credentials) and use
+/// - `{"$secret":"name"}` → look the secret up as [`AwsCredentials`](edgecommons::credentials) and use
 ///   static keys — a missing service, missing secret, or malformed secret is a **permanent** config
 ///   error (the secret value never enters logs);
 /// - any other JSON shape → permanent (unsupported credentials form).
@@ -1030,47 +1030,47 @@ mod tests {
         json: Option<Vec<u8>>,
     }
     impl CredentialService for FakeCreds {
-        fn get(&self, _name: &str) -> ggcommons::Result<Option<ggcommons::credentials::Secret>> {
+        fn get(&self, _name: &str) -> edgecommons::Result<Option<edgecommons::credentials::Secret>> {
             Ok(None)
         }
         fn get_version(
             &self,
             _n: &str,
             _v: &str,
-        ) -> ggcommons::Result<Option<ggcommons::credentials::Secret>> {
+        ) -> edgecommons::Result<Option<edgecommons::credentials::Secret>> {
             Ok(None)
         }
-        fn exists(&self, name: &str) -> ggcommons::Result<bool> {
+        fn exists(&self, name: &str) -> edgecommons::Result<bool> {
             Ok(name == self.name && self.json.is_some())
         }
         fn list(
             &self,
             _prefix: &str,
-        ) -> ggcommons::Result<Vec<ggcommons::credentials::SecretMeta>> {
+        ) -> edgecommons::Result<Vec<edgecommons::credentials::SecretMeta>> {
             Ok(vec![])
         }
-        fn versions(&self, _n: &str) -> ggcommons::Result<Vec<String>> {
+        fn versions(&self, _n: &str) -> edgecommons::Result<Vec<String>> {
             Ok(vec![])
         }
         fn put(
             &self,
             _n: &str,
             _v: &[u8],
-            _o: ggcommons::credentials::PutOptions,
-        ) -> ggcommons::Result<String> {
+            _o: edgecommons::credentials::PutOptions,
+        ) -> edgecommons::Result<String> {
             Ok("v1".to_string())
         }
-        fn delete(&self, _n: &str) -> ggcommons::Result<bool> {
+        fn delete(&self, _n: &str) -> edgecommons::Result<bool> {
             Ok(false)
         }
         fn get_aws_credentials(
             &self,
             name: &str,
-        ) -> ggcommons::Result<Option<ggcommons::credentials::AwsCredentials>> {
+        ) -> edgecommons::Result<Option<edgecommons::credentials::AwsCredentials>> {
             if name == self.name {
                 if let Some(bytes) = &self.json {
                     let aws = serde_json::from_slice(bytes)
-                        .map_err(|e| ggcommons::GgError::Credentials(format!("bad AWS secret: {e}")))?;
+                        .map_err(|e| edgecommons::EdgeCommonsError::Credentials(format!("bad AWS secret: {e}")))?;
                     return Ok(Some(aws));
                 }
             }

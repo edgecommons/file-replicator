@@ -4,7 +4,7 @@
 //! semaphore and the **global** bandwidth token bucket (aggregate caps from `component.global.limits`),
 //! and the completion/failure metric definition — then assembles one [`Instance`] per parsed
 //! `component.instances[]` entry and spawns its run loop. [`App::run`] marks the component ready and
-//! awaits [`GgCommons::shutdown_signal`]; on shutdown it cancels every instance, waits for the loops to
+//! awaits [`EdgeCommons::shutdown_signal`]; on shutdown it cancels every instance, waits for the loops to
 //! drain, and flushes metrics. Durable state is written ahead of every side effect, so a clean stop and
 //! a crash recover identically (DESIGN §13.2) — there is no separate checkpoint step.
 
@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ggcommons::prelude::*;
+use edgecommons::prelude::*;
 use tokio_util::sync::CancellationToken;
 
 use crate::admission::PriorityGate;
@@ -69,7 +69,7 @@ impl ConfigurationChangeListener for ConfigListener {
 
 impl App {
     /// Capture the service handles and register for config hot-reload.
-    pub fn new(gg: &GgCommons) -> anyhow::Result<Self> {
+    pub fn new(gg: &EdgeCommons) -> anyhow::Result<Self> {
         gg.add_config_change_listener(Arc::new(ConfigListener));
         Ok(Self {
             config: gg.config(),
@@ -78,7 +78,7 @@ impl App {
     }
 
     /// Build the shared governors + store, start every instance, then run until shutdown.
-    pub async fn run(&self, gg: &GgCommons) -> anyhow::Result<()> {
+    pub async fn run(&self, gg: &EdgeCommons) -> anyhow::Result<()> {
         let instances_cfg: Vec<InstanceCfg> = config::load_instances(&self.config);
         let global = config::load_global(&self.config);
 
@@ -154,7 +154,7 @@ impl App {
         #[cfg(feature = "dest-s3")]
         let deps = deps.with_credentials(gg.credentials());
 
-        // Control/event plane (DESIGN §15-§17, migrated onto the ggcommons UNS core). Messaging may be
+        // Control/event plane (DESIGN §15-§17, migrated onto the edgecommons UNS core). Messaging may be
         // absent on some platforms, in which case every `events()`/`commands()` call below degrades to
         // a no-op (or is simply never registered) and the P1/P2 engine runs unchanged (DESIGN §6).
         if gg.messaging().is_err() {
@@ -177,7 +177,7 @@ impl App {
         for cfg in instances_cfg {
             let id = cfg.id.clone();
             // Mint this instance's own bound `events()` facade once, while `gg` is in scope (an owned
-            // value — `EventsFacade` does not borrow `GgCommons` — so it can be handed into the
+            // value — `EventsFacade` does not borrow `EdgeCommons` — so it can be handed into the
             // long-lived `Instance`/`Worker`; see `crate::events` module docs). A UNS-token-invalid id
             // (forbidden chars — `/ + # \` or control chars) degrades to a disabled emitter rather than
             // aborting the whole component over a naming quirk (DESIGN §6-style graceful degradation).
@@ -341,10 +341,10 @@ impl App {
 /// reports connected (with the path as the detail), else disconnected.
 fn source_dir_connectivity(
     dirs: &[(String, std::path::PathBuf)],
-) -> Vec<ggcommons::heartbeat::InstanceConnectivity> {
+) -> Vec<edgecommons::heartbeat::InstanceConnectivity> {
     dirs.iter()
         .map(|(id, path)| {
-            ggcommons::heartbeat::InstanceConnectivity::new(
+            edgecommons::heartbeat::InstanceConnectivity::new(
                 id.clone(),
                 path.is_dir(),
                 Some(path.display().to_string()),
@@ -430,7 +430,7 @@ mod tests {
 
     // ---- Feature A: the same startup-validation composition `App::run`'s per-instance loop uses -----
     //
-    // `App::run` itself needs a full `GgCommons` harness to unit-test (this crate's convention — see
+    // `App::run` itself needs a full `EdgeCommons` harness to unit-test (this crate's convention — see
     // the integration tests under `tests/`, none of which drive `App::run` directly). These tests
     // instead exercise the EXACT decision pipeline that loop applies to each `cfg` — resolve the policy,
     // validate, apply the policy — with real tempdirs, so `disableInstance`/`fatal`/`retain` and the

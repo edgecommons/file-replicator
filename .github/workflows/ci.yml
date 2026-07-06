@@ -10,7 +10,7 @@ on:
 jobs:
   ci:
     # Reusable component CI from the org defaults repo. `secrets: inherit` passes the org-level
-    # EDGECOMMONS_READ_TOKEN so cargo can fetch the private ggcommons git dependency. The repo must be
+    # EDGECOMMONS_READ_TOKEN so cargo can fetch the private edgecommons git dependency. The repo must be
     # added to that secret's repository allow-list (org Actions secrets, via the REST API).
     permissions:
       contents: read
@@ -35,7 +35,7 @@ jobs:
   coverage:
     # The 90% line-coverage gate (NFR-2 / DESIGN §18 / CLAUDE.md), actually RUN here (the reusable
     # component-ci only does build/test/clippy). Excluded from the denominator: the live-infra SDK/
-    # protocol-call seams `dest/{s3,sftp,ftps,http,azure,gcs}/client.rs` (like ggcommons excludes
+    # protocol-call seams `dest/{s3,sftp,ftps,http,azure,gcs}/client.rs` (like edgecommons excludes
     # `testutil.rs`) AND every simulator-backed integration-test file (`tests/s3_floci.rs`,
     # `tests/p3_control_emqx.rs`, `tests/sftp_atmoz.rs`, `tests/azure_azurite.rs`,
     # `tests/gcs_fakegcs.rs`, `tests/http_inprocess.rs`, `tests/p6_fanout.rs`, `tests/s3_real.rs`
@@ -55,7 +55,7 @@ jobs:
         run: rustup toolchain install stable --profile minimal --component llvm-tools-preview
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Authenticate to the private ggcommons git dependency
+      - name: Authenticate to the private edgecommons git dependency
         env:
           # Same org read token the reusable workflow uses (secrets: inherit); the repo must be on that
           # secret's allow-list. Rewrites the https git URL so cargo can fetch the private dep.

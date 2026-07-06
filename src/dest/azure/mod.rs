@@ -56,7 +56,7 @@ use crate::state::StateStore;
 
 use super::DestDeps;
 
-use ggcommons::credentials::CredentialService;
+use edgecommons::credentials::CredentialService;
 
 const MIB: u64 = 1024 * 1024;
 /// Files at or below this use a single `Put Blob`; larger use staged blocks.
@@ -624,43 +624,43 @@ mod tests {
     // ---- credentials ----------------------------------------------------------------------------
 
     /// A fake credential service returning canned JSON for one secret name (mirrors S3's/HTTP's fakes
-    /// — the opaque `Secret` type has no public constructor outside the ggcommons credentials crate).
+    /// — the opaque `Secret` type has no public constructor outside the edgecommons credentials crate).
     struct FakeCreds {
         name: String,
         json: Option<serde_json::Value>,
     }
     impl CredentialService for FakeCreds {
-        fn get(&self, _n: &str) -> ggcommons::Result<Option<ggcommons::credentials::Secret>> {
+        fn get(&self, _n: &str) -> edgecommons::Result<Option<edgecommons::credentials::Secret>> {
             Ok(None)
         }
         fn get_version(
             &self,
             _n: &str,
             _v: &str,
-        ) -> ggcommons::Result<Option<ggcommons::credentials::Secret>> {
+        ) -> edgecommons::Result<Option<edgecommons::credentials::Secret>> {
             Ok(None)
         }
-        fn exists(&self, name: &str) -> ggcommons::Result<bool> {
+        fn exists(&self, name: &str) -> edgecommons::Result<bool> {
             Ok(name == self.name && self.json.is_some())
         }
-        fn list(&self, _p: &str) -> ggcommons::Result<Vec<ggcommons::credentials::SecretMeta>> {
+        fn list(&self, _p: &str) -> edgecommons::Result<Vec<edgecommons::credentials::SecretMeta>> {
             Ok(vec![])
         }
-        fn versions(&self, _n: &str) -> ggcommons::Result<Vec<String>> {
+        fn versions(&self, _n: &str) -> edgecommons::Result<Vec<String>> {
             Ok(vec![])
         }
         fn put(
             &self,
             _n: &str,
             _v: &[u8],
-            _o: ggcommons::credentials::PutOptions,
-        ) -> ggcommons::Result<String> {
+            _o: edgecommons::credentials::PutOptions,
+        ) -> edgecommons::Result<String> {
             Ok("v1".into())
         }
-        fn delete(&self, _n: &str) -> ggcommons::Result<bool> {
+        fn delete(&self, _n: &str) -> edgecommons::Result<bool> {
             Ok(false)
         }
-        fn get_json(&self, name: &str) -> ggcommons::Result<Option<serde_json::Value>> {
+        fn get_json(&self, name: &str) -> edgecommons::Result<Option<serde_json::Value>> {
             if name == self.name {
                 Ok(self.json.clone())
             } else {

@@ -128,38 +128,38 @@ impl Drop for ContainerGuard {
 /// A fake credential service returning canned Azure credentials JSON for one secret name — exercises
 /// `AzureDest`'s `{"$secret":"…"}` resolution path (DESIGN §11.5-equivalent) without any real vault.
 struct FakeCreds;
-impl ggcommons::credentials::CredentialService for FakeCreds {
-    fn get(&self, _n: &str) -> ggcommons::Result<Option<ggcommons::credentials::Secret>> {
+impl edgecommons::credentials::CredentialService for FakeCreds {
+    fn get(&self, _n: &str) -> edgecommons::Result<Option<edgecommons::credentials::Secret>> {
         Ok(None)
     }
     fn get_version(
         &self,
         _n: &str,
         _v: &str,
-    ) -> ggcommons::Result<Option<ggcommons::credentials::Secret>> {
+    ) -> edgecommons::Result<Option<edgecommons::credentials::Secret>> {
         Ok(None)
     }
-    fn exists(&self, _n: &str) -> ggcommons::Result<bool> {
+    fn exists(&self, _n: &str) -> edgecommons::Result<bool> {
         Ok(true)
     }
-    fn list(&self, _p: &str) -> ggcommons::Result<Vec<ggcommons::credentials::SecretMeta>> {
+    fn list(&self, _p: &str) -> edgecommons::Result<Vec<edgecommons::credentials::SecretMeta>> {
         Ok(vec![])
     }
-    fn versions(&self, _n: &str) -> ggcommons::Result<Vec<String>> {
+    fn versions(&self, _n: &str) -> edgecommons::Result<Vec<String>> {
         Ok(vec![])
     }
     fn put(
         &self,
         _n: &str,
         _v: &[u8],
-        _o: ggcommons::credentials::PutOptions,
-    ) -> ggcommons::Result<String> {
+        _o: edgecommons::credentials::PutOptions,
+    ) -> edgecommons::Result<String> {
         Ok("v1".into())
     }
-    fn delete(&self, _n: &str) -> ggcommons::Result<bool> {
+    fn delete(&self, _n: &str) -> edgecommons::Result<bool> {
         Ok(false)
     }
-    fn get_json(&self, _name: &str) -> ggcommons::Result<Option<serde_json::Value>> {
+    fn get_json(&self, _name: &str) -> edgecommons::Result<Option<serde_json::Value>> {
         Ok(Some(serde_json::json!({ "accountKey": ACCOUNT_KEY })))
     }
 }

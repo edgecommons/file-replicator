@@ -13,14 +13,14 @@ trigger-now) plus granular **status events** for building a realtime UI. Support
 fan-out (an ordered `egress` list, `N >= 1`).
 
 Runs standalone (**HOST**), on **Greengrass** (IPC), and on **Kubernetes** (ConfigMap) via the
-`ggcommons` library — no platform-specific code.
+`edgecommons` library — no platform-specific code.
 
 ## Status
 
 **Implemented through P6** of the phase plan in **[DESIGN.md](DESIGN.md) §21** (scaffold → local engine →
 S3 → control/events/UNS → cron/window scheduling → the additional destinations above → multi-destination
 fan-out); CI enforces a 90%-line coverage gate across every destination feature. Only **P7** (optional
-promotion of the UNS/control-surface helper into `ggcommons`) remains undone. DESIGN.md is still the
+promotion of the UNS/control-surface helper into `edgecommons`) remains undone. DESIGN.md is still the
 authoritative spec for rationale — but treat any framing there that reads "nothing is implemented yet"
 as stale; check `src/` and `git log` for actual status.
 

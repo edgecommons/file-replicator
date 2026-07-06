@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ggcommons::metrics::MetricService;
+use edgecommons::metrics::MetricService;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokio::task::JoinSet;
@@ -2296,7 +2296,7 @@ mod tests {
         }
         #[async_trait]
         impl MetricService for CountingMetrics {
-            fn define_metric(&self, _m: ggcommons::metrics::Metric) {}
+            fn define_metric(&self, _m: edgecommons::metrics::Metric) {}
             fn is_metric_defined(&self, _n: &str) -> bool {
                 true
             }
@@ -2304,7 +2304,7 @@ mod tests {
                 &self,
                 _name: &str,
                 _values: HashMap<String, f64>,
-            ) -> ggcommons::Result<()> {
+            ) -> edgecommons::Result<()> {
                 self.calls.fetch_add(1, AtomicOrdering::SeqCst);
                 Ok(())
             }
@@ -2312,10 +2312,10 @@ mod tests {
                 &self,
                 _name: &str,
                 _values: HashMap<String, f64>,
-            ) -> ggcommons::Result<()> {
+            ) -> edgecommons::Result<()> {
                 Ok(())
             }
-            async fn flush_metrics(&self) -> ggcommons::Result<()> {
+            async fn flush_metrics(&self) -> edgecommons::Result<()> {
                 Ok(())
             }
             async fn shutdown(&self) {}
