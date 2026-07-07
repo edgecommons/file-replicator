@@ -82,7 +82,7 @@ dest-gcs = ["dep:reqwest", "reqwest/json", "dep:base64", "edgecommons/credential
 # the reserved-class guard, the `data()`/`events()`/`app()` class facades) plus the rebranded Rust crate
 # metadata. The pin below points at the current core `main`; LOCAL DEV may still build against the sibling
 # checkout via the gitignored `.cargo/config.toml` `paths` override, which replaces this source outright.
-edgecommons = { git = "https://github.com/edgecommons/edgecommons.git", rev = "56a706c8cc16ec870c6f2f81f1c118ba0cebb691", default-features = false }
+edgecommons = { git = "https://github.com/edgecommons/edgecommons.git", rev = "5ab84e013eb02dd85e83ed61df7455ca3fe6c7d3", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
