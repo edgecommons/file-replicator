@@ -64,14 +64,16 @@ That is the whole engine end to end: **discover → ready → replicate → veri
 
 ## 5. Watch the event stream
 
-Every lifecycle step is published on the UNS `evt` class. Subscribe with any MQTT client — one wildcard
-covers every instance of every device:
+Every lifecycle step is published on the UNS `evt` class. One wildcard covers every instance of every
+device:
 
 ```bash
 mosquitto_sub -t 'ecv1/+/FileReplicator/+/evt/#' -v
 ```
 
-Drop another file and you'll see a sequence like:
+The broker payload is an EdgeCommons protobuf envelope, so a plain MQTT client shows bytes rather than
+JSON. A protobuf-aware EdgeCommons client or test harness will show decoded events with this topic/body
+shape:
 
 ```
 ecv1/my-thing/FileReplicator/spool-to-archive/evt/info/file-ready              {"severity":"info","type":"file-ready","context":{"path":"report2.txt","size":22}, ...}
@@ -87,17 +89,22 @@ disagree. The full catalog — every `type`, its severity, and its `context` fie
 
 ## 6. Ask for status on demand
 
-There is no retained state snapshot; the current picture is a request/reply command. Publish to the `main`
-command inbox with a `reply_to` you subscribe:
+There is no retained state snapshot; the current picture is a request/reply command. Send a protobuf
+EdgeCommons command envelope to the `main` command inbox with `header.name = "get-status"` and a
+`reply_to` topic. In Rust, that is the normal `MessageBuilder` + `MessagingService::request` path:
 
-```bash
-# subscribe to your reply topic first, then publish the request:
-mosquitto_pub -t 'ecv1/my-thing/FileReplicator/main/cmd/get-status' \
-  -m '{"header":{"name":"get-status","reply_to":"app/r","correlation_id":"1"},"body":{}}'
+```rust
+let topic = gg.uns().topic_with_channel(UnsClass::Cmd, "get-status")?;
+let req = MessageBuilder::new("get-status", "1.0")
+    .payload(serde_json::json!({}))
+    .build();
+let messaging = gg.messaging().expect("messaging transport");
+let reply = messaging.request(&topic, req).await?.await?;
 ```
 
-The reply on `app/r` is `{"ok":true,"result": …}` where `result` is the component roster + summary. Add
-`"body":{"instance":"spool-to-archive"}` to get that one instance's document
+Do not send the JSON object above as raw MQTT text; raw JSON is not the EdgeCommons message wire format.
+After decoding, the reply body is `{"ok":true,"result": …}` where `result` is the component roster +
+summary. Use a request body of `{"instance":"spool-to-archive"}` to get that one instance's document
 (`awaiting`/`inProgress`/`replicated`/`failed` tallies). Both shapes are specified in the
 [data-types reference](reference/data-types.md).
 

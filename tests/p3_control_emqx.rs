@@ -5,7 +5,7 @@
 //! HOST --transport MQTT`, built via [`EdgeCommonsBuilder`]) carries the `evt` stream and the `cmd`
 //! request/reply suite through the broker and back, through the edgecommons `events()` facade and
 //! `commands()` inbox — not a hand-rolled topic scheme. Everything the unit tests exercise with a
-//! recorder is here proven on the wire, on the real UNS grammar
+//! recorder is here proven through the normal EdgeCommons protobuf message path, on the real UNS grammar
 //! (`ecv1/{thing}/FileReplicator/{instance}/{class}…` — `FileReplicator` is the short component token
 //! edgecommons derives from `com.mbreissi.edgecommons.FileReplicator`, DESIGN-uns §2 D-U18).
 //!
@@ -16,8 +16,8 @@
 //!      events (`file-ready`/`replication-started`/`…-progress`/`…-completed`/`file-deleted`) on
 //!      `evt/{severity}/{type}` with the facade's body contract, and progress is **throttled** (few
 //!      events, not one per chunk).
-//!   2. `get_status_request_receives_reply` — a `get-status` command gets `{"ok":true,"result":{…}}`
-//!      back on its `reply_to`.
+//!   2. `get_status_request_receives_reply` — a `get-status` command gets the decoded diagnostic body
+//!      shape `{"ok":true,"result":{…}}` back on its `reply_to`.
 //!   3. `set_activation_deactivate_stops_work_and_reflects_in_status` — a `set-activation
 //!      {instance,active:false}` request stops new work AND is reflected in a subsequent
 //!      `get-status`.
@@ -103,7 +103,11 @@ async fn build_gg(thing: &str) -> EdgeCommons {
     )
     .expect("write messaging config");
     let cfg_path = dir.path().join("config.json");
-    std::fs::write(&cfg_path, r#"{"component":{}}"#).expect("write component config");
+    std::fs::write(
+        &cfg_path,
+        r#"{"tags":{"site":"file-replicator-it","suite":"p3-control-emqx"},"component":{}}"#,
+    )
+    .expect("write component config");
     std::mem::forget(dir); // keep the temp files alive for the process (read once at startup)
 
     EdgeCommonsBuilder::new(COMPONENT)
@@ -151,6 +155,29 @@ fn events_named(rec: &Recorder, wire_type: &str) -> Vec<(String, Message)> {
         .filter(|(_, m)| m.body.get("type").and_then(Value::as_str) == Some(wire_type))
         .cloned()
         .collect()
+}
+
+fn assert_core_protobuf_round_trip(msg: &Message, thing: &str, instance: &str) {
+    let bytes = msg.to_vec().expect("message encodes as EdgeCommons protobuf");
+    assert!(
+        serde_json::from_slice::<Value>(&bytes).is_err(),
+        "normal EdgeCommons MQTT payloads must be protobuf bytes, not JSON text"
+    );
+
+    let decoded = Message::from_slice(&bytes).expect("message decodes from EdgeCommons protobuf");
+    assert_eq!(decoded.header.name, msg.header.name);
+    assert_eq!(decoded.body, msg.body);
+    assert_eq!(decoded.identity, msg.identity);
+    assert_eq!(decoded.tags, msg.tags);
+
+    let identity = decoded.identity.as_ref().expect("protobuf envelope preserves identity");
+    assert_eq!(identity.device(), thing);
+    assert_eq!(identity.component(), "FileReplicator");
+    assert_eq!(identity.instance(), instance);
+
+    let tags = decoded.tags.as_ref().expect("protobuf envelope preserves config tags");
+    assert_eq!(tags.extra.get("site"), Some(&json!("file-replicator-it")));
+    assert_eq!(tags.extra.get("suite"), Some(&json!("p3-control-emqx")));
 }
 
 /// Poll until `pred` holds over the recorded messages, up to ~10 s (broker round-trips are async).
@@ -248,7 +275,7 @@ fn write_file(path: &Path, bytes: &[u8]) {
     std::fs::write(path, bytes).unwrap();
 }
 
-// ---- 1. events + throttled progress on the wire -------------------------------------------------
+// ---- 1. events + throttled progress through the protobuf messaging path -------------------------
 
 #[tokio::test]
 async fn driving_replication_publishes_lifecycle_events() {
@@ -297,6 +324,7 @@ async fn driving_replication_publishes_lifecycle_events() {
     assert!(ready[0].1.body.get("timestamp").is_some());
     assert_eq!(ready[0].1.identity.as_ref().unwrap().device(), thing);
     assert_eq!(ready[0].1.identity.as_ref().unwrap().instance(), id);
+    assert_core_protobuf_round_trip(&ready[0].1, &thing, id);
 
     // replication-started body.
     let started = events_named(&rec, "replication-started");
@@ -365,6 +393,7 @@ async fn get_status_request_receives_reply() {
     assert_eq!(reply.header.name, "get-status");
     assert_eq!(reply.identity.as_ref().unwrap().device(), thing);
     assert_eq!(reply.body["ok"], json!(true));
+    assert_core_protobuf_round_trip(&reply, &thing, "main");
     let result = &reply.body["result"];
     assert_eq!(result["instance"], json!(id));
     assert_eq!(result["active"], json!(true));

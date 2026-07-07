@@ -1,14 +1,14 @@
 # Reference — data types
 
-The two structured payloads a client parses: the **`get-status` status document** (the reply to the
-`get-status` command) and the **event `context`** object carried by every `evt` message. Both are validated
-against the source — the status document against `src/control.rs`
+The two structured body shapes a client parses after decoding the EdgeCommons protobuf envelope: the
+**`get-status` status document** (the reply to the `get-status` command) and the **event `context`** object
+carried by every `evt` message. Both are validated against the source — the status document against `src/control.rs`
 (`instance_status_json` / `disabled_status_json` / `component_status_json`), the event context against
 `src/events.rs` (`Event::fields` / `Event::plan`). For the topic grammar, command envelope, and the event
 catalog (each `type` + severity), see [messaging-interface.md](messaging-interface.md).
 
-All numeric fields are JSON numbers; byte counts and sizes are unsigned 64-bit (a JavaScript consumer may
-lose precision above 2^53). Timestamps are RFC3339 UTC strings.
+In the decoded/diagnostic body representation, numeric fields are JSON numbers; byte counts and sizes are
+unsigned 64-bit (a JavaScript consumer may lose precision above 2^53). Timestamps are RFC3339 UTC strings.
 
 ---
 
@@ -144,5 +144,6 @@ object carries the event-specific data; its fields, across all event types, have
 
 **`message` vs `context`.** For the events with a natural error string — `replication-failed`,
 `retries-exhausted`, `file-quarantined`, `permission-denied` — the error is promoted to the top-level
-`message` field and **removed from `context`** (never duplicated on the wire). So a consumer reads the human
-error from `message`, and the machine fields (`path`, `attempt`, `willRetry`, `role`, …) from `context`.
+`message` field and **removed from `context`** (never duplicated in the decoded body). So a consumer reads
+the human error from `message`, and the machine fields (`path`, `attempt`, `willRetry`, `role`, …) from
+`context`.

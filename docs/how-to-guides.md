@@ -163,11 +163,15 @@ Pause or resume one instance at runtime without a redeploy, via the `set-activat
 "all" form — `instance` is required):
 
 ```
-publish   ecv1/<device>/FileReplicator/main/cmd/set-activation
-          { "header": { "name": "set-activation", "reply_to": "app/r", "correlation_id": "9" },
-            "body": { "instance": "plant-csv-to-s3", "active": false, "persist": true } }
-subscribe app/r   → { "ok": true, "result": { "instance": "plant-csv-to-s3", "active": false, "persisted": true } }
+request topic   ecv1/<device>/FileReplicator/main/cmd/set-activation
+header.name     set-activation
+body            { "instance": "plant-csv-to-s3", "active": false, "persist": true }
+reply body      { "ok": true, "result": { "instance": "plant-csv-to-s3", "active": false, "persisted": true } }
 ```
+
+Send the request through an edgecommons client API or another protobuf-aware producer. The body and reply
+above are decoded JSON content inside the EdgeCommons command envelope; raw MQTT JSON is not accepted as a
+normal command message.
 
 - `persist: true` (the default) writes the override to durable state so it **survives restart** (runtime
   state wins over config `enabled`); `persist: false` is a runtime-only flip.
@@ -210,5 +214,5 @@ ecv1/+/FileReplicator/+/state         # the library RUNNING/STOPPED keepalive pe
 `{device}` is the ThingName (`-t`), `{component}` is the short UNS token `FileReplicator`. There is no
 configurable prefix and no legacy alias. To fold status into a fleet dashboard, bridge these topics
 northbound and fan `get-status` requests to each device's `main` inbox as needed. Envelope `tags` (e.g.
-`enterprise`/`site`) travel in the message body for grouping — they are **not** topic segments. See the
+`enterprise`/`site`) travel in the protobuf envelope for grouping — they are **not** topic segments. See the
 [messaging interface reference](reference/messaging-interface.md).

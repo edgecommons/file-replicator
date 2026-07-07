@@ -1,9 +1,11 @@
 # Reference — messaging interface (UNS)
 
 All command/event topics ride the edgecommons **Unified Namespace** core (`gg.commands()` / `gg.events()` /
-the automatic `state`/`cfg` keepalive) — minted by the library, not a hand-rolled topic builder. Full
-rationale in [`DESIGN.md`](https://github.com/edgecommons/file-replicator/blob/main/DESIGN.md); this page
-and the `crate::events`/`crate::control` module docs are the source of truth for the wire contract.
+the automatic `state`/`cfg` keepalive) — minted by the library, not a hand-rolled topic builder. Normal
+EdgeCommons messages on these topics are protobuf-encoded `EdgeCommonsMessage` payload bytes; the JSON
+objects below are the decoded body/diagnostic shapes that component handlers and client APIs work with.
+Full rationale in [`DESIGN.md`](https://github.com/edgecommons/file-replicator/blob/main/DESIGN.md); this
+page and the `crate::events`/`crate::control` module docs are the source of truth for the message contract.
 
 ```
 ecv1/{device}/{component}/{instance}/{class}[/{channel…}]
@@ -27,8 +29,10 @@ There is no configurable topic prefix and no legacy alias — the UNS grammar ab
 Registered on the single `main`-instance command inbox (`ecv1/{device}/FileReplicator/main/cmd/#`) —
 scoping an instance is a request-body field, not a topic segment (mirroring how opcua-adapter/
 modbus-adapter address their multi-instance `sb/*` verbs and telemetry-processor's `route`/`pause`/
-`resume`). Every reply is `{"ok": true, "result": <value>}` or `{"ok": false, "error": {"code",
-"message"}}` (the edgecommons command-inbox contract — the request's `header.name` MUST equal the verb).
+`resume`). Publish commands with the edgecommons client APIs (`MessageBuilder` + `MessagingService`
+request/reply, or an equivalent protobuf producer), not by sending JSON text to MQTT. Every decoded reply
+body is `{"ok": true, "result": <value>}` or `{"ok": false, "error": {"code", "message"}}` (the
+edgecommons command-inbox contract — the request's `header.name` MUST equal the verb).
 
 | Verb | Topic | Body | Result / error codes |
 |---|---|---|---|
@@ -91,4 +95,6 @@ answers `get-status` — `active: false`, `disabled: true`, `disabledReason` —
 
 The standard edgecommons `Message`: `header` (`name`/`version`/`timestamp`/`correlation_id`/`reply_to`?),
 top-level `identity` (`hier`/`path`/`component`/`instance`, stamped automatically), optional `tags`
-(config `tags`, metadata only), `body`.
+(config `tags`, metadata only), `body`. The Rust component never hand-emits this envelope as JSON; it
+builds messages through the core facades and the core messaging service serializes/deserializes protobuf
+bytes while preserving `identity` and `tags`.
