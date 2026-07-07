@@ -61,12 +61,11 @@ jobs:
           # secret's allow-list. Rewrites the https git URL so cargo can fetch the private dep.
           EDGECOMMONS_READ_TOKEN: ${{ secrets.EDGECOMMONS_READ_TOKEN }}
         run: |
-          # Temporary compatibility while the core repo is still hosted at edgecommons/ggcommons.
           git config --global \
-            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/ggcommons.git".insteadOf \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons.git".insteadOf \
             "https://github.com/edgecommons/edgecommons.git"
           git config --global \
-            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/ggcommons".insteadOf \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons".insteadOf \
             "https://github.com/edgecommons/edgecommons"
           git config --global \
             url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/".insteadOf \
