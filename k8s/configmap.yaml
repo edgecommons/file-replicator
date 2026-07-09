@@ -12,7 +12,7 @@ metadata:
 data:
   config.json: |-
     {
-      "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] {target} - {message}" },
+      "logging": { "level": "INFO", "rust_format": "{timestamp} [{level}] [{component}] {target} - {message}" },
       "metricEmission": { "target": "log", "namespace": "filereplicator" },
       "messaging": { "local": { "host": "emqx.default.svc.cluster.local", "port": 1883, "clientId": "file-replicator" } },
       "tags": { "appId": "Demo", "site": "factory-1" },

@@ -1,7 +1,7 @@
 {
   "logging": {
     "level": "DEBUG",
-    "rust_format": "{timestamp} [{level}] {target} - {message}"
+    "rust_format": "{timestamp} [{level}] [{component}] {target} - {message}"
   },
   "heartbeat": {
     "intervalSecs": 10,
