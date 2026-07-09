@@ -200,6 +200,29 @@ Both the event `context` shapes and the `get-status` document schema are in the
 
 ---
 
+## Monitor replication throughput and backlog
+
+Route metrics with the standard `metricEmission` section. With `metricEmission.target: "messaging"`, the
+library publishes every metric group to `ecv1/{device}/FileReplicator/main/metric/{metricName}`; with
+CloudWatch or Prometheus, the same groups and dimensions are used by those targets.
+
+Key groups:
+
+| Question | Metric group / measures |
+|---|---|
+| Are files completing? | `fileReplicator.filesReplicated` and `bytesReplicated` are durable cumulative totals; `filesReplicatedInterval` and `bytesReplicatedInterval` are per-completion deltas. |
+| Is the source discovering work? | `FileReplicatorDiscovery.filesDiscovered`, `filesReady`, `scanErrors`, `permissionDenied`, plus `scanDurationMs`. |
+| Is work backing up? | `FileReplicatorQueue.queueDepthReady`, `queueDepthInProgress`, `queueDepthFailed`, `oldestQueuedAgeMs`, `retryBacklog`, `bytesQueued`. |
+| Are transfers healthy? | `FileReplicatorTransfer.filesStarted`, `filesReplicated`, `filesFailed`, `transferDurationMs`, `throughputBytesPerSec`, `retryAttempts`, `verificationFailures`, `resumeRecoveries`. |
+| Is a destination constrained? | `FileReplicatorDestination.linkConnected`, `connectFailures`, `authFailures`, `writeFailures`, `throttleDelayMs`, `bandwidthLimitBytesPerSec`. |
+| Is the schedule holding work? | `FileReplicatorSchedule.instanceActive`, `windowOpen`, `scheduleSkipped`, `admissionBlocked`, `filesReleased`. |
+
+For CloudWatch, keep dashboards grouped by the published dimensions (`instance`, `destinationType`,
+`result`, `mode`, and `readinessStrategy`). Do not add filenames, paths, object keys, bucket names, or raw
+errors as dimensions; those are intentionally kept in events/status documents, not metrics.
+
+---
+
 ## Bridge status to the cloud for fleet-wide visibility
 
 Every device publishes under the same fixed UNS grammar
@@ -209,6 +232,7 @@ with one subscription:
 ```
 ecv1/+/FileReplicator/+/evt/#         # every event, every instance, every device
 ecv1/+/FileReplicator/+/state         # the library RUNNING/STOPPED keepalive per device
+ecv1/+/FileReplicator/+/metric/#      # compatibility and operational metrics
 ```
 
 `{device}` is the ThingName (`-t`), `{component}` is the short UNS token `FileReplicator`. There is no

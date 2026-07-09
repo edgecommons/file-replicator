@@ -20,6 +20,7 @@ pub mod error;
 pub mod events;
 pub mod instance;
 pub mod integrity;
+pub mod metrics;
 pub mod permission;
 pub mod ratelimit;
 pub mod readiness;

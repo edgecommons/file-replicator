@@ -31,10 +31,9 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, TimeZone, Utc};
-use edgecommons::metrics::MetricService;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -45,6 +44,7 @@ use crate::dest::{build_destination, DestDeps, SharedDestination};
 use crate::domain::{ItemState, WorkItem};
 use crate::error::Result;
 use crate::events::{Event, Events};
+use crate::metrics::{MetricValues, ReplicatorMetrics};
 use crate::permission::{PermissionLog, Role};
 use crate::ratelimit::{parse_byte_rate, Bandwidth, Clock, SystemClock, TokenBucket};
 use crate::readiness::RealProbe;
@@ -84,6 +84,9 @@ pub struct Instance {
     /// The configured schedule mode (`"immediate"`/`"cron"`/`"window"`) reported by `get-status`
     /// (DESIGN §16), driven live by [`schedule`](Self::schedule).
     schedule_mode: &'static str,
+    /// The configured readiness strategy (`"stability"`/`"marker"`/`"rename"`/`"glob"`) used as a
+    /// bounded metric dimension.
+    readiness_strategy: &'static str,
     /// The parsed schedule (DESIGN §12); [`Schedule::admission`] gates every tick's claim.
     schedule: Schedule,
     /// The cron watermark / window open-state [`schedule`](Self::schedule) evaluation needs across
@@ -105,6 +108,7 @@ pub struct Instance {
     watcher: Arc<Mutex<Watcher>>,
     queue: Queue,
     worker: Arc<Worker>,
+    metrics: Option<Arc<ReplicatorMetrics>>,
     /// Held for the activation write-side ([`set_activation`](Self::set_activation) /
     /// [`clear_activation`](Self::clear_activation)) and the P3 `get-status` store queries.
     store: Arc<dyn StateStore>,
@@ -150,10 +154,17 @@ struct ScheduleTransition {
     window_closed: bool,
 }
 
+struct QueueMetricSnapshot {
+    ready: usize,
+    values: MetricValues,
+}
+
 /// Convert the engine's Unix-ms clock base to the schedule model's `DateTime<Utc>`. Falls back to the
 /// Unix epoch on an out-of-range value (astronomically unlikely — `now` is always a real clock read).
 fn ms_to_utc(now_ms: i64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(now_ms).single().unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
+    Utc.timestamp_millis_opt(now_ms)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
 }
 
 impl Instance {
@@ -167,7 +178,7 @@ impl Instance {
         store: Arc<dyn StateStore>,
         global_gate: Arc<PriorityGate>,
         global_bw: Arc<TokenBucket>,
-        metrics: Option<Arc<dyn MetricService>>,
+        metrics: Option<Arc<ReplicatorMetrics>>,
         deps: &DestDeps,
         events: Events,
     ) -> anyhow::Result<Instance> {
@@ -183,10 +194,20 @@ impl Instance {
             .egress
             .iter()
             .map(|e| {
-                build_destination(e, &deps).map_err(|err| anyhow::anyhow!("instance '{}': {err}", cfg.id))
+                build_destination(e, &deps)
+                    .map_err(|err| anyhow::anyhow!("instance '{}': {err}", cfg.id))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Self::build_with_dests(cfg, global, store, global_gate, global_bw, metrics, dests, events)
+        Self::build_with_dests(
+            cfg,
+            global,
+            store,
+            global_gate,
+            global_bw,
+            metrics,
+            dests,
+            events,
+        )
     }
 
     /// Assemble an instance with a **caller-supplied** [`SharedDestination`], bypassing the egress
@@ -203,11 +224,20 @@ impl Instance {
         store: Arc<dyn StateStore>,
         global_gate: Arc<PriorityGate>,
         global_bw: Arc<TokenBucket>,
-        metrics: Option<Arc<dyn MetricService>>,
+        metrics: Option<Arc<ReplicatorMetrics>>,
         dest: SharedDestination,
         events: Events,
     ) -> anyhow::Result<Instance> {
-        Self::build_with_dests(cfg, global, store, global_gate, global_bw, metrics, vec![dest], events)
+        Self::build_with_dests(
+            cfg,
+            global,
+            store,
+            global_gate,
+            global_bw,
+            metrics,
+            vec![dest],
+            events,
+        )
     }
 
     /// Assemble an instance that fans a claimed item out to every destination in `dests` (P6, DESIGN
@@ -222,7 +252,7 @@ impl Instance {
         store: Arc<dyn StateStore>,
         global_gate: Arc<PriorityGate>,
         global_bw: Arc<TokenBucket>,
-        metrics: Option<Arc<dyn MetricService>>,
+        metrics: Option<Arc<ReplicatorMetrics>>,
         dests: Vec<SharedDestination>,
         events: Events,
     ) -> anyhow::Result<Instance> {
@@ -235,6 +265,12 @@ impl Instance {
             ScheduleCfg::Immediate => "immediate",
             ScheduleCfg::Cron(_) => "cron",
             ScheduleCfg::Window(_) => "window",
+        };
+        let readiness_strategy = match &cfg.ingress.readiness {
+            crate::config::ReadinessCfg::Stability(_) => "stability",
+            crate::config::ReadinessCfg::Marker(_) => "marker",
+            crate::config::ReadinessCfg::Rename => "rename",
+            crate::config::ReadinessCfg::Glob(_) => "glob",
         };
         let default_tz = global.defaults.as_ref().and_then(|d| d.timezone.as_deref());
         let schedule = Schedule::from_cfg(&cfg.schedule, default_tz)
@@ -300,16 +336,18 @@ impl Instance {
         // same fallback now covers "at least one destination can't resume"). `dest_kind` is every
         // configured destination's label, joined (`"local"` for N=1, `"local+s3"` for N=2, …) — the
         // short label surfaced in `get-status`.
-        let dest_kind = dests
-            .iter()
-            .map(|d| d.kind())
-            .collect::<Vec<_>>()
-            .join("+");
+        let dest_kind = dests.iter().map(|d| d.kind()).collect::<Vec<_>>().join("+");
         let dest_supports_resume = dests.iter().all(|d| d.supports_resume());
         // Feature B (`src/admission.rs`): this instance's cross-instance GLOBAL admission priority
         // (lower = higher priority) rides in with it so `Queue::acquire_slot` can hand it to
         // `PriorityGate::acquire` — the per-instance semaphore below is unaffected by priority.
-        let queue = Queue::new(cfg.id.clone(), store.clone(), per_limit, global_gate, cfg.priority);
+        let queue = Queue::new(
+            cfg.id.clone(),
+            store.clone(),
+            per_limit,
+            global_gate,
+            cfg.priority,
+        );
         // Feature A (`src/permission.rs`): two dedup-logs, not one — the ingress one has a natural
         // "still erroring" set every tick (this scan's issues) so it evicts recovered paths and stays
         // tightly bounded (keyed by ingress directory path). The worker's egress errors have no
@@ -331,7 +369,7 @@ impl Instance {
                 cfg.ingress.path.clone(),
                 bw,
                 retry,
-                metrics,
+                metrics.clone(),
             )
             .with_events(events.clone())
             .with_permission_log(worker_perm_log),
@@ -343,8 +381,12 @@ impl Instance {
             None => cfg.enabled,
         };
 
-        let rescan =
-            Duration::from_secs(cfg.ingress.rescan_secs.unwrap_or(DEFAULT_RESCAN_SECS).max(1));
+        let rescan = Duration::from_secs(
+            cfg.ingress
+                .rescan_secs
+                .unwrap_or(DEFAULT_RESCAN_SECS)
+                .max(1),
+        );
 
         Ok(Instance {
             id: cfg.id,
@@ -352,6 +394,7 @@ impl Instance {
             config_enabled: cfg.enabled,
             dest_kind,
             schedule_mode,
+            readiness_strategy,
             schedule,
             sched_track: Mutex::new(ScheduleTrack::default()),
             dest_supports_resume,
@@ -360,6 +403,7 @@ impl Instance {
             watcher: Arc::new(Mutex::new(watcher)),
             queue,
             worker,
+            metrics,
             store,
             events,
             perm_log,
@@ -401,7 +445,9 @@ impl Instance {
     pub fn seed_permission_log(&self, violations: &[crate::permission::Violation], now: i64) {
         for v in violations {
             if v.role == Role::Ingress {
-                let _ = self.perm_log.should_log(&v.path.display().to_string(), v.kind, now);
+                let _ = self
+                    .perm_log
+                    .should_log(&v.path.display().to_string(), v.kind, now);
             }
         }
     }
@@ -422,6 +468,8 @@ impl Instance {
     /// perturbs the automatic schedule.
     async fn run_tick(&self, now: i64, force: bool) {
         if !self.is_active() {
+            self.emit_schedule_metrics(0, false, false, false, false, 0)
+                .await;
             return;
         }
 
@@ -438,23 +486,46 @@ impl Instance {
         // state.rs contract that bulk scans go through spawn_blocking). It mutates the readiness
         // tracker behind the shared `Arc<Mutex<Watcher>>`, so state persists across ticks.
         let watcher = self.watcher.clone();
-        let (ready, issues) = match tokio::task::spawn_blocking(move || {
+        let scan_started = Instant::now();
+        let report = match tokio::task::spawn_blocking(move || {
             let mut w = watcher.lock().expect("watcher mutex");
-            w.discover(&RealProbe)
+            w.discover_report(&RealProbe)
         })
         .await
         {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(instance = %self.id, error = %e, "discovery task failed");
-                (Vec::new(), Vec::new())
+                crate::instance::watcher::ScanReport {
+                    ready: Vec::new(),
+                    issues: Vec::new(),
+                    files_discovered: 0,
+                    files_ignored: 0,
+                }
             }
         };
+        let scan_duration_ms = scan_started.elapsed().as_secs_f64() * 1000.0;
+        let files_ready = report.ready.len() as u64;
+        let scan_errors = report.issues.len() as u64;
+        let permission_denied = report
+            .issues
+            .iter()
+            .filter(|issue| issue.kind == std::io::ErrorKind::PermissionDenied)
+            .count() as u64;
         // Feature A: dedup-log + emit `PermissionDenied` for any directory the scan couldn't read,
         // instead of the old silent per-rescan skip (`src/permission.rs`).
-        self.report_scan_issues(&issues, now).await;
+        self.report_scan_issues(&report.issues, now).await;
+        self.emit_discovery_metrics(
+            scan_duration_ms,
+            report.files_discovered,
+            files_ready,
+            report.files_ignored,
+            scan_errors,
+            permission_denied,
+        )
+        .await;
         let mut discovered: u64 = 0;
-        for c in ready {
+        for c in report.ready {
             // A brand-new relpath (no prior durable row) is a genuine `FileReady` transition; a row
             // that already exists (still Ready/InProgress/terminal) is a re-scan of a known file, so
             // it is not re-announced (avoids per-rescan event spam for a backlog or a retained file).
@@ -481,7 +552,12 @@ impl Instance {
                 .list_by_state(&self.id, ItemState::Ready)
                 .map(|v| v.len() as u64)
                 .unwrap_or(0);
-            self.events.emit(Event::ScanComplete { discovered, awaiting }).await;
+            self.events
+                .emit(Event::ScanComplete {
+                    discovered,
+                    awaiting,
+                })
+                .await;
         }
 
         // Retry manager: promote any Failed items whose backoff gate has elapsed back to Ready. This
@@ -490,48 +566,199 @@ impl Instance {
         let queue = self.queue.clone();
         match tokio::task::spawn_blocking(move || queue.promote_due(now)).await {
             Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::error!(instance = %self.id, error = %e, "retry promotion failed"),
-            Err(e) => tracing::error!(instance = %self.id, error = %e, "retry promotion task failed"),
+            Ok(Err(e)) => {
+                tracing::error!(instance = %self.id, error = %e, "retry promotion failed")
+            }
+            Err(e) => {
+                tracing::error!(instance = %self.id, error = %e, "retry promotion task failed")
+            }
         }
+        let queue_snapshot = self.emit_queue_metrics(now).await;
 
         // Scheduling gate (DESIGN §12): decide whether/how ready work may be claimed this tick.
         // Discovery/enqueue above always ran regardless — only the CLAIM is gated, so newly-ready work
         // simply accumulates in the durable `Ready` backlog while the gate is closed. A forced trigger
         // (FR-CTL-3 `ignoreWindow`) bypasses the gate entirely and drains everything now.
         let (admission, transition) = if force {
-            (Admission::All { drain: true }, ScheduleTransition::default())
+            (
+                Admission::All { drain: true },
+                ScheduleTransition::default(),
+            )
         } else {
             self.evaluate_schedule(ms_to_utc(now))
         };
         if transition.triggered {
-            self.events.emit(Event::ScheduleTriggered { scope: self.id.clone() }).await;
+            self.events
+                .emit(Event::ScheduleTriggered {
+                    scope: self.id.clone(),
+                })
+                .await;
         }
         if transition.window_opened {
-            self.events.emit(Event::WindowOpened { window: self.window_label() }).await;
+            self.events
+                .emit(Event::WindowOpened {
+                    window: self.window_label(),
+                })
+                .await;
         }
         if transition.window_closed {
             // The common case: the previous windowed batch (if any) fully drained before `close_at`,
             // so the close is only discovered on this later tick — no transfer to pause here (a close
             // caught mid-transfer is instead handled synchronously in `run_batch_windowed`).
-            self.events.emit(Event::WindowClosed { window: self.window_label() }).await;
-            self.events.emit(Event::ScheduleComplete { mode: "window".to_string() }).await;
+            self.events
+                .emit(Event::WindowClosed {
+                    window: self.window_label(),
+                })
+                .await;
+            self.events
+                .emit(Event::ScheduleComplete {
+                    mode: "window".to_string(),
+                })
+                .await;
         }
 
         // The return value used to also gate a retained-state republish (dropped — see events.rs's
         // module docs: `state` is now a reserved, library-owned UNS class); the calls themselves still
         // run for their side effects (persisting/delivering the admitted batch).
-        match admission {
-            Admission::All { drain } => {
-                self.run_admitted(drain, now).await;
-            }
-            Admission::None => {}
+        let schedule_skipped = matches!(admission, Admission::None);
+        let window_open = matches!(admission, Admission::Windowed { .. });
+        let admission_blocked = schedule_skipped && queue_snapshot.ready > 0;
+        let files_released = match admission {
+            Admission::All { drain } => self.run_admitted(drain, now).await,
+            Admission::None => 0,
             Admission::Windowed { close_at, on_close } => {
-                self.run_windowed(close_at, on_close, now).await;
+                self.run_windowed(close_at, on_close, now).await
             }
-        }
+        };
+        self.emit_schedule_metrics(
+            1,
+            window_open,
+            transition.triggered,
+            schedule_skipped,
+            admission_blocked,
+            files_released as u64,
+        )
+        .await;
         if transition.triggered {
-            self.events.emit(Event::ScheduleComplete { mode: "cron".to_string() }).await;
+            self.events
+                .emit(Event::ScheduleComplete {
+                    mode: "cron".to_string(),
+                })
+                .await;
         }
+    }
+
+    async fn emit_discovery_metrics(
+        &self,
+        scan_duration_ms: f64,
+        files_discovered: u64,
+        files_ready: u64,
+        files_ignored: u64,
+        scan_errors: u64,
+        permission_denied: u64,
+    ) {
+        let Some(metrics) = &self.metrics else { return };
+        metrics
+            .emit_discovery(
+                &self.id,
+                self.readiness_strategy,
+                MetricValues::new()
+                    .add("scanCount", 1.0)
+                    .add("scanDurationMs", scan_duration_ms)
+                    .add("filesDiscovered", files_discovered as f64)
+                    .add("filesReady", files_ready as f64)
+                    .add("filesIgnored", files_ignored as f64)
+                    .add("scanErrors", scan_errors as f64)
+                    .add("permissionDenied", permission_denied as f64),
+            )
+            .await;
+    }
+
+    async fn emit_queue_metrics(&self, now: i64) -> QueueMetricSnapshot {
+        let snapshot = self.queue_metric_snapshot(now);
+        if let Some(metrics) = &self.metrics {
+            metrics.emit_queue(&self.id, snapshot.values).await;
+            self.queue_metric_snapshot(now)
+        } else {
+            snapshot
+        }
+    }
+
+    fn queue_metric_snapshot(&self, now: i64) -> QueueMetricSnapshot {
+        let ready = self
+            .store
+            .list_by_state(&self.id, ItemState::Ready)
+            .unwrap_or_else(|e| {
+                tracing::debug!(instance = %self.id, error = %e, "queue ready metric query failed");
+                Vec::new()
+            });
+        let in_progress = self
+            .store
+            .list_by_state(&self.id, ItemState::InProgress)
+            .map(|items| items.len())
+            .unwrap_or(0);
+        let failed = self
+            .store
+            .list_by_state(&self.id, ItemState::Failed)
+            .map(|items| items.len())
+            .unwrap_or(0);
+        let exhausted = self
+            .store
+            .list_by_state(&self.id, ItemState::Exhausted)
+            .map(|items| items.len())
+            .unwrap_or(0);
+        let oldest_age = ready
+            .first()
+            .map(|item| now.saturating_sub(item.discovered_at).max(0) as f64)
+            .unwrap_or(0.0);
+        let bytes_queued: u64 = ready.iter().map(|item| item.size).sum();
+        let active_workers = self
+            .queue
+            .per_limit()
+            .saturating_sub(self.queue.available());
+        QueueMetricSnapshot {
+            ready: ready.len(),
+            values: MetricValues::new()
+                .add("queueDepthReady", ready.len() as f64)
+                .add("queueDepthInProgress", in_progress as f64)
+                .add("queueDepthFailed", failed as f64)
+                .add("queueDepthExhausted", exhausted as f64)
+                .add("oldestQueuedAgeMs", oldest_age)
+                .add("bytesQueued", bytes_queued as f64)
+                .add("retryBacklog", failed as f64)
+                .add("activeWorkers", active_workers as f64),
+        }
+    }
+
+    async fn emit_schedule_metrics(
+        &self,
+        instance_active: u64,
+        window_open: bool,
+        schedule_triggered: bool,
+        schedule_skipped: bool,
+        admission_blocked: bool,
+        files_released: u64,
+    ) {
+        let Some(metrics) = &self.metrics else { return };
+        metrics
+            .emit_schedule(
+                &self.id,
+                self.schedule_mode,
+                MetricValues::new()
+                    .add("instanceActive", instance_active as f64)
+                    .add("windowOpen", if window_open { 1.0 } else { 0.0 })
+                    .add(
+                        "scheduleTriggers",
+                        if schedule_triggered { 1.0 } else { 0.0 },
+                    )
+                    .add("scheduleSkipped", if schedule_skipped { 1.0 } else { 0.0 })
+                    .add(
+                        "admissionBlocked",
+                        if admission_blocked { 1.0 } else { 0.0 },
+                    )
+                    .add("filesReleased", files_released as f64),
+            )
+            .await;
     }
 
     /// Feature A (`src/permission.rs`): turn this tick's ingress [`ScanIssue`]s into the ALWAYS
@@ -617,8 +844,8 @@ impl Instance {
     /// batch, matching the unchanged P1 behavior; `drain = true` (a fresh cron fire) repeats the
     /// claim → process cycle until the ready backlog is exhausted (DESIGN §12.2: "release all ready
     /// work at each fire"). Returns whether anything was claimed.
-    async fn run_admitted(&self, drain: bool, now: i64) -> bool {
-        let mut processed = false;
+    async fn run_admitted(&self, drain: bool, now: i64) -> usize {
+        let mut processed = 0;
         loop {
             let batch = match self.queue.claim(self.queue.per_limit(), now) {
                 Ok(b) => b,
@@ -630,7 +857,7 @@ impl Instance {
             if batch.is_empty() {
                 break;
             }
-            processed = true;
+            processed += batch.len();
             self.run_batch(batch, now).await;
             if !drain {
                 break;
@@ -650,6 +877,7 @@ impl Instance {
                 worker.process_item(&item, now).await;
             });
         }
+        self.emit_queue_metrics(now).await;
         while set.join_next().await.is_some() {}
     }
 
@@ -663,11 +891,18 @@ impl Instance {
     /// Unlike a cron fire (an instantaneous point trigger), an open window must keep more work moving
     /// than one `per_limit` batch per reconciliation-rescan tick — a nightly window over a large spool
     /// has to actually drain within its span, not trickle `per_limit` files every `rescan` seconds.
-    async fn run_windowed(&self, close_at: DateTime<Utc>, on_close: WindowClose, now: i64) -> bool {
+    async fn run_windowed(
+        &self,
+        close_at: DateTime<Utc>,
+        on_close: WindowClose,
+        now: i64,
+    ) -> usize {
         // One absolute deadline for the whole open span, shared across every drained batch.
-        let dur = (close_at - ms_to_utc(now)).to_std().unwrap_or(Duration::ZERO);
+        let dur = (close_at - ms_to_utc(now))
+            .to_std()
+            .unwrap_or(Duration::ZERO);
         let deadline = tokio::time::Instant::now() + dur;
-        let mut processed = false;
+        let mut processed = 0;
         loop {
             // Stop admitting new batches once the window has actually closed between batches (real time
             // reached the deadline while draining). This clean between-batches close is announced by the
@@ -686,10 +921,13 @@ impl Instance {
             if batch.is_empty() {
                 break;
             }
-            processed = true;
+            processed += batch.len();
             // If the close is caught mid-batch, `run_batch_windowed` handles `onWindowClose`, emits the
             // close events once, and returns `true` — stop draining then (admit no new work post-close).
-            if self.run_batch_windowed(batch, now, deadline, on_close).await {
+            if self
+                .run_batch_windowed(batch, now, deadline, on_close)
+                .await
+            {
                 break;
             }
         }
@@ -731,6 +969,7 @@ impl Instance {
                 worker.process_item(&item, now).await;
             });
         }
+        self.emit_queue_metrics(now).await;
 
         let sleep = tokio::time::sleep_until(deadline);
         tokio::pin!(sleep);
@@ -763,7 +1002,11 @@ impl Instance {
             }
         }
         if closed {
-            self.events.emit(Event::ScheduleComplete { mode: "window".to_string() }).await;
+            self.events
+                .emit(Event::ScheduleComplete {
+                    mode: "window".to_string(),
+                })
+                .await;
         }
         closed
     }
@@ -889,21 +1132,23 @@ impl Instance {
             RecursiveMode::NonRecursive
         };
         let watch_id = self.id.clone();
-        let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            match res {
-                // Any change nudges a tick; coalesced (a full channel already has a pending nudge, so
-                // a dropped send is harmless — the tick re-scans everything).
-                Ok(_) => {
-                    let _ = nudge_tx.try_send(());
+        let mut watcher = match notify::recommended_watcher(
+            move |res: notify::Result<notify::Event>| {
+                match res {
+                    // Any change nudges a tick; coalesced (a full channel already has a pending nudge, so
+                    // a dropped send is harmless — the tick re-scans everything).
+                    Ok(_) => {
+                        let _ = nudge_tx.try_send(());
+                    }
+                    // Surface watch errors (e.g. inotify queue overflow) instead of silently dropping them:
+                    // the periodic rescan still guarantees correctness, but an operator should see that the
+                    // low-latency watch has degraded.
+                    Err(e) => {
+                        tracing::warn!(instance = %watch_id, error = %e, "OS file watch event error")
+                    }
                 }
-                // Surface watch errors (e.g. inotify queue overflow) instead of silently dropping them:
-                // the periodic rescan still guarantees correctness, but an operator should see that the
-                // low-latency watch has degraded.
-                Err(e) => {
-                    tracing::warn!(instance = %watch_id, error = %e, "OS file watch event error")
-                }
-            }
-        }) {
+            },
+        ) {
             Ok(w) => w,
             Err(e) => {
                 tracing::warn!(instance = %self.id, error = %e, "OS file watch unavailable; using periodic rescan only");
@@ -1047,15 +1292,30 @@ mod tests {
         std::fs::write(src.path().join("sub/b.txt"), b"world!").unwrap();
 
         let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let inst = build(instance_cfg("i1", src.path(), dst.path(), true), store.clone());
+        let inst = build(
+            instance_cfg("i1", src.path(), dst.path(), true),
+            store.clone(),
+        );
 
         inst.tick(100).await;
 
         assert_eq!(std::fs::read(dst.path().join("a.txt")).unwrap(), b"hello");
-        assert_eq!(std::fs::read(dst.path().join("sub/b.txt")).unwrap(), b"world!");
-        assert!(!src.path().join("a.txt").exists(), "source deleted on success");
-        assert_eq!(store.get("i1", "a.txt").unwrap().unwrap().state, ItemState::Completed);
-        assert_eq!(store.get("i1", "sub/b.txt").unwrap().unwrap().state, ItemState::Completed);
+        assert_eq!(
+            std::fs::read(dst.path().join("sub/b.txt")).unwrap(),
+            b"world!"
+        );
+        assert!(
+            !src.path().join("a.txt").exists(),
+            "source deleted on success"
+        );
+        assert_eq!(
+            store.get("i1", "a.txt").unwrap().unwrap().state,
+            ItemState::Completed
+        );
+        assert_eq!(
+            store.get("i1", "sub/b.txt").unwrap().unwrap().state,
+            ItemState::Completed
+        );
         assert_eq!(store.stats("i1").unwrap().replicated, 2);
     }
 
@@ -1068,19 +1328,38 @@ mod tests {
         // Pre-seed a Failed item with a backoff gate at t=500 (a prior attempt).
         store.upsert_ready("i5", "retry.txt", 5, 0, 1).unwrap();
         store
-            .record_attempt("i5", "retry.txt", "earlier boom", ItemState::Failed, 500, 10)
+            .record_attempt(
+                "i5",
+                "retry.txt",
+                "earlier boom",
+                ItemState::Failed,
+                500,
+                10,
+            )
             .unwrap();
-        let inst = build(instance_cfg("i5", src.path(), dst.path(), true), store.clone());
+        let inst = build(
+            instance_cfg("i5", src.path(), dst.path(), true),
+            store.clone(),
+        );
 
         // A tick before the gate does not promote/process it.
         inst.tick(100).await;
-        assert_eq!(store.get("i5", "retry.txt").unwrap().unwrap().state, ItemState::Failed);
+        assert_eq!(
+            store.get("i5", "retry.txt").unwrap().unwrap().state,
+            ItemState::Failed
+        );
         assert!(!dst.path().join("retry.txt").exists());
 
         // A tick at/after the gate promotes Failed → Ready, claims, and completes it.
         inst.tick(500).await;
-        assert_eq!(store.get("i5", "retry.txt").unwrap().unwrap().state, ItemState::Completed);
-        assert_eq!(std::fs::read(dst.path().join("retry.txt")).unwrap(), b"later");
+        assert_eq!(
+            store.get("i5", "retry.txt").unwrap().unwrap().state,
+            ItemState::Completed
+        );
+        assert_eq!(
+            std::fs::read(dst.path().join("retry.txt")).unwrap(),
+            b"later"
+        );
     }
 
     #[tokio::test]
@@ -1089,11 +1368,17 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join("a.txt"), b"x").unwrap();
         let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let inst = build(instance_cfg("i2", src.path(), dst.path(), false), store.clone());
+        let inst = build(
+            instance_cfg("i2", src.path(), dst.path(), false),
+            store.clone(),
+        );
 
         assert!(!inst.is_active());
         inst.tick(100).await;
-        assert!(src.path().join("a.txt").exists(), "nothing replicated while inactive");
+        assert!(
+            src.path().join("a.txt").exists(),
+            "nothing replicated while inactive"
+        );
         assert!(store.get("i2", "a.txt").unwrap().is_none());
 
         // Activate → the next tick processes it.
@@ -1110,8 +1395,14 @@ mod tests {
 
         // Operator deactivates a config-enabled instance; the override persists.
         store.set_activation("i3", false, "control", 1).unwrap();
-        let inst = build(instance_cfg("i3", src.path(), dst.path(), true), store.clone());
-        assert!(!inst.is_active(), "persisted deactivate wins over config enabled=true");
+        let inst = build(
+            instance_cfg("i3", src.path(), dst.path(), true),
+            store.clone(),
+        );
+        assert!(
+            !inst.is_active(),
+            "persisted deactivate wins over config enabled=true"
+        );
 
         // Reset reverts to config `enabled` (true here).
         inst.clear_activation(now_ms()).unwrap();
@@ -1125,7 +1416,10 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join("live.txt"), b"streamed").unwrap();
         let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let inst = Arc::new(build(instance_cfg("i4", src.path(), dst.path(), true), store.clone()));
+        let inst = Arc::new(build(
+            instance_cfg("i4", src.path(), dst.path(), true),
+            store.clone(),
+        ));
 
         let cancel = CancellationToken::new();
         let c = cancel.clone();
@@ -1173,12 +1467,25 @@ mod tests {
         inst.tick(200).await;
         inst.tick(300).await;
 
-        assert!(dst.join("a.txt").exists(), "file replicated into the nested dest");
-        assert!(!dst.join("out").exists(), "no self-nesting: out/out must not appear");
+        assert!(
+            dst.join("a.txt").exists(),
+            "file replicated into the nested dest"
+        );
+        assert!(
+            !dst.join("out").exists(),
+            "no self-nesting: out/out must not appear"
+        );
         assert!(!dst.join("a.txt/a.txt").exists());
         // Exactly one work item was ever tracked (the original) — the delivered copy was not ingested.
-        assert!(store.get("loop", "out/a.txt").unwrap().is_none(), "dest copy never enqueued");
-        assert_eq!(store.stats("loop").unwrap().replicated, 1, "replicated exactly once");
+        assert!(
+            store.get("loop", "out/a.txt").unwrap().is_none(),
+            "dest copy never enqueued"
+        );
+        assert_eq!(
+            store.stats("loop").unwrap().replicated,
+            1,
+            "replicated exactly once"
+        );
     }
 
     #[tokio::test]
@@ -1188,7 +1495,10 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join("t.txt"), b"data").unwrap();
         let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let inst = build(instance_cfg("ictl", src.path(), dst.path(), true), store.clone());
+        let inst = build(
+            instance_cfg("ictl", src.path(), dst.path(), true),
+            store.clone(),
+        );
 
         // Metadata accessors.
         assert_eq!(InstanceControl::id(&inst), "ictl");
@@ -1215,7 +1525,10 @@ mod tests {
 
         // trigger_scan forces a replication pass now (immediate mode: gate always open).
         inst.trigger_scan(now_ms(), false).await;
-        assert!(dst.path().join("t.txt").exists(), "trigger replicated the file");
+        assert!(
+            dst.path().join("t.txt").exists(),
+            "trigger replicated the file"
+        );
     }
 
     #[test]
@@ -1332,15 +1645,21 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
         let (fake, events) = recording_events();
-        let inst = build_with_events(instance_cfg("iperm", src.path(), dst.path(), true), store, events);
+        let inst = build_with_events(
+            instance_cfg("iperm", src.path(), dst.path(), true),
+            store,
+            events,
+        );
 
         let bad = ScanIssue {
             path: src.path().join("locked-subdir"),
             kind: std::io::ErrorKind::PermissionDenied,
         };
         // Two rescans' worth of the SAME still-erroring ingress issue → exactly one event.
-        inst.report_scan_issues(std::slice::from_ref(&bad), 1_000).await;
-        inst.report_scan_issues(std::slice::from_ref(&bad), 2_000).await;
+        inst.report_scan_issues(std::slice::from_ref(&bad), 1_000)
+            .await;
+        inst.report_scan_issues(std::slice::from_ref(&bad), 2_000)
+            .await;
         assert_eq!(
             fake.events_named("PermissionDenied").len(),
             1,
@@ -1350,7 +1669,8 @@ mod tests {
         // A clean pass (the path no longer errors) evicts + re-arms the dedup; a later re-break emits
         // a fresh event (the "re-log on state change" half of the contract).
         inst.report_scan_issues(&[], 3_000).await;
-        inst.report_scan_issues(std::slice::from_ref(&bad), 4_000).await;
+        inst.report_scan_issues(std::slice::from_ref(&bad), 4_000)
+            .await;
         assert_eq!(
             fake.events_named("PermissionDenied").len(),
             2,
@@ -1366,14 +1686,20 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
         let (fake, events) = recording_events();
-        let inst = build_with_events(instance_cfg("inf", src.path(), dst.path(), true), store, events);
+        let inst = build_with_events(
+            instance_cfg("inf", src.path(), dst.path(), true),
+            store,
+            events,
+        );
 
         let gone = ScanIssue {
             path: src.path().join("vanished"),
             kind: std::io::ErrorKind::NotFound,
         };
-        inst.report_scan_issues(std::slice::from_ref(&gone), 1_000).await;
-        inst.report_scan_issues(std::slice::from_ref(&gone), 2_000).await;
+        inst.report_scan_issues(std::slice::from_ref(&gone), 1_000)
+            .await;
+        inst.report_scan_issues(std::slice::from_ref(&gone), 2_000)
+            .await;
         assert!(
             fake.events_named("PermissionDenied").is_empty(),
             "a NotFound scan issue is deduped but not a permission event"
@@ -1390,7 +1716,11 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
         let (fake, events) = recording_events();
-        let inst = build_with_events(instance_cfg("iseed", src.path(), dst.path(), true), store, events);
+        let inst = build_with_events(
+            instance_cfg("iseed", src.path(), dst.path(), true),
+            store,
+            events,
+        );
 
         let ingress_path = src.path().join("locked");
         let violations = vec![crate::permission::Violation {
@@ -1401,8 +1731,12 @@ mod tests {
         }];
         inst.seed_permission_log(&violations, 1_000);
 
-        let issue = ScanIssue { path: ingress_path, kind: std::io::ErrorKind::PermissionDenied };
-        inst.report_scan_issues(std::slice::from_ref(&issue), 1_001).await;
+        let issue = ScanIssue {
+            path: ingress_path,
+            kind: std::io::ErrorKind::PermissionDenied,
+        };
+        inst.report_scan_issues(std::slice::from_ref(&issue), 1_001)
+            .await;
         assert!(
             fake.events_named("PermissionDenied").is_empty(),
             "the seeded startup violation suppresses the first-rescan re-emit"
@@ -1480,8 +1814,16 @@ mod tests {
         // Second tick: the file is re-discovered on disk but is already a tracked row → no new
         // FileReady and no ScanComplete (nothing newly enqueued).
         inst.tick(2_000).await;
-        assert_eq!(fake.events_named("FileReady").len(), 1, "known file not re-announced");
-        assert_eq!(fake.events_named("ScanComplete").len(), 1, "no scan heartbeat without new work");
+        assert_eq!(
+            fake.events_named("FileReady").len(),
+            1,
+            "known file not re-announced"
+        );
+        assert_eq!(
+            fake.events_named("ScanComplete").len(),
+            1,
+            "no scan heartbeat without new work"
+        );
     }
 
     #[tokio::test]
@@ -1614,18 +1956,32 @@ mod tests {
         inst.tick(0).await; // baseline — discovers + enqueues, but does not release (not a fire)
         for i in 0..N {
             assert_eq!(
-                store.get("cronx", &format!("f{i}.txt")).unwrap().unwrap().state,
+                store
+                    .get("cronx", &format!("f{i}.txt"))
+                    .unwrap()
+                    .unwrap()
+                    .state,
                 ItemState::Ready
             );
         }
 
         inst.tick(30 * MIN).await; // still within the same hour — gate stays closed
-        assert_eq!(store.list_by_state("cronx", ItemState::Ready).unwrap().len(), N);
+        assert_eq!(
+            store
+                .list_by_state("cronx", ItemState::Ready)
+                .unwrap()
+                .len(),
+            N
+        );
 
         inst.tick(61 * MIN).await; // crossed the hour boundary — the fire drains the WHOLE backlog
         for i in 0..N {
             assert_eq!(
-                store.get("cronx", &format!("f{i}.txt")).unwrap().unwrap().state,
+                store
+                    .get("cronx", &format!("f{i}.txt"))
+                    .unwrap()
+                    .unwrap()
+                    .state,
                 ItemState::Completed,
                 "cron fire must drain every ready file, not just one per_limit batch"
             );
@@ -1647,13 +2003,23 @@ mod tests {
         }
         let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
         // Immediate schedule (default), same builder as the other tests.
-        let inst = build(instance_cfg("imm", src.path(), dst.path(), true), store.clone());
+        let inst = build(
+            instance_cfg("imm", src.path(), dst.path(), true),
+            store.clone(),
+        );
 
         inst.tick(1_000).await;
-        let completed = store.list_by_state("imm", ItemState::Completed).unwrap().len();
+        let completed = store
+            .list_by_state("imm", ItemState::Completed)
+            .unwrap()
+            .len();
         let ready = store.list_by_state("imm", ItemState::Ready).unwrap().len();
         assert_eq!(completed, per_limit, "one bounded batch replicated");
-        assert_eq!(ready, N - per_limit, "the overflow stays Ready for the next tick");
+        assert_eq!(
+            ready,
+            N - per_limit,
+            "the overflow stays Ready for the next tick"
+        );
     }
 
     #[tokio::test]
@@ -1664,7 +2030,12 @@ mod tests {
         let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
         let (fake, events) = recording_events();
         let inst = Instance::build(
-            instance_cfg_scheduled("cronevt", src.path(), dst.path(), cron_schedule("0 * * * *")),
+            instance_cfg_scheduled(
+                "cronevt",
+                src.path(),
+                dst.path(),
+                cron_schedule("0 * * * *"),
+            ),
             &GlobalCfg::default(),
             store.clone(),
             Arc::new(PriorityGate::new(8)),
@@ -1677,7 +2048,10 @@ mod tests {
 
         inst.tick(0).await;
         inst.tick(30 * MIN).await;
-        assert!(fake.events_named("ScheduleTriggered").is_empty(), "no fire yet");
+        assert!(
+            fake.events_named("ScheduleTriggered").is_empty(),
+            "no fire yet"
+        );
         assert!(fake.events_named("ScheduleComplete").is_empty());
 
         inst.tick(61 * MIN).await;
@@ -1706,13 +2080,25 @@ mod tests {
 
         // t = 2h: closed (the 00:00 window already closed at 01:00).
         inst.tick(2 * HOUR).await;
-        assert_eq!(store.get("winx", "a.txt").unwrap().unwrap().state, ItemState::Ready);
-        assert!(!dst.path().join("a.txt").exists(), "withheld while the window is closed");
+        assert_eq!(
+            store.get("winx", "a.txt").unwrap().unwrap().state,
+            ItemState::Ready
+        );
+        assert!(
+            !dst.path().join("a.txt").exists(),
+            "withheld while the window is closed"
+        );
 
         // t = 24h + 30min: inside the next day's window.
         inst.tick(DAY + 30 * MIN).await;
-        assert_eq!(store.get("winx", "a.txt").unwrap().unwrap().state, ItemState::Completed);
-        assert!(dst.path().join("a.txt").exists(), "released once the window opens");
+        assert_eq!(
+            store.get("winx", "a.txt").unwrap().unwrap().state,
+            ItemState::Completed
+        );
+        assert!(
+            dst.path().join("a.txt").exists(),
+            "released once the window opens"
+        );
     }
 
     #[tokio::test]
@@ -1741,16 +2127,31 @@ mod tests {
 
         // Closed first (files pile up in the Ready backlog).
         inst.tick(2 * HOUR).await;
-        assert_eq!(store.list_by_state("windrain", ItemState::Ready).unwrap().len(), N);
+        assert_eq!(
+            store
+                .list_by_state("windrain", ItemState::Ready)
+                .unwrap()
+                .len(),
+            N
+        );
 
         // Next day, well inside the window (opens at 24h, closes at 24h+60m): drain everything.
         inst.tick(DAY + 30 * MIN).await;
         assert_eq!(
-            store.list_by_state("windrain", ItemState::Completed).unwrap().len(),
+            store
+                .list_by_state("windrain", ItemState::Completed)
+                .unwrap()
+                .len(),
             N,
             "an open window drains the whole backlog, not just one per_limit batch"
         );
-        assert_eq!(store.list_by_state("windrain", ItemState::Ready).unwrap().len(), 0);
+        assert_eq!(
+            store
+                .list_by_state("windrain", ItemState::Ready)
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1782,7 +2183,10 @@ mod tests {
 
         inst.tick(30 * MIN + DAY).await; // now open
         assert_eq!(fake.events_named("WindowOpened").len(), 1);
-        assert_eq!(fake.events_named("WindowOpened")[0].body["window"], serde_json::json!("0 0 * * * for 60m"));
+        assert_eq!(
+            fake.events_named("WindowOpened")[0].body["window"],
+            serde_json::json!("0 0 * * * for 60m")
+        );
 
         inst.tick(2 * HOUR + DAY).await; // closed again (between ticks — no in-flight transfer)
         assert_eq!(fake.events_named("WindowClosed").len(), 1);
@@ -1921,7 +2325,10 @@ mod tests {
             ItemState::Ready,
             "a transfer paused mid-flight reverts to Ready, not left stuck InProgress"
         );
-        assert!(!dst.path().join("big.bin").exists(), "never delivered — it was cancelled");
+        assert!(
+            !dst.path().join("big.bin").exists(),
+            "never delivered — it was cancelled"
+        );
         assert_eq!(fake.events_named("ReplicationStarted").len(), 1);
         assert!(fake.events_named("ReplicationCompleted").is_empty());
         assert_eq!(fake.events_named("WindowClosed").len(), 1);
@@ -1931,20 +2338,35 @@ mod tests {
         // The resume checkpoint the (hung) first attempt persisted SURVIVES the pause — the revert must
         // not clear it, or the next window would restart from byte 0 (the whole point of pauseResume).
         assert!(
-            store.load_resume("pausewin", "big.bin", "hang-once").unwrap().is_some(),
+            store
+                .load_resume("pausewin", "big.bin", "hang-once")
+                .unwrap()
+                .is_some(),
             "resume checkpoint preserved across the pause"
         );
 
         // The window was open at t=30s (first evaluation), so exactly one WindowOpened has fired.
-        assert_eq!(fake.events_named("WindowOpened").len(), 1, "the initial open, announced once");
+        assert_eq!(
+            fake.events_named("WindowOpened").len(),
+            1,
+            "the initial open, announced once"
+        );
 
         // A follow-up tick still INSIDE the same closed span (90s; the window closed at 60s, reopens
         // at 24h): the synchronous `window_open = false` flip at close must prevent a SECOND
         // WindowClosed/ScheduleComplete, and there is no spurious WindowOpened while still closed.
         inst.tick(90_000).await;
-        assert_eq!(fake.events_named("WindowClosed").len(), 1, "close announced exactly once");
+        assert_eq!(
+            fake.events_named("WindowClosed").len(),
+            1,
+            "close announced exactly once"
+        );
         assert_eq!(fake.events_named("ScheduleComplete").len(), 1);
-        assert_eq!(fake.events_named("WindowOpened").len(), 1, "no reopen while still closed");
+        assert_eq!(
+            fake.events_named("WindowOpened").len(),
+            1,
+            "no reopen while still closed"
+        );
         assert_eq!(
             store.get("pausewin", "big.bin").unwrap().unwrap().state,
             ItemState::Ready,
@@ -2068,19 +2490,39 @@ mod tests {
 
         let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
         store.upsert_ready("pr", "v.txt", 5, 0, 1).unwrap();
-        store.set_state("pr", "v.txt", ItemState::Verified, 2).unwrap();
+        store
+            .set_state("pr", "v.txt", ItemState::Verified, 2)
+            .unwrap();
         store.upsert_ready("pr", "p.txt", 5, 0, 1).unwrap();
-        store.set_state("pr", "p.txt", ItemState::InProgress, 2).unwrap();
+        store
+            .set_state("pr", "p.txt", ItemState::InProgress, 2)
+            .unwrap();
 
-        let inst = build(instance_cfg("pr", src.path(), dst.path(), true), store.clone());
-        inst.pause_revert(&["v.txt".to_string(), "p.txt".to_string()], 100).await;
+        let inst = build(
+            instance_cfg("pr", src.path(), dst.path(), true),
+            store.clone(),
+        );
+        inst.pause_revert(&["v.txt".to_string(), "p.txt".to_string()], 100)
+            .await;
 
         // Verified → Completed (source deleted, stat bumped), not stranded non-terminal.
-        assert_eq!(store.get("pr", "v.txt").unwrap().unwrap().state, ItemState::Completed);
-        assert!(!src.path().join("v.txt").exists(), "verified item completed its source action");
-        assert!(store.stats("pr").unwrap().replicated >= 1, "verified completion counted");
+        assert_eq!(
+            store.get("pr", "v.txt").unwrap().unwrap().state,
+            ItemState::Completed
+        );
+        assert!(
+            !src.path().join("v.txt").exists(),
+            "verified item completed its source action"
+        );
+        assert!(
+            store.stats("pr").unwrap().replicated >= 1,
+            "verified completion counted"
+        );
         // InProgress → Ready (re-armed for the next window; checkpoint preserved).
-        assert_eq!(store.get("pr", "p.txt").unwrap().unwrap().state, ItemState::Ready);
+        assert_eq!(
+            store.get("pr", "p.txt").unwrap().unwrap().state,
+            ItemState::Ready
+        );
     }
 
     #[tokio::test]
@@ -2095,8 +2537,12 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join("tick.txt"), b"cron").unwrap();
         let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let mut cfg =
-            instance_cfg_scheduled("cronrun", src.path(), dst.path(), cron_schedule("* * * * * *"));
+        let mut cfg = instance_cfg_scheduled(
+            "cronrun",
+            src.path(),
+            dst.path(),
+            cron_schedule("* * * * * *"),
+        );
         cfg.ingress.rescan_secs = Some(3600); // keep the periodic rescan out of the way
         let inst = Arc::new(build(cfg, store.clone()));
 
@@ -2123,6 +2569,9 @@ mod tests {
             .await
             .expect("run loop exits on cancel")
             .unwrap();
-        assert!(landed, "the schedule-edge wake fired a cron and replicated the file");
+        assert!(
+            landed,
+            "the schedule-edge wake fired a cron and replicated the file"
+        );
     }
 }

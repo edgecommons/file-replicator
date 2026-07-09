@@ -9,8 +9,8 @@ cargo features pending crate-maturity confidence) — either **as files arrive**
 
 Handles source lifecycle on completion (**delete** or **archive**), retries with **resumable** partial
 uploads, and exposes a full **control-message** surface (get-config / get-status+statistics /
-trigger-now) plus granular **status events** for building a realtime UI. Supports multi-destination
-fan-out (an ordered `egress` list, `N >= 1`).
+trigger-now) plus granular **status events** and CloudWatch-friendly metric groups for building a
+realtime UI. Supports multi-destination fan-out (an ordered `egress` list, `N >= 1`).
 
 Runs standalone (**HOST**), on **Greengrass** (IPC), and on **Kubernetes** (ConfigMap) via the
 `edgecommons` library — no platform-specific code.

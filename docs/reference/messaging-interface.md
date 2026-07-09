@@ -91,6 +91,27 @@ which returns the full document — per instance (`awaiting`/`inProgress`/`repli
 component roster + summary. An instance disabled at startup by `onPermissionError: disableInstance` still
 answers `get-status` — `active: false`, `disabled: true`, `disabledReason` — instead of `UNKNOWN_INSTANCE`.
 
+## Metrics — library-owned
+
+Metrics are emitted through `gg.metrics()` on the reserved UNS `metric` class, using the configured
+`metricEmission` target. The compatibility `fileReplicator` group remains available with
+`filesReplicated`, `bytesReplicated`, and `filesFailed` as durable cumulative per-instance totals.
+It also emits `filesReplicatedInterval`, `bytesReplicatedInterval`, and `filesFailedInterval` as
+per-completion deltas for CloudWatch `Sum` views. Richer groups are emitted with bounded
+CloudWatch-friendly dimensions only:
+
+| Group | Dimensions | Measures |
+|---|---|---|
+| `FileReplicatorDiscovery` | `instance`, `readinessStrategy` | `scanCount`, `scanDurationMs`, `filesDiscovered`, `filesReady`, `filesIgnored`, `scanErrors`, `permissionDenied` |
+| `FileReplicatorQueue` | `instance` | `queueDepthReady`, `queueDepthInProgress`, `queueDepthFailed`, `queueDepthExhausted`, `oldestQueuedAgeMs`, `bytesQueued`, `retryBacklog`, `activeWorkers` |
+| `FileReplicatorTransfer` | `instance`, `destinationType`, `result` | `filesStarted`, `filesReplicated`, `filesFailed`, `filesQuarantined`, `filesRetained`, `bytesReplicated`, `transferDurationMs`, `throughputBytesPerSec`, `retryAttempts`, `verificationFailures`, `resumeRecoveries` |
+| `FileReplicatorDestination` | `instance`, `destinationType` | `linkConnected`, `connectFailures`, `authFailures`, `writeFailures`, `throttleDelayMs`, `bandwidthLimitBytesPerSec` |
+| `FileReplicatorSchedule` | `instance`, `mode` | `instanceActive`, `windowOpen`, `scheduleTriggers`, `scheduleSkipped`, `admissionBlocked`, `filesReleased` |
+
+Metric dimensions never include paths, filenames, bucket names, object keys, endpoints, or raw error text.
+`destinationType` is the bounded destination backend kind such as `local` or `s3`; for aggregate terminal
+outcomes on an instance with more than one destination, `FileReplicatorTransfer` uses `multi`.
+
 ## Envelope
 
 The standard edgecommons `Message`: `header` (`name`/`version`/`timestamp`/`correlation_id`/`reply_to`?),

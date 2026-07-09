@@ -11,6 +11,13 @@ The component owns the `component` section (`component.global` + `component.inst
 (`messaging`, `credentials`, `logging`, `heartbeat`, `metricEmission`, `health`, `tags`) are parsed by the
 `edgecommons` library — see the library docs.
 
+`metricEmission` routes the compatibility `fileReplicator` metric group and the richer
+`FileReplicatorDiscovery`, `FileReplicatorQueue`, `FileReplicatorTransfer`,
+`FileReplicatorDestination`, and `FileReplicatorSchedule` groups. With `target: "messaging"`, the
+library publishes to the reserved UNS `metric` class (`ecv1/{device}/FileReplicator/main/metric/{name}`);
+with CloudWatch or Prometheus, the same group names and bounded dimensions are used there. See
+[Reference › Messaging interface](messaging-interface.md#metrics--library-owned).
+
 ## `component.global`
 | Key | Type | Default | Notes |
 |---|---|---|---|

@@ -7,6 +7,7 @@
 //! testable without real sleeps. Human byte-rates like `"20MB/s"`, `"5Mbps"`, `"1Gbps"` are parsed by
 //! [`parse_byte_rate`].
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -91,6 +92,11 @@ impl TokenBucket {
         self.rate == 0
     }
 
+    /// Configured rate in bytes/second (`0` means unlimited).
+    pub fn rate_bytes_per_sec(&self) -> u64 {
+        self.rate
+    }
+
     /// Account for `n` bytes and return how long the caller must wait before sending them (`0` if
     /// tokens are already available). Tokens may go negative (debt) so the *average* rate is honored
     /// even for a write larger than the burst capacity.
@@ -122,6 +128,7 @@ impl TokenBucket {
 pub struct Bandwidth {
     per_instance: Arc<TokenBucket>,
     global: Arc<TokenBucket>,
+    throttle_delay_ms: Option<Arc<AtomicU64>>,
 }
 
 impl Bandwidth {
@@ -130,6 +137,7 @@ impl Bandwidth {
         Bandwidth {
             per_instance,
             global,
+            throttle_delay_ms: None,
         }
     }
 
@@ -138,7 +146,25 @@ impl Bandwidth {
         Bandwidth {
             per_instance: Arc::new(TokenBucket::unlimited()),
             global: Arc::new(TokenBucket::unlimited()),
+            throttle_delay_ms: None,
         }
+    }
+
+    /// Clone the governor and attach a per-transfer throttle-delay accumulator.
+    pub fn with_delay_recorder(&self) -> Self {
+        Bandwidth {
+            per_instance: self.per_instance.clone(),
+            global: self.global.clone(),
+            throttle_delay_ms: Some(Arc::new(AtomicU64::new(0))),
+        }
+    }
+
+    /// Milliseconds waited by this recorder-enabled governor.
+    pub fn recorded_throttle_delay_ms(&self) -> u64 {
+        self.throttle_delay_ms
+            .as_ref()
+            .map(|delay| delay.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     /// Reserve `bytes` from both buckets and await the larger of the two required waits before the
@@ -149,7 +175,23 @@ impl Bandwidth {
             .acquire(bytes)
             .max(self.global.acquire(bytes));
         if !wait.is_zero() {
+            if let Some(delay) = &self.throttle_delay_ms {
+                delay.fetch_add(wait.as_millis() as u64, Ordering::Relaxed);
+            }
             tokio::time::sleep(wait).await;
+        }
+    }
+
+    /// The effective configured limit in bytes/second (`0` when both buckets are unlimited).
+    pub fn limit_bytes_per_sec(&self) -> u64 {
+        match (
+            self.per_instance.rate_bytes_per_sec(),
+            self.global.rate_bytes_per_sec(),
+        ) {
+            (0, 0) => 0,
+            (0, global) => global,
+            (per_instance, 0) => per_instance,
+            (per_instance, global) => per_instance.min(global),
         }
     }
 }
@@ -194,7 +236,9 @@ pub fn parse_byte_rate(input: &str) -> Result<u64, String> {
         .parse()
         .map_err(|_| format!("invalid number in byte-rate {input:?}"))?;
     if value < 0.0 || !value.is_finite() {
-        return Err(format!("byte-rate must be non-negative and finite: {input:?}"));
+        return Err(format!(
+            "byte-rate must be non-negative and finite: {input:?}"
+        ));
     }
 
     let mut unit = unit_raw.trim();
@@ -287,7 +331,7 @@ mod tests {
         // 1000 B/s → capacity 1000, starts full.
         let b = TokenBucket::new(1000, clock.clone());
         assert_eq!(b.acquire(1000), Duration::ZERO); // drains the full burst
-        // Next 1000 with no refill → full-second deficit.
+                                                     // Next 1000 with no refill → full-second deficit.
         assert_eq!(b.acquire(1000), Duration::from_secs_f64(1.0));
     }
 
@@ -296,7 +340,7 @@ mod tests {
         let clock = manual();
         let b = TokenBucket::new(1000, clock.clone());
         assert_eq!(b.acquire(1000), Duration::ZERO); // empty now
-        // Ask for 500 with 0 tokens → wait 0.5s.
+                                                     // Ask for 500 with 0 tokens → wait 0.5s.
         assert_eq!(b.acquire(500), Duration::from_secs_f64(0.5));
     }
 
@@ -360,8 +404,15 @@ mod tests {
         assert_eq!(global.acquire(1000), Duration::ZERO);
         // B now sees the shared global bucket empty → its next byte must wait, even though B's own
         // per-instance bucket is unlimited. This is the cross-instance aggregate cap.
-        assert_eq!(b.per_instance.acquire(1000), Duration::ZERO, "B per-instance unlimited");
-        assert!(global.acquire(1000) > Duration::ZERO, "shared global cap makes B wait");
+        assert_eq!(
+            b.per_instance.acquire(1000),
+            Duration::ZERO,
+            "B per-instance unlimited"
+        );
+        assert!(
+            global.acquire(1000) > Duration::ZERO,
+            "shared global cap makes B wait"
+        );
     }
 
     #[tokio::test]

@@ -45,6 +45,14 @@ pub struct ScanIssue {
     pub kind: std::io::ErrorKind,
 }
 
+/// A discovery pass with ready files plus aggregate counters for metric emission.
+pub struct ScanReport {
+    pub ready: Vec<Candidate>,
+    pub issues: Vec<ScanIssue>,
+    pub files_discovered: u64,
+    pub files_ignored: u64,
+}
+
 /// A file discovered by [`scan`]: its source-root-relative, forward-slash key plus the absolute path,
 /// size, and last-modified time captured from the directory entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +90,10 @@ pub fn scan(
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(e) => {
-                issues.push(ScanIssue { path: dir.clone(), kind: e.kind() });
+                issues.push(ScanIssue {
+                    path: dir.clone(),
+                    kind: e.kind(),
+                });
                 tracing::debug!(dir = %dir.display(), error = %e, "read_dir failed; skipping");
                 continue;
             }
@@ -95,7 +106,10 @@ pub fn scan(
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    issues.push(ScanIssue { path: dir.clone(), kind: e.kind() });
+                    issues.push(ScanIssue {
+                        path: dir.clone(),
+                        kind: e.kind(),
+                    });
                     continue;
                 }
             };
@@ -106,7 +120,10 @@ pub fn scan(
             let ft = match entry.file_type() {
                 Ok(t) => t,
                 Err(e) => {
-                    issues.push(ScanIssue { path: path.clone(), kind: e.kind() });
+                    issues.push(ScanIssue {
+                        path: path.clone(),
+                        kind: e.kind(),
+                    });
                     continue;
                 }
             };
@@ -204,6 +221,12 @@ impl Watcher {
     /// error gets the same bounded, once-only signal); any other probe error (e.g. the file vanished
     /// between scan and probe) is a transient, self-correcting condition and is quietly skipped.
     pub fn discover(&mut self, probe: &dyn ReadinessProbe) -> (Vec<Candidate>, Vec<ScanIssue>) {
+        let report = self.discover_report(probe);
+        (report.ready, report.issues)
+    }
+
+    /// As [`discover`](Self::discover), plus aggregate counters for metric emission.
+    pub fn discover_report(&mut self, probe: &dyn ReadinessProbe) -> ScanReport {
         let mut issues = Vec::new();
         let candidates = scan(
             &self.root,
@@ -216,28 +239,41 @@ impl Watcher {
         // Snapshot the paths present this scan so per-file readiness bookkeeping (the stability
         // tracker) can be evicted for files that no longer exist — otherwise it would grow without
         // bound over the process lifetime on a high-churn spool (NFR-3 bounded memory).
+        let files_discovered = candidates.len() as u64;
+        let mut files_ignored = 0;
         let present: HashSet<PathBuf> = candidates.iter().map(|c| c.abs.clone()).collect();
         let mut ready = Vec::with_capacity(candidates.len());
         for c in candidates {
             match self.strategy.is_ready(&c.abs, probe, &self.exclude) {
                 Ok(true) => ready.push(c),
-                Ok(false) => {}
+                Ok(false) => {
+                    files_ignored += 1;
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                     // A file the scan could list but cannot open/stat because of a *permission* denial
                     // (Feature A): route it through the same dedup+`PermissionDenied` event path as an
                     // unreadable directory, rather than the silent per-rescan `debug!` a file-level
                     // permission error would otherwise get (which would re-log every rescan, forever).
-                    issues.push(ScanIssue { path: c.abs, kind: e.kind() });
+                    issues.push(ScanIssue {
+                        path: c.abs,
+                        kind: e.kind(),
+                    });
                 }
                 Err(e) => {
                     // Any other probe error (e.g. the file vanished between scan and probe) is a
                     // transient, self-correcting condition — a quiet debug line, not a scan issue.
+                    files_ignored += 1;
                     tracing::debug!(path = %c.abs.display(), error = %e, "readiness probe failed");
                 }
             }
         }
         self.strategy.retain_tracked(&present);
-        (ready, issues)
+        ScanReport {
+            ready,
+            issues,
+            files_discovered,
+            files_ignored,
+        }
     }
 }
 
@@ -281,7 +317,13 @@ mod tests {
         let got = scan(dir.path(), true, &inc, &exc, &[], &mut issues);
         let rels: Vec<_> = got.iter().map(|c| c.relpath.as_str()).collect();
         assert_eq!(rels, vec!["a.csv", "nested/b.csv"]); // forward-slash, sorted, .tmp excluded
-        assert_eq!(got.iter().find(|c| c.relpath == "nested/b.csv").unwrap().size, 2);
+        assert_eq!(
+            got.iter()
+                .find(|c| c.relpath == "nested/b.csv")
+                .unwrap()
+                .size,
+            2
+        );
         assert!(issues.is_empty(), "a clean tree has no scan issues");
     }
 
@@ -292,7 +334,14 @@ mod tests {
         write(&dir.path().join("sub/deep.csv"), b"2");
         let all = GlobMatcher::empty();
         let mut issues = Vec::new();
-        let got = scan(dir.path(), false, &all, &GlobMatcher::empty(), &[], &mut issues);
+        let got = scan(
+            dir.path(),
+            false,
+            &all,
+            &GlobMatcher::empty(),
+            &[],
+            &mut issues,
+        );
         let rels: Vec<_> = got.iter().map(|c| c.relpath.as_str()).collect();
         assert_eq!(rels, vec!["top.csv"]);
     }
@@ -305,7 +354,14 @@ mod tests {
         let all = GlobMatcher::empty();
         let skip = vec![dir.path().join("archive")];
         let mut issues = Vec::new();
-        let got = scan(dir.path(), true, &all, &GlobMatcher::empty(), &skip, &mut issues);
+        let got = scan(
+            dir.path(),
+            true,
+            &all,
+            &GlobMatcher::empty(),
+            &skip,
+            &mut issues,
+        );
         let rels: Vec<_> = got.iter().map(|c| c.relpath.as_str()).collect();
         assert_eq!(rels, vec!["keep.csv"], "in-tree archive dir must be pruned");
     }
@@ -321,7 +377,14 @@ mod tests {
         // Force it onto the walk stack as if it were a directory by scanning IT directly as root.
         let all = GlobMatcher::empty();
         let mut issues = Vec::new();
-        let got = scan(&not_a_dir, true, &all, &GlobMatcher::empty(), &[], &mut issues);
+        let got = scan(
+            &not_a_dir,
+            true,
+            &all,
+            &GlobMatcher::empty(),
+            &[],
+            &mut issues,
+        );
         assert!(got.is_empty());
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].path, not_a_dir);
@@ -371,7 +434,10 @@ mod tests {
 
         let (ready, issues) = w.discover(&FailProbe(std::io::ErrorKind::NotFound));
         assert!(ready.is_empty());
-        assert!(issues.is_empty(), "a non-permission probe error is not a scan issue");
+        assert!(
+            issues.is_empty(),
+            "a non-permission probe error is not a scan issue"
+        );
     }
 
     #[test]
@@ -379,8 +445,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(&dir.path().join("a.csv"), b"data");
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
-        let mut w = Watcher::from_cfg(&ingress(dir.path(), true, &["**/*.csv"], &[]), clock, vec![])
-            .unwrap();
+        let mut w = Watcher::from_cfg(
+            &ingress(dir.path(), true, &["**/*.csv"], &[]),
+            clock,
+            vec![],
+        )
+        .unwrap();
         let (ready, issues) = w.discover(&RealProbe);
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].relpath, "a.csv");

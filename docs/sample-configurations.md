@@ -3,7 +3,7 @@
 Complete, annotated configs for real scenarios. Each is validated against the config parser
 (`src/config.rs`) — not against other docs. The `component` subtree is **identical across platforms** (the
 component never branches on platform); only how config/messaging/identity are *sourced* differs, covered in
-[§9 Per-platform](#9-per-platform-host--greengrass--kubernetes).
+[§10 Per-platform](#10-per-platform-host--greengrass--kubernetes).
 
 Every instance lives under `component.instances[]`; the standard edgecommons sections (`messaging`,
 `credentials`, `logging`, `heartbeat`, `metricEmission`, `tags`) sit alongside `component`. Full field
@@ -238,7 +238,34 @@ is completed (here, archived) only once **every** destination has succeeded.
 }
 ```
 
-## 9. Per-platform (HOST / GREENGRASS / KUBERNETES)
+## 9. Observability: route operational metrics
+
+Metrics are emitted by the edgecommons metric subsystem, not by hand-published topics. To put the
+compatibility `fileReplicator` group and the richer operational groups on the local UNS bus:
+
+```jsonc
+{
+  "messaging": { "local": { "type": "mqtt", "host": "localhost", "port": 1883 } },
+  "metricEmission": {
+    "target": "messaging",
+    "targetConfig": { "destination": "local" }
+  },
+  "component": { "instances": [ /* any instance config from the examples above */ ] }
+}
+```
+
+For CloudWatch, use `metricEmission.target: "cloudwatch"` (or route `messaging` to the northbound
+provider and bridge the UNS metric class). The emitted dimensions are intentionally bounded:
+`instance`, `destinationType`, `result`, `mode`, and `readinessStrategy`, plus library-provided component
+dimensions. Paths, filenames, bucket names, object keys, endpoint URLs, and raw errors stay out of metric
+dimensions and belong in events or `get-status`.
+
+The main groups are `FileReplicatorDiscovery`, `FileReplicatorQueue`, `FileReplicatorTransfer`,
+`FileReplicatorDestination`, and `FileReplicatorSchedule`. See
+[Reference › Messaging interface](reference/messaging-interface.md#metrics--library-owned) for the full
+measure list.
+
+## 10. Per-platform (HOST / GREENGRASS / KUBERNETES)
 
 The `component` config above is unchanged across all three platforms — only the launch and the
 config/messaging/identity *source* differ.

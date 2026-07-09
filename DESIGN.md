@@ -1131,15 +1131,29 @@ which derives the `evt/{severity}/{type}` channel from the body — the wire bod
 
 ## 18. Observability, platform & packaging
 
-- **Metrics** (`gg.metrics()`): `files_discovered`, `files_replicated`, `files_failed`, `files_quarantined`,
-  `bytes_replicated`, `in_progress`, `queue_depth`, `retry_count`, `bandwidth_bytes_per_sec`,
-  `link_connected` (gauge), `instance_active` (gauge), `upload_duration_ms`. Target resolves per platform
-  (prometheus on k8s, log elsewhere). **As shipped (P3, not previously audited against this list):** only a
-  subset exists, under the `"fileReplicator"` metric group with camelCase names —
-  `filesReplicated`/`bytesReplicated` on completion and a single `filesFailed` covering both `Quarantined`
-  and `Retained` outcomes (`src/instance/worker.rs`'s `emit`). The rest of this list — discovery/in-progress/
-  queue-depth/retry-count/bandwidth/link/activation/duration metrics — has no emission call anywhere in
-  `src/` as of P6; treat them as still-designed, not shipped.
+- **Metrics** (`gg.metrics()`): the legacy `"fileReplicator"` group is retained for compatibility
+  (`filesReplicated`, `bytesReplicated`, `filesFailed` as durable cumulative totals, plus
+  `filesReplicatedInterval`, `bytesReplicatedInterval`, and `filesFailedInterval` as per-completion
+  deltas). The richer shipped scheme uses CloudWatch-friendly groups with bounded dimensions only:
+  - `FileReplicatorDiscovery` dimensions: `instance`, `readinessStrategy`; measures: `scanCount`,
+    `scanDurationMs`, `filesDiscovered`, `filesReady`, `filesIgnored`, `scanErrors`, `permissionDenied`.
+  - `FileReplicatorQueue` dimensions: `instance`; measures: `queueDepthReady`,
+    `queueDepthInProgress`, `queueDepthFailed`, `queueDepthExhausted`, `oldestQueuedAgeMs`,
+    `bytesQueued`, `retryBacklog`, `activeWorkers`.
+  - `FileReplicatorTransfer` dimensions: `instance`, `destinationType`, `result`; measures:
+    `filesStarted`, `filesReplicated`, `filesFailed`, `filesQuarantined`, `filesRetained`,
+    `bytesReplicated`, `transferDurationMs`, `throughputBytesPerSec`, `retryAttempts`,
+    `verificationFailures`, `resumeRecoveries`.
+  - `FileReplicatorDestination` dimensions: `instance`, `destinationType`; measures: `linkConnected`,
+    `connectFailures`, `authFailures`, `writeFailures`, `throttleDelayMs`,
+    `bandwidthLimitBytesPerSec`.
+  - `FileReplicatorSchedule` dimensions: `instance`, `mode`; measures: `instanceActive`,
+    `windowOpen`, `scheduleTriggers`, `scheduleSkipped`, `admissionBlocked`, `filesReleased`.
+  `destinationType` is the bounded backend kind (`local`, `s3`, etc.); `FileReplicatorTransfer`
+  may use `multi` only for aggregate terminal outcomes on a fan-out instance.
+  Dimensions deliberately exclude paths, filenames, bucket names, object keys, raw endpoints, and error text.
+  Target resolution stays platform-driven by edgecommons (Prometheus on Kubernetes when enabled, log or the
+  configured target elsewhere).
 - **Platform** entirely via the edgecommons resolver (HOST→FILE/MQTT, GG→GG_CONFIG/IPC, K8S→CONFIGMAP/MQTT);
   no `#[cfg(platform)]` in engine code; cargo features gate backends + the Linux-only `greengrass` (IPC)
   feature (OFF by default). Health `/livez` `/readyz` `/startupz` + JSON logging from the library on k8s.

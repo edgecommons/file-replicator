@@ -35,20 +35,23 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use edgecommons::metrics::MetricService;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokio::task::JoinSet;
 
 use crate::config::{Collision, CompletionCfg, OnExhausted, OnSuccess, RetryCfg, Verify};
 use crate::dest::SharedDestination;
-use crate::domain::{Checksum, Delivered, DestPhase, ItemState, ProgressSink, ResumeState, WorkItem};
+use crate::domain::{
+    Checksum, Delivered, DestPhase, ItemState, ProgressSink, ResumeState, WorkItem,
+};
 use crate::error::{ReplError, Result};
 use crate::events::{Event, Events, ProgressThrottle};
+use crate::metrics::{MetricValues, ReplicatorMetrics};
 use crate::permission::{PermissionLog, Role};
 use crate::ratelimit::Bandwidth;
-use crate::state::{StatsDelta, StateStore};
+use crate::state::{StateStore, StatsDelta};
 
 use super::now_ms;
 
@@ -253,8 +256,8 @@ pub struct Worker {
     /// Backoff jitter source (seedable for deterministic tests); shared (`Arc`) so it can be cloned
     /// into the per-destination fan-out tasks ([`run_one_dest`]) without borrowing `self`.
     rng: Arc<Mutex<StdRng>>,
-    /// Optional metric emitter (`filesReplicated`/`bytesReplicated`/`filesFailed`).
-    metrics: Option<Arc<dyn MetricService>>,
+    /// Optional metric emitter.
+    metrics: Option<Arc<ReplicatorMetrics>>,
     /// UNS event emitter for the per-file lifecycle events (`ReplicationStarted`/`…Progress`/
     /// `…Completed`/`…Failed`/`FileDeleted`/`FileArchived`/`RetriesExhausted`/`FileQuarantined`,
     /// DESIGN §17). A no-op [`Events::disabled`] by default, so a worker built without messaging (or
@@ -286,7 +289,7 @@ impl Worker {
         ingress_root: PathBuf,
         bw: Bandwidth,
         retry: RetryPolicy,
-        metrics: Option<Arc<dyn MetricService>>,
+        metrics: Option<Arc<ReplicatorMetrics>>,
     ) -> Self {
         Self::new_multi(
             instance,
@@ -312,7 +315,7 @@ impl Worker {
         ingress_root: PathBuf,
         bw: Bandwidth,
         retry: RetryPolicy,
-        metrics: Option<Arc<dyn MetricService>>,
+        metrics: Option<Arc<ReplicatorMetrics>>,
     ) -> Self {
         let labels = label_destinations(&dests);
         let dests = labels
@@ -360,6 +363,14 @@ impl Worker {
             .map(|s| s.label.as_str())
             .collect::<Vec<_>>()
             .join("+")
+    }
+
+    fn metric_destination_type(&self) -> &'static str {
+        if self.dests.len() == 1 {
+            self.dests[0].dest.kind()
+        } else {
+            "multi"
+        }
     }
 
     /// The absolute source path for `item`, rebuilt from the ingress root and the stored `relpath`
@@ -475,6 +486,7 @@ impl Worker {
                     retry: self.retry,
                     verify_policy: self.completion.verify,
                     events: self.events.clone(),
+                    metrics: self.metrics.clone(),
                     now,
                     attempts_so_far: attempts_of(&slot.label),
                     rng: self.rng.clone(),
@@ -487,7 +499,13 @@ impl Worker {
                     Ok(Ok((label, DestOutcome::Verified))) => {
                         verified.insert(label);
                     }
-                    Ok(Ok((label, DestOutcome::Retry { next_attempt_at, err }))) => {
+                    Ok(Ok((
+                        label,
+                        DestOutcome::Retry {
+                            next_attempt_at,
+                            err,
+                        },
+                    ))) => {
                         retries.push((label, next_attempt_at, err));
                     }
                     Ok(Ok((label, DestOutcome::GiveUp { err, attempts }))) => {
@@ -516,11 +534,13 @@ impl Worker {
             // give-up cleanup); an already-`Verified` destination's delivered data is left untouched.
             for (label, _, _) in &retries {
                 if let Some(slot) = self.dests.iter().find(|s| &s.label == label) {
-                    self.abort_and_clear_resume(&slot.label, &slot.dest, item).await;
+                    self.abort_and_clear_resume(&slot.label, &slot.dest, item)
+                        .await;
                 }
             }
             for slot in &not_due {
-                self.abort_and_clear_resume(&slot.label, &slot.dest, item).await;
+                self.abort_and_clear_resume(&slot.label, &slot.dest, item)
+                    .await;
             }
             let attempts = giveups
                 .iter()
@@ -626,7 +646,9 @@ impl Worker {
                 "load resume for give-up abort failed"
             ),
         }
-        let _ = self.store.clear_resume(&self.instance, &item.relpath, label);
+        let _ = self
+            .store
+            .clear_resume(&self.instance, &item.relpath, label);
     }
 
     /// Run the success completion action (`delete` | `archive`) on the source, then persist
@@ -644,7 +666,14 @@ impl Worker {
         let relpath = item.relpath.clone();
         let instance = self.instance.clone();
         if let Err(e) = tokio::task::spawn_blocking(move || {
-            apply_success_action(on_success, &src, archive_dir.as_deref(), &relpath, collision, &instance)
+            apply_success_action(
+                on_success,
+                &src,
+                archive_dir.as_deref(),
+                &relpath,
+                collision,
+                &instance,
+            )
         })
         .await
         {
@@ -715,6 +744,16 @@ impl Worker {
             OnExhausted::RetainInPlace => {
                 self.store
                     .set_state(&self.instance, &item.relpath, ItemState::Retained, now)?;
+                if let Some(metrics) = &self.metrics {
+                    metrics
+                        .emit_transfer(
+                            &self.instance,
+                            self.metric_destination_type(),
+                            "retained",
+                            MetricValues::new().add("filesRetained", 1.0),
+                        )
+                        .await;
+                }
                 Ok(ItemState::Retained)
             }
             OnExhausted::Quarantine => {
@@ -756,6 +795,16 @@ impl Worker {
                         quarantine_path,
                     })
                     .await;
+                if let Some(metrics) = &self.metrics {
+                    metrics
+                        .emit_transfer(
+                            &self.instance,
+                            self.metric_destination_type(),
+                            "quarantined",
+                            MetricValues::new().add("filesQuarantined", 1.0),
+                        )
+                        .await;
+                }
                 Ok(ItemState::Quarantined)
             }
         }
@@ -783,9 +832,16 @@ impl Worker {
                 _ => {}
             }
         }
-        for it in self.store.list_by_state(&self.instance, ItemState::Exhausted)? {
-            let last = it.last_error.clone().unwrap_or_else(|| "exhausted".to_string());
-            let _ = self.finish_exhausted(&it, &last, it.attempts, now).await?;
+        for it in self
+            .store
+            .list_by_state(&self.instance, ItemState::Exhausted)?
+        {
+            let last = it
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "exhausted".to_string());
+            let state = self.finish_exhausted(&it, &last, it.attempts, now).await?;
+            self.emit(state, it.size).await;
         }
         Ok(())
     }
@@ -828,6 +884,7 @@ impl Worker {
         if all_ok {
             tracing::info!(instance = %self.instance, relpath = %it.relpath, "recovering Verified → every destination re-verified, completing");
             let _ = self.complete_verified(it, now).await?;
+            self.emit(ItemState::Completed, it.size).await;
         } else {
             self.store
                 .set_state(&self.instance, &it.relpath, ItemState::Ready, now)?;
@@ -892,6 +949,16 @@ impl Worker {
                     instance = %self.instance, relpath = %it.relpath, dest = %slot.label, error = %e,
                     "recovery: destination failed re-verification; requeuing that destination"
                 );
+                if let Some(metrics) = &self.metrics {
+                    metrics
+                        .emit_transfer(
+                            &self.instance,
+                            slot.dest.kind(),
+                            "error",
+                            MetricValues::new().add("verificationFailures", 1.0),
+                        )
+                        .await;
+                }
                 self.store.set_dest_phase(
                     &self.instance,
                     &it.relpath,
@@ -934,21 +1001,30 @@ impl Worker {
         Ok(())
     }
 
-    /// Emit the completion/failure metric for a terminal state (best-effort).
+    /// Emit the compatibility metric group for consumers that already scrape `fileReplicator`.
     async fn emit(&self, state: ItemState, size: u64) {
         let Some(m) = &self.metrics else { return };
-        let values: Option<HashMap<String, f64>> = match state {
-            ItemState::Completed => Some(HashMap::from([
-                ("filesReplicated".to_string(), 1.0),
-                ("bytesReplicated".to_string(), size as f64),
-            ])),
-            ItemState::Quarantined | ItemState::Retained => {
-                Some(HashMap::from([("filesFailed".to_string(), 1.0)]))
-            }
-            _ => None,
+        let stats = self.store.stats(&self.instance).unwrap_or_default();
+        let totals = || {
+            MetricValues::new()
+                .add("filesReplicated", stats.replicated as f64)
+                .add("bytesReplicated", stats.bytes as f64)
+                .add("filesFailed", stats.failed as f64)
         };
-        if let Some(v) = values {
-            let _ = m.emit_metric("fileReplicator", v).await;
+        match state {
+            ItemState::Completed => {
+                m.emit_legacy(
+                    totals()
+                        .add("filesReplicatedInterval", 1.0)
+                        .add("bytesReplicatedInterval", size as f64),
+                )
+                .await;
+            }
+            ItemState::Quarantined | ItemState::Retained => {
+                m.emit_legacy(totals().add("filesFailedInterval", 1.0))
+                    .await;
+            }
+            _ => {}
         }
     }
 }
@@ -979,6 +1055,7 @@ struct DestAttemptCtx {
     retry: RetryPolicy,
     verify_policy: Verify,
     events: Events,
+    metrics: Option<Arc<ReplicatorMetrics>>,
     now: i64,
     /// This destination's attempts-so-far (from its [`DestState`](crate::domain::DestState), `0` if
     /// this is its first attempt) — the per-destination analogue of [`WorkItem::attempts`].
@@ -1006,6 +1083,7 @@ async fn run_one_dest(ctx: DestAttemptCtx) -> Result<(String, DestOutcome)> {
         retry,
         verify_policy,
         events,
+        metrics,
         now,
         attempts_so_far,
         rng,
@@ -1013,7 +1091,9 @@ async fn run_one_dest(ctx: DestAttemptCtx) -> Result<(String, DestOutcome)> {
     } = ctx;
 
     let resume = store.load_resume(&instance, &item.relpath, &label)?;
+    let resumed = resume.is_some();
     let attempt = attempts_so_far.saturating_add(1);
+    let destination_type = dest.kind();
 
     tracing::info!(
         instance = %instance, relpath = %item.relpath, dest = %label,
@@ -1029,6 +1109,21 @@ async fn run_one_dest(ctx: DestAttemptCtx) -> Result<(String, DestOutcome)> {
             attempt,
         })
         .await;
+    if let Some(m) = &metrics {
+        m.emit_transfer(
+            &instance,
+            destination_type,
+            "started",
+            MetricValues::new().add("filesStarted", 1.0),
+        )
+        .await;
+        m.emit_destination(
+            &instance,
+            destination_type,
+            MetricValues::new().add("bandwidthLimitBytesPerSec", bw.limit_bytes_per_sec() as f64),
+        )
+        .await;
+    }
 
     let (progress, drainer) = build_progress(
         store.clone(),
@@ -1040,12 +1135,17 @@ async fn run_one_dest(ctx: DestAttemptCtx) -> Result<(String, DestOutcome)> {
         attempt,
     );
 
-    let outcome = async {
-        let delivered = dest.deliver(&item, resume, &progress, &bw).await?;
-        dest.verify(&item, &delivered, verify_policy).await?;
-        Ok::<Delivered, ReplError>(delivered)
-    }
-    .await;
+    let transfer_started = Instant::now();
+    let attempt_bw = bw.with_delay_recorder();
+    let outcome = match dest.deliver(&item, resume, &progress, &attempt_bw).await {
+        Ok(delivered) => match dest.verify(&item, &delivered, verify_policy).await {
+            Ok(()) => Ok(delivered),
+            Err(e) => Err((e, true)),
+        },
+        Err(e) => Err((e, false)),
+    };
+    let transfer_duration_ms = transfer_started.elapsed().as_secs_f64() * 1000.0;
+    let throttle_delay_ms = attempt_bw.recorded_throttle_delay_ms() as f64;
 
     // Drop our sink handle so the progress channel closes once every destination-held clone is gone
     // (deliver has returned), then flush any still-queued `ReplicationProgress` events.
@@ -1075,9 +1175,41 @@ async fn run_one_dest(ctx: DestAttemptCtx) -> Result<(String, DestOutcome)> {
                     bytes: delivered.bytes,
                 })
                 .await;
+            if let Some(m) = &metrics {
+                let throughput = if transfer_duration_ms > 0.0 {
+                    delivered.bytes as f64 / (transfer_duration_ms / 1000.0)
+                } else {
+                    delivered.bytes as f64
+                };
+                m.emit_transfer(
+                    &instance,
+                    destination_type,
+                    "success",
+                    {
+                        let mut values = MetricValues::new()
+                            .add("filesReplicated", 1.0)
+                            .add("bytesReplicated", delivered.bytes as f64)
+                            .add("transferDurationMs", transfer_duration_ms)
+                            .add("throughputBytesPerSec", throughput);
+                        if resumed {
+                            values = values.add("resumeRecoveries", 1.0);
+                        }
+                        values
+                    },
+                )
+                .await;
+                m.emit_destination(
+                    &instance,
+                    destination_type,
+                    MetricValues::new()
+                        .add("linkConnected", 1.0)
+                        .add("throttleDelayMs", throttle_delay_ms),
+                )
+                .await;
+            }
             Ok((label, DestOutcome::Verified))
         }
-        Err(e) => {
+        Err((e, verification_failure)) => {
             // Feature A (`src/permission.rs`): a permission-denied failure on this destination is
             // ALWAYS logged (once, deduplicated — not on every retry attempt, and not once per file)
             // and gets a `PermissionDenied` event, BEFORE falling through to the unchanged
@@ -1149,7 +1281,31 @@ async fn run_one_dest(ctx: DestAttemptCtx) -> Result<(String, DestOutcome)> {
                             next_attempt_at_ms: Some(next_attempt_at),
                         })
                         .await;
-                    Ok((label, DestOutcome::Retry { next_attempt_at, err: err_str }))
+                    if let Some(m) = &metrics {
+                        let mut values = MetricValues::new()
+                            .add("filesFailed", 1.0)
+                            .add("transferDurationMs", transfer_duration_ms)
+                            .add("retryAttempts", 1.0);
+                        if verification_failure {
+                            values = values.add("verificationFailures", 1.0);
+                        }
+                        m.emit_transfer(&instance, destination_type, "retry", values)
+                            .await;
+                        m.emit_destination(
+                            &instance,
+                            destination_type,
+                            destination_failure_values(&e)
+                                .add("throttleDelayMs", throttle_delay_ms),
+                        )
+                        .await;
+                    }
+                    Ok((
+                        label,
+                        DestOutcome::Retry {
+                            next_attempt_at,
+                            err: err_str,
+                        },
+                    ))
                 }
                 RetryDecision::GiveUp => {
                     store.record_dest_attempt(
@@ -1191,11 +1347,69 @@ async fn run_one_dest(ctx: DestAttemptCtx) -> Result<(String, DestOutcome)> {
                             last_error: err_str.clone(),
                         })
                         .await;
-                    Ok((label, DestOutcome::GiveUp { err: err_str, attempts: attempt }))
+                    if let Some(m) = &metrics {
+                        let mut values = MetricValues::new()
+                            .add("filesFailed", 1.0)
+                            .add("transferDurationMs", transfer_duration_ms);
+                        if verification_failure {
+                            values = values.add("verificationFailures", 1.0);
+                        }
+                        m.emit_transfer(&instance, destination_type, "exhausted", values)
+                            .await;
+                        m.emit_destination(
+                            &instance,
+                            destination_type,
+                            destination_failure_values(&e)
+                                .add("throttleDelayMs", throttle_delay_ms),
+                        )
+                        .await;
+                    }
+                    Ok((
+                        label,
+                        DestOutcome::GiveUp {
+                            err: err_str,
+                            attempts: attempt,
+                        },
+                    ))
                 }
             }
         }
     }
+}
+
+fn destination_failure_values(error: &ReplError) -> MetricValues {
+    if error.is_permission_denied() || is_auth_failure(error) {
+        MetricValues::new()
+            .add("authFailures", 1.0)
+            .add("linkConnected", 0.0)
+    } else if error.is_transient() {
+        MetricValues::new()
+            .add("connectFailures", 1.0)
+            .add("linkConnected", 0.0)
+    } else {
+        MetricValues::new()
+            .add("writeFailures", 1.0)
+            .add("linkConnected", 0.0)
+    }
+}
+
+fn is_auth_failure(error: &ReplError) -> bool {
+    let msg = error.to_string().to_ascii_lowercase();
+    [
+        "accessdenied",
+        "access denied",
+        "invalidaccesskeyid",
+        "signaturedoesnotmatch",
+        "signature mismatch",
+        "auth",
+        "authentication",
+        "unauthorized",
+        "forbidden",
+        "401",
+        "403",
+    ]
+    .iter()
+    .any(|needle| msg.contains(needle))
 }
 
 /// Persist the delivered result as `label`'s `Verified` write-ahead checkpoint (DESIGN §13.2/§20-B).
@@ -1500,8 +1714,10 @@ fn write_error_sidecar(dst: &Path, ctx: &QuarantineCtx) {
         "destination": ctx.destination,
         "bytesDone": ctx.bytes_done,
     });
-    if let Err(e) = std::fs::write(&sidecar, serde_json::to_vec_pretty(&payload).unwrap_or_default())
-    {
+    if let Err(e) = std::fs::write(
+        &sidecar,
+        serde_json::to_vec_pretty(&payload).unwrap_or_default(),
+    ) {
         tracing::warn!(path = %sidecar.display(), error = %e, "write error sidecar failed");
     }
 }
@@ -1580,6 +1796,22 @@ mod tests {
     }
 
     #[test]
+    fn auth_classifier_covers_common_remote_denials() {
+        for msg in [
+            "AccessDenied from object store",
+            "InvalidAccessKeyId",
+            "SignatureDoesNotMatch",
+            "HTTP 403 Forbidden",
+            "authentication failed",
+        ] {
+            assert!(is_auth_failure(&ReplError::Permanent(msg.into())), "{msg}");
+        }
+        assert!(!is_auth_failure(&ReplError::Permanent(
+            "destination path does not exist".into()
+        )));
+    }
+
+    #[test]
     fn resolve_prefers_instance_then_global_then_default() {
         let def = RetryPolicy::resolve(None, None);
         assert_eq!(def.base_delay_ms, DEFAULT_BASE_DELAY_MS);
@@ -1651,10 +1883,16 @@ mod tests {
             d => panic!("expected retry, got {d:?}"),
         }
         // Permanent → always GiveUp.
-        assert_eq!(p.decide(&item, true, 1_000, &mut rng), RetryDecision::GiveUp);
+        assert_eq!(
+            p.decide(&item, true, 1_000, &mut rng),
+            RetryDecision::GiveUp
+        );
         // Attempts cap: after 2 prior attempts, this (3rd) reaches maxAttempts=3 → GiveUp.
         item.attempts = 2;
-        assert_eq!(p.decide(&item, false, 1_000, &mut rng), RetryDecision::GiveUp);
+        assert_eq!(
+            p.decide(&item, false, 1_000, &mut rng),
+            RetryDecision::GiveUp
+        );
         // Time budget: within attempts but past giveUpAfter → GiveUp.
         item.attempts = 0;
         assert_eq!(
@@ -1665,8 +1903,14 @@ mod tests {
 
     #[test]
     fn suffixed_inserts_before_extension() {
-        assert_eq!(suffixed(Path::new("/a/report.csv"), 1), PathBuf::from("/a/report.1.csv"));
-        assert_eq!(suffixed(Path::new("/a/data"), 2), PathBuf::from("/a/data.2"));
+        assert_eq!(
+            suffixed(Path::new("/a/report.csv"), 1),
+            PathBuf::from("/a/report.1.csv")
+        );
+        assert_eq!(
+            suffixed(Path::new("/a/data"), 2),
+            PathBuf::from("/a/data.2")
+        );
     }
 
     // ---- move_file / collision ------------------------------------------------------------------
@@ -1796,7 +2040,9 @@ mod tests {
             std::fs::create_dir_all(p).unwrap();
         }
         std::fs::write(&abs, body).unwrap();
-        store.upsert_ready(INST, rel, body.len() as u64, 0, 1).unwrap();
+        store
+            .upsert_ready(INST, rel, body.len() as u64, 0, 1)
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1805,15 +2051,30 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         let store = store();
         enqueue_file(&store, src.path(), "a/b.txt", b"payload");
-        let worker = local_worker(store.clone(), src.path(), dst.path(), completion(OnSuccess::Delete), RetryPolicy::default());
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            RetryPolicy::default(),
+        );
 
         let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
         let state = worker.process_item(&item, 100).await;
 
         assert_eq!(state, ItemState::Completed);
-        assert_eq!(std::fs::read(dst.path().join("a/b.txt")).unwrap(), b"payload");
-        assert!(!src.path().join("a/b.txt").exists(), "source deleted on success");
-        assert_eq!(store.get(INST, "a/b.txt").unwrap().unwrap().state, ItemState::Completed);
+        assert_eq!(
+            std::fs::read(dst.path().join("a/b.txt")).unwrap(),
+            b"payload"
+        );
+        assert!(
+            !src.path().join("a/b.txt").exists(),
+            "source deleted on success"
+        );
+        assert_eq!(
+            store.get(INST, "a/b.txt").unwrap().unwrap().state,
+            ItemState::Completed
+        );
         assert_eq!(store.stats(INST).unwrap().replicated, 1);
     }
 
@@ -1826,13 +2087,25 @@ mod tests {
         enqueue_file(&store, src.path(), "r.csv", b"1,2,3");
         let mut comp = completion(OnSuccess::Archive);
         comp.archive_dir = Some(archive.path().to_path_buf());
-        let worker = local_worker(store.clone(), src.path(), dst.path(), comp, RetryPolicy::default());
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            comp,
+            RetryPolicy::default(),
+        );
 
         let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
         assert_eq!(worker.process_item(&item, 100).await, ItemState::Completed);
         assert_eq!(std::fs::read(dst.path().join("r.csv")).unwrap(), b"1,2,3");
-        assert_eq!(std::fs::read(archive.path().join("r.csv")).unwrap(), b"1,2,3");
-        assert!(!src.path().join("r.csv").exists(), "source archived (moved)");
+        assert_eq!(
+            std::fs::read(archive.path().join("r.csv")).unwrap(),
+            b"1,2,3"
+        );
+        assert!(
+            !src.path().join("r.csv").exists(),
+            "source archived (moved)"
+        );
     }
 
     #[tokio::test]
@@ -1885,8 +2158,14 @@ mod tests {
         );
         let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
         assert_eq!(worker.process_item(&item, 100).await, ItemState::Retained);
-        assert_eq!(store.get(INST, "f").unwrap().unwrap().state, ItemState::Retained);
-        assert!(src.path().join("f").exists(), "retainInPlace leaves the source");
+        assert_eq!(
+            store.get(INST, "f").unwrap().unwrap().state,
+            ItemState::Retained
+        );
+        assert!(
+            src.path().join("f").exists(),
+            "retainInPlace leaves the source"
+        );
         assert_eq!(store.stats(INST).unwrap().failed, 1);
     }
 
@@ -1914,9 +2193,15 @@ mod tests {
             None,
         );
         let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
-        assert_eq!(worker.process_item(&item, 100).await, ItemState::Quarantined);
+        assert_eq!(
+            worker.process_item(&item, 100).await,
+            ItemState::Quarantined
+        );
         assert!(!src.path().join("bad.dat").exists(), "quarantined (moved)");
-        assert_eq!(std::fs::read(failed.path().join("bad.dat")).unwrap(), b"oops");
+        assert_eq!(
+            std::fs::read(failed.path().join("bad.dat")).unwrap(),
+            b"oops"
+        );
         let sidecar = failed.path().join("bad.dat.error.json");
         let json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
@@ -1956,10 +2241,19 @@ mod tests {
         assert_eq!(worker.process_item(&item, 0).await, ItemState::Failed);
         assert_eq!(store.get(INST, "f").unwrap().unwrap().attempts, 1);
         // The retry manager promotes Failed → Ready once the gate elapses (see Queue::promote_due).
-        store.set_state(INST, "f", ItemState::Ready, 1_000_000).unwrap();
+        store
+            .set_state(INST, "f", ItemState::Ready, 1_000_000)
+            .unwrap();
         // Re-claim; attempt 2 hits maxAttempts → Exhausted → Retained (default onExhausted).
-        let item = store.claim_ready(INST, 10, 1_000_000).unwrap().pop().unwrap();
-        assert_eq!(worker.process_item(&item, 1_000_000).await, ItemState::Retained);
+        let item = store
+            .claim_ready(INST, 10, 1_000_000)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            worker.process_item(&item, 1_000_000).await,
+            ItemState::Retained
+        );
     }
 
     #[tokio::test]
@@ -1973,27 +2267,53 @@ mod tests {
         std::fs::write(src.path().join("v.txt"), b"verified-src").unwrap();
         std::fs::write(dst.path().join("v.txt"), b"verified-src").unwrap();
         store.upsert_ready(INST, "v.txt", 12, 0, 1).unwrap();
-        store.set_state(INST, "v.txt", ItemState::Verified, 2).unwrap();
+        store
+            .set_state(INST, "v.txt", ItemState::Verified, 2)
+            .unwrap();
 
         // An InProgress item interrupted mid-flight: recovery must return it to Ready.
         std::fs::write(src.path().join("p.txt"), b"partial").unwrap();
         store.upsert_ready(INST, "p.txt", 7, 0, 1).unwrap();
-        store.set_state(INST, "p.txt", ItemState::InProgress, 2).unwrap();
+        store
+            .set_state(INST, "p.txt", ItemState::InProgress, 2)
+            .unwrap();
 
-        let worker = local_worker(store.clone(), src.path(), dst.path(), completion(OnSuccess::Delete), RetryPolicy::default());
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            RetryPolicy::default(),
+        );
         worker.recover(100).await.unwrap();
 
-        assert_eq!(store.get(INST, "v.txt").unwrap().unwrap().state, ItemState::Completed);
-        assert!(!src.path().join("v.txt").exists(), "verified recovery deletes the source");
-        assert_eq!(store.get(INST, "p.txt").unwrap().unwrap().state, ItemState::Ready);
+        assert_eq!(
+            store.get(INST, "v.txt").unwrap().unwrap().state,
+            ItemState::Completed
+        );
+        assert!(
+            !src.path().join("v.txt").exists(),
+            "verified recovery deletes the source"
+        );
+        assert_eq!(
+            store.get(INST, "p.txt").unwrap().unwrap().state,
+            ItemState::Ready
+        );
 
         // The re-readied InProgress item must actually be re-delivered on the next claim, exactly
         // once (idempotent re-delivery, no double-count): drive the claim→process the engine would.
         let item = store.claim_ready(INST, 10, 200).unwrap().pop().unwrap();
         assert_eq!(item.relpath, "p.txt");
         assert_eq!(worker.process_item(&item, 200).await, ItemState::Completed);
-        assert_eq!(std::fs::read(dst.path().join("p.txt")).unwrap(), b"partial", "re-delivered correctly");
-        assert!(!src.path().join("p.txt").exists(), "source deleted after re-delivery");
+        assert_eq!(
+            std::fs::read(dst.path().join("p.txt")).unwrap(),
+            b"partial",
+            "re-delivered correctly"
+        );
+        assert!(
+            !src.path().join("p.txt").exists(),
+            "source deleted after re-delivery"
+        );
         // Exactly-once across the crash: v.txt completed via recovery (+1) and p.txt via re-delivery
         // (+1) — two files, each counted once, no double-delivery.
         assert_eq!(store.stats(INST).unwrap().replicated, 2);
@@ -2009,9 +2329,17 @@ mod tests {
         std::fs::write(src.path().join("v.txt"), b"the only copy").unwrap();
         // NOTE: destination object deliberately absent (simulating a wiped mount).
         store.upsert_ready(INST, "v.txt", 13, 0, 1).unwrap();
-        store.set_state(INST, "v.txt", ItemState::Verified, 2).unwrap();
+        store
+            .set_state(INST, "v.txt", ItemState::Verified, 2)
+            .unwrap();
 
-        let worker = local_worker(store.clone(), src.path(), dst.path(), completion(OnSuccess::Delete), RetryPolicy::default());
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            RetryPolicy::default(),
+        );
         worker.recover(100).await.unwrap();
 
         assert_eq!(
@@ -2019,8 +2347,15 @@ mod tests {
             ItemState::Ready,
             "missing destination → requeue, never complete"
         );
-        assert!(src.path().join("v.txt").exists(), "source preserved — no data loss");
-        assert_eq!(store.stats(INST).unwrap().replicated, 0, "not counted as replicated");
+        assert!(
+            src.path().join("v.txt").exists(),
+            "source preserved — no data loss"
+        );
+        assert_eq!(
+            store.stats(INST).unwrap().replicated,
+            0,
+            "not counted as replicated"
+        );
     }
 
     #[tokio::test]
@@ -2061,7 +2396,9 @@ mod tests {
 
         // Seed the store as a crashed-at-Verified item WITH the checkpoint (dest key = "local").
         store.upsert_ready(INST, "v.bin", 18, 0, 1).unwrap();
-        store.set_state(INST, "v.bin", ItemState::Verified, 2).unwrap();
+        store
+            .set_state(INST, "v.bin", ItemState::Verified, 2)
+            .unwrap();
         store
             .save_resume(
                 INST,
@@ -2074,11 +2411,23 @@ mod tests {
             )
             .unwrap();
 
-        let worker = local_worker(store.clone(), src.path(), dst.path(), completion(OnSuccess::Delete), RetryPolicy::default());
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            RetryPolicy::default(),
+        );
         worker.recover(100).await.unwrap();
 
-        assert_eq!(store.get(INST, "v.bin").unwrap().unwrap().state, ItemState::Completed);
-        assert!(!src.path().join("v.bin").exists(), "checksum-verified recovery deletes the source");
+        assert_eq!(
+            store.get(INST, "v.bin").unwrap().unwrap().state,
+            ItemState::Completed
+        );
+        assert!(
+            !src.path().join("v.bin").exists(),
+            "checksum-verified recovery deletes the source"
+        );
         // Resume checkpoint cleared after Completed.
         assert!(store.load_resume(INST, "v.bin", "local").unwrap().is_none());
         assert_eq!(store.stats(INST).unwrap().replicated, 1);
@@ -2121,10 +2470,15 @@ mod tests {
 
         // Corrupt the delivered object in place: SAME length, different content (a size check passes).
         std::fs::write(dst.path().join("c.bin"), b"CORRUPTED bytes!").unwrap();
-        assert_eq!(std::fs::metadata(dst.path().join("c.bin")).unwrap().len(), 16);
+        assert_eq!(
+            std::fs::metadata(dst.path().join("c.bin")).unwrap().len(),
+            16
+        );
 
         store.upsert_ready(INST, "c.bin", 16, 0, 1).unwrap();
-        store.set_state(INST, "c.bin", ItemState::Verified, 2).unwrap();
+        store
+            .set_state(INST, "c.bin", ItemState::Verified, 2)
+            .unwrap();
         store
             .save_resume(
                 INST,
@@ -2137,7 +2491,13 @@ mod tests {
             )
             .unwrap();
 
-        let worker = local_worker(store.clone(), src.path(), dst.path(), completion(OnSuccess::Delete), RetryPolicy::default());
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            RetryPolicy::default(),
+        );
         worker.recover(100).await.unwrap();
 
         assert_eq!(
@@ -2145,8 +2505,14 @@ mod tests {
             ItemState::Ready,
             "corruption caught by checksum → requeue"
         );
-        assert!(src.path().join("c.bin").exists(), "source preserved — no data loss");
-        assert!(store.load_resume(INST, "c.bin", "local").unwrap().is_none(), "stale checkpoint cleared");
+        assert!(
+            src.path().join("c.bin").exists(),
+            "source preserved — no data loss"
+        );
+        assert!(
+            store.load_resume(INST, "c.bin", "local").unwrap().is_none(),
+            "stale checkpoint cleared"
+        );
         assert_eq!(store.stats(INST).unwrap().replicated, 0);
     }
 
@@ -2225,9 +2591,16 @@ mod tests {
         );
         let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
         assert_eq!(worker.process_item(&item, 100).await, ItemState::Retained);
-        assert_eq!(aborts.load(AtomicOrdering::SeqCst), 1, "give-up aborts the partial upload once");
+        assert_eq!(
+            aborts.load(AtomicOrdering::SeqCst),
+            1,
+            "give-up aborts the partial upload once"
+        );
         assert!(
-            store.load_resume(INST, "m.bin", "recording").unwrap().is_none(),
+            store
+                .load_resume(INST, "m.bin", "recording")
+                .unwrap()
+                .is_none(),
             "resume checkpoint cleared on give-up"
         );
     }
@@ -2267,7 +2640,10 @@ mod tests {
         let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
         assert_eq!(worker.process_item(&item, 100).await, ItemState::Failed);
         assert!(
-            store.load_resume(INST, "r.bin", "failing").unwrap().is_some(),
+            store
+                .load_resume(INST, "r.bin", "failing")
+                .unwrap()
+                .is_some(),
             "retry preserves the resume checkpoint"
         );
     }
@@ -2282,30 +2658,43 @@ mod tests {
         store
             .record_attempt(INST, "e.txt", "boom", ItemState::Exhausted, 2, 2)
             .unwrap();
-        let worker = local_worker(store.clone(), src.path(), dst.path(), completion(OnSuccess::Delete), RetryPolicy::default());
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            RetryPolicy::default(),
+        );
         worker.recover(100).await.unwrap();
         // Default on_exhausted = retainInPlace.
-        assert_eq!(store.get(INST, "e.txt").unwrap().unwrap().state, ItemState::Retained);
+        assert_eq!(
+            store.get(INST, "e.txt").unwrap().unwrap().state,
+            ItemState::Retained
+        );
     }
 
     #[tokio::test]
     async fn metrics_emitted_on_completion() {
-        // A tiny in-crate MetricService double that counts emit_metric calls.
+        // A tiny in-crate MetricService double that records emit_metric calls.
         struct CountingMetrics {
             calls: AtomicU32,
+            names: Mutex<Vec<String>>,
+            emitted: Mutex<Vec<(String, HashMap<String, f64>)>>,
         }
         #[async_trait]
-        impl MetricService for CountingMetrics {
+        impl edgecommons::metrics::MetricService for CountingMetrics {
             fn define_metric(&self, _m: edgecommons::metrics::Metric) {}
             fn is_metric_defined(&self, _n: &str) -> bool {
                 true
             }
             async fn emit_metric(
                 &self,
-                _name: &str,
-                _values: HashMap<String, f64>,
+                name: &str,
+                values: HashMap<String, f64>,
             ) -> edgecommons::Result<()> {
                 self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                self.names.lock().unwrap().push(name.to_string());
+                self.emitted.lock().unwrap().push((name.to_string(), values));
                 Ok(())
             }
             async fn emit_metric_now(
@@ -2325,9 +2714,15 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         let store = store();
         enqueue_file(&store, src.path(), "m.txt", b"metric");
+        enqueue_file(&store, src.path(), "n.txt", b"second");
         let metrics = Arc::new(CountingMetrics {
             calls: AtomicU32::new(0),
+            names: Mutex::new(Vec::new()),
+            emitted: Mutex::new(Vec::new()),
         });
+        let replicator_metrics = Arc::new(crate::metrics::ReplicatorMetrics::without_config(
+            metrics.clone(),
+        ));
         let dest: SharedDestination = Arc::new(LocalDest::new(
             &LocalEgress {
                 path: dst.path().to_path_buf(),
@@ -2343,11 +2738,37 @@ mod tests {
             src.path().to_path_buf(),
             Bandwidth::unlimited(),
             RetryPolicy::default(),
-            Some(metrics.clone()),
+            Some(replicator_metrics),
         );
-        let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
+        let item = store.claim_ready(INST, 1, 100).unwrap().pop().unwrap();
         assert_eq!(worker.process_item(&item, 100).await, ItemState::Completed);
-        assert_eq!(metrics.calls.load(AtomicOrdering::SeqCst), 1);
+        let item = store.claim_ready(INST, 1, 200).unwrap().pop().unwrap();
+        assert_eq!(worker.process_item(&item, 200).await, ItemState::Completed);
+        let names = metrics.names.lock().unwrap().clone();
+        assert!(names
+            .iter()
+            .any(|name| name == crate::metrics::LEGACY_GROUP));
+        assert!(names
+            .iter()
+            .any(|name| name == crate::metrics::TRANSFER_GROUP));
+        assert!(names
+            .iter()
+            .any(|name| name == crate::metrics::DESTINATION_GROUP));
+        assert!(
+            metrics.calls.load(AtomicOrdering::SeqCst) >= 4,
+            "legacy plus richer transfer/destination metrics are emitted"
+        );
+        let emitted = metrics.emitted.lock().unwrap().clone();
+        let legacy = emitted
+            .iter()
+            .rev()
+            .find(|(name, _)| name == crate::metrics::LEGACY_GROUP)
+            .map(|(_, values)| values)
+            .expect("legacy metric emitted");
+        assert_eq!(legacy.get("filesReplicated"), Some(&2.0));
+        assert_eq!(legacy.get("filesReplicatedInterval"), Some(&1.0));
+        assert_eq!(legacy.get("bytesReplicated"), Some(&12.0));
+        assert_eq!(legacy.get("bytesReplicatedInterval"), Some(&6.0));
     }
 
     // ---- P3 UNS event emission (the engine-wiring slice) ----------------------------------------
@@ -2387,7 +2808,10 @@ mod tests {
         let deleted = fake.events_named("FileDeleted");
         assert_eq!(deleted.len(), 1);
         assert_eq!(deleted[0].body["path"], serde_json::json!("a/b.txt"));
-        assert!(fake.events_named("FileArchived").is_empty(), "delete, not archive");
+        assert!(
+            fake.events_named("FileArchived").is_empty(),
+            "delete, not archive"
+        );
     }
 
     #[tokio::test]
@@ -2400,8 +2824,14 @@ mod tests {
         let mut comp = completion(OnSuccess::Archive);
         comp.archive_dir = Some(archive.path().to_path_buf());
         let (fake, events) = recording_events();
-        let worker = local_worker(store.clone(), src.path(), dst.path(), comp, RetryPolicy::default())
-            .with_events(events);
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            comp,
+            RetryPolicy::default(),
+        )
+        .with_events(events);
 
         let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
         assert_eq!(worker.process_item(&item, 100).await, ItemState::Completed);
@@ -2410,8 +2840,14 @@ mod tests {
         assert_eq!(archived.len(), 1);
         assert_eq!(archived[0].body["path"], serde_json::json!("r.csv"));
         let ap = archived[0].body["archivePath"].as_str().unwrap();
-        assert!(ap.ends_with("r.csv"), "archivePath points at the moved file: {ap}");
-        assert!(fake.events_named("FileDeleted").is_empty(), "archive, not delete");
+        assert!(
+            ap.ends_with("r.csv"),
+            "archivePath points at the moved file: {ap}"
+        );
+        assert!(
+            fake.events_named("FileDeleted").is_empty(),
+            "archive, not delete"
+        );
     }
 
     #[tokio::test]
@@ -2442,8 +2878,14 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].body["willRetry"], serde_json::json!(true));
         assert_eq!(failed[0].body["attempt"], serde_json::json!(1));
-        assert!(failed[0].body["error"].as_str().unwrap().contains("network"));
-        assert!(failed[0].body.get("nextAttemptAt").is_some(), "retry has a scheduled next attempt");
+        assert!(failed[0].body["error"]
+            .as_str()
+            .unwrap()
+            .contains("network"));
+        assert!(
+            failed[0].body.get("nextAttemptAt").is_some(),
+            "retry has a scheduled next attempt"
+        );
         assert!(fake.events_named("RetriesExhausted").is_empty());
     }
 
@@ -2474,17 +2916,26 @@ mod tests {
         .with_events(events);
 
         let item = store.claim_ready(INST, 10, 100).unwrap().pop().unwrap();
-        assert_eq!(worker.process_item(&item, 100).await, ItemState::Quarantined);
+        assert_eq!(
+            worker.process_item(&item, 100).await,
+            ItemState::Quarantined
+        );
 
         let exhausted = fake.events_named("RetriesExhausted");
         assert_eq!(exhausted.len(), 1);
         assert_eq!(exhausted[0].body["attempts"], serde_json::json!(1));
-        assert!(exhausted[0].body["lastError"].as_str().unwrap().contains("denied"));
+        assert!(exhausted[0].body["lastError"]
+            .as_str()
+            .unwrap()
+            .contains("denied"));
 
         let quarantined = fake.events_named("FileQuarantined");
         assert_eq!(quarantined.len(), 1);
         assert_eq!(quarantined[0].body["path"], serde_json::json!("bad.dat"));
-        assert!(quarantined[0].body["quarantinePath"].as_str().unwrap().ends_with("bad.dat"));
+        assert!(quarantined[0].body["quarantinePath"]
+            .as_str()
+            .unwrap()
+            .ends_with("bad.dat"));
         // A permanent failure never rides the retry path.
         assert!(fake.events_named("ReplicationFailed").is_empty());
     }
@@ -2537,7 +2988,11 @@ mod tests {
         let denied = fake.events_named("PermissionDenied");
         assert_eq!(denied.len(), 1);
         assert_eq!(denied[0].body["role"], serde_json::json!("egress"));
-        assert_eq!(denied[0].body["path"], serde_json::json!("failing"), "keyed on the destination label");
+        assert_eq!(
+            denied[0].body["path"],
+            serde_json::json!("failing"),
+            "keyed on the destination label"
+        );
         assert!(denied[0].body["error"].as_str().unwrap().contains("denied"));
         // The existing permanent-failure path is unchanged: still exhausted.
         assert_eq!(fake.events_named("RetriesExhausted").len(), 1);
@@ -2569,6 +3024,7 @@ mod tests {
             retry: RetryPolicy::default(),
             verify_policy: Verify::Checksum,
             events: events.clone(),
+            metrics: None,
             now,
             attempts_so_far: 0,
             rng: Arc::new(Mutex::new(StdRng::from_entropy())),
@@ -2618,6 +3074,7 @@ mod tests {
                 retry: RetryPolicy::default(),
                 verify_policy: Verify::Checksum,
                 events: events.clone(),
+                metrics: None,
                 now,
                 attempts_so_far: 0,
                 rng: Arc::new(Mutex::new(StdRng::from_entropy())),
@@ -2657,7 +3114,10 @@ mod tests {
         assert_eq!(worker.process_item(&item, 100).await, ItemState::Completed);
 
         let progress = fake.events_named("ReplicationProgress");
-        assert!(!progress.is_empty(), "a multi-checkpoint transfer emits progress");
+        assert!(
+            !progress.is_empty(),
+            "a multi-checkpoint transfer emits progress"
+        );
         let p0 = &progress[0].body;
         assert_eq!(p0["path"], serde_json::json!("big.bin"));
         assert_eq!(p0["destination"], serde_json::json!("local"));
@@ -2691,14 +3151,34 @@ mod tests {
         assert_eq!(worker.process_item(&item, 100).await, ItemState::Completed);
 
         let progress = fake.events_named("ReplicationProgress");
-        assert!(progress.len() >= 2, "at least the 0% and 100% endpoints, got {}", progress.len());
-        assert!(progress.len() <= 50, "still throttled, not one per chunk (got {})", progress.len());
-        let percents: Vec<f64> =
-            progress.iter().filter_map(|m| m.body["percent"].as_f64()).collect();
-        assert!(percents.contains(&0.0), "the 0% endpoint is emitted (got {percents:?})");
-        assert!(percents.contains(&100.0), "the 100% endpoint is emitted (got {percents:?})");
+        assert!(
+            progress.len() >= 2,
+            "at least the 0% and 100% endpoints, got {}",
+            progress.len()
+        );
+        assert!(
+            progress.len() <= 50,
+            "still throttled, not one per chunk (got {})",
+            progress.len()
+        );
+        let percents: Vec<f64> = progress
+            .iter()
+            .filter_map(|m| m.body["percent"].as_f64())
+            .collect();
+        assert!(
+            percents.contains(&0.0),
+            "the 0% endpoint is emitted (got {percents:?})"
+        );
+        assert!(
+            percents.contains(&100.0),
+            "the 100% endpoint is emitted (got {percents:?})"
+        );
         let last = progress.last().unwrap();
-        assert_eq!(last.body["percent"], serde_json::json!(100.0), "final progress is 100%");
+        assert_eq!(
+            last.body["percent"],
+            serde_json::json!(100.0),
+            "final progress is 100%"
+        );
         assert_eq!(last.body["bytesDone"].as_u64().unwrap(), big.len() as u64);
     }
 
@@ -2785,7 +3265,11 @@ mod tests {
         ) -> ReplResult<()> {
             self.inner.verify(item, delivered, policy).await
         }
-        async fn abort(&self, item: &WorkItem, resume: &crate::domain::ResumeState) -> ReplResult<()> {
+        async fn abort(
+            &self,
+            item: &WorkItem,
+            resume: &crate::domain::ResumeState,
+        ) -> ReplResult<()> {
             self.inner.abort(item, resume).await
         }
     }
@@ -2813,10 +3297,22 @@ mod tests {
         let state = worker.process_item(&item, 100).await;
 
         assert_eq!(state, ItemState::Completed);
-        assert_eq!(std::fs::read(dst_a.path().join("f.txt")).unwrap(), b"fan-out payload");
-        assert_eq!(std::fs::read(dst_b.path().join("f.txt")).unwrap(), b"fan-out payload");
-        assert!(!src.path().join("f.txt").exists(), "source deleted only after BOTH destinations verify");
-        assert_eq!(store.get(INST, "f.txt").unwrap().unwrap().state, ItemState::Completed);
+        assert_eq!(
+            std::fs::read(dst_a.path().join("f.txt")).unwrap(),
+            b"fan-out payload"
+        );
+        assert_eq!(
+            std::fs::read(dst_b.path().join("f.txt")).unwrap(),
+            b"fan-out payload"
+        );
+        assert!(
+            !src.path().join("f.txt").exists(),
+            "source deleted only after BOTH destinations verify"
+        );
+        assert_eq!(
+            store.get(INST, "f.txt").unwrap().unwrap().state,
+            ItemState::Completed
+        );
         // The completion action (source delete + the `replicated` counter) fires EXACTLY ONCE — not
         // once per destination.
         assert_eq!(store.stats(INST).unwrap().replicated, 1);
@@ -2855,19 +3351,35 @@ mod tests {
             ItemState::Retained,
             "one destination permanently exhausted -> the item can never complete"
         );
-        assert!(src.path().join("f.txt").exists(), "source retained, not deleted");
+        assert!(
+            src.path().join("f.txt").exists(),
+            "source retained, not deleted"
+        );
         assert_eq!(
             std::fs::read(dst_a.path().join("f.txt")).unwrap(),
             b"payload",
             "the destination that DID succeed keeps its delivered data"
         );
-        assert_eq!(store.get(INST, "f.txt").unwrap().unwrap().state, ItemState::Retained);
+        assert_eq!(
+            store.get(INST, "f.txt").unwrap().unwrap().state,
+            ItemState::Retained
+        );
         assert_eq!(store.stats(INST).unwrap().failed, 1);
         assert_eq!(store.stats(INST).unwrap().replicated, 0);
         let states = store.dest_states(INST, "f.txt").unwrap();
-        let local = states.iter().find(|d| d.dest == "local").expect("local dest row exists");
-        assert_eq!(local.phase, DestPhase::Verified, "the succeeded destination stays Verified");
-        let failed = states.iter().find(|d| d.dest == "failing").expect("failing dest row exists");
+        let local = states
+            .iter()
+            .find(|d| d.dest == "local")
+            .expect("local dest row exists");
+        assert_eq!(
+            local.phase,
+            DestPhase::Verified,
+            "the succeeded destination stays Verified"
+        );
+        let failed = states
+            .iter()
+            .find(|d| d.dest == "failing")
+            .expect("failing dest row exists");
         assert_eq!(failed.phase, DestPhase::Exhausted);
     }
 
@@ -2903,12 +3415,19 @@ mod tests {
             updated_at: 0,
         };
         let delivered_a = dest_a_backend
-            .deliver(&seed_item, None, &ProgressSink::noop(), &Bandwidth::unlimited())
+            .deliver(
+                &seed_item,
+                None,
+                &ProgressSink::noop(),
+                &Bandwidth::unlimited(),
+            )
             .await
             .unwrap();
 
         store.upsert_ready(INST, "f.txt", 7, 0, 1).unwrap();
-        store.set_state(INST, "f.txt", ItemState::InProgress, 2).unwrap();
+        store
+            .set_state(INST, "f.txt", ItemState::InProgress, 2)
+            .unwrap();
         store
             .save_resume(
                 INST,
@@ -2920,7 +3439,9 @@ mod tests {
                 },
             )
             .unwrap();
-        store.set_dest_phase(INST, "f.txt", "local", DestPhase::Verified, 2).unwrap();
+        store
+            .set_dest_phase(INST, "f.txt", "local", DestPhase::Verified, 2)
+            .unwrap();
         // No dest_state row at all for "counting" — implicitly Pending.
 
         let counting = CountingDest::new(dst_b.path());
@@ -2939,7 +3460,10 @@ mod tests {
         // Crash recovery: the aggregate item was InProgress → reverts to Ready. Per-destination
         // bookkeeping (the "local" DestPhase::Verified row) is untouched by an InProgress recovery.
         worker.recover(100).await.unwrap();
-        assert_eq!(store.get(INST, "f.txt").unwrap().unwrap().state, ItemState::Ready);
+        assert_eq!(
+            store.get(INST, "f.txt").unwrap().unwrap().state,
+            ItemState::Ready
+        );
 
         // Re-claim and process: must re-deliver ONLY to "counting" (the unverified destination) — the
         // already-`Verified` "local" destination is skipped entirely (no re-delivery).
@@ -2952,9 +3476,16 @@ mod tests {
             1,
             "only the unverified destination is (re-)delivered"
         );
-        assert_eq!(std::fs::read(dst_b.path().join("f.txt")).unwrap(), b"payload");
+        assert_eq!(
+            std::fs::read(dst_b.path().join("f.txt")).unwrap(),
+            b"payload"
+        );
         assert!(!src.path().join("f.txt").exists());
-        assert_eq!(store.stats(INST).unwrap().replicated, 1, "completes exactly once");
+        assert_eq!(
+            store.stats(INST).unwrap().replicated,
+            1,
+            "completes exactly once"
+        );
     }
 
     #[tokio::test]
@@ -2992,14 +3523,28 @@ mod tests {
             .record_dest_attempt(INST, "f.txt", "ay", "earlier", DestPhase::Pending, 0, 1)
             .unwrap();
         store
-            .record_dest_attempt(INST, "f.txt", "bee", "earlier", DestPhase::Pending, 5_000, 1)
+            .record_dest_attempt(
+                INST,
+                "f.txt",
+                "bee",
+                "earlier",
+                DestPhase::Pending,
+                5_000,
+                1,
+            )
             .unwrap();
-        store.set_state(INST, "f.txt", ItemState::InProgress, 1).unwrap();
+        store
+            .set_state(INST, "f.txt", ItemState::InProgress, 1)
+            .unwrap();
 
         let item = store.get(INST, "f.txt").unwrap().unwrap();
         assert_eq!(worker.process_item(&item, 1_000).await, ItemState::Failed);
 
-        assert_eq!(a_calls.load(AtomicOrdering::SeqCst), 1, "the due destination is attempted");
+        assert_eq!(
+            a_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "the due destination is attempted"
+        );
         assert_eq!(
             b_calls.load(AtomicOrdering::SeqCst),
             0,
@@ -3013,20 +3558,46 @@ mod tests {
         let states = store.dest_states(INST, "f.txt").unwrap();
         let bee = states.iter().find(|d| d.dest == "bee").unwrap();
         assert_eq!(bee.phase, DestPhase::Pending);
-        assert_eq!(bee.next_attempt_at, 5_000, "not-due destination's backoff clock untouched");
-        assert_eq!(bee.attempts, 1, "not-due destination's attempt count not inflated");
+        assert_eq!(
+            bee.next_attempt_at, 5_000,
+            "not-due destination's backoff clock untouched"
+        );
+        assert_eq!(
+            bee.attempts, 1,
+            "not-due destination's attempt count not inflated"
+        );
         let ay = states.iter().find(|d| d.dest == "ay").unwrap();
-        assert_eq!(ay.phase, DestPhase::Verified, "the attempted destination delivered + verified");
+        assert_eq!(
+            ay.phase,
+            DestPhase::Verified,
+            "the attempted destination delivered + verified"
+        );
 
         // Once B's clock elapses it is attempted and the item completes exactly once; A (already
         // Verified) is never re-delivered.
-        store.set_state(INST, "f.txt", ItemState::InProgress, 6_000).unwrap();
+        store
+            .set_state(INST, "f.txt", ItemState::InProgress, 6_000)
+            .unwrap();
         let item = store.get(INST, "f.txt").unwrap().unwrap();
-        assert_eq!(worker.process_item(&item, 6_000).await, ItemState::Completed);
-        assert_eq!(a_calls.load(AtomicOrdering::SeqCst), 1, "already-Verified destination never re-delivered");
-        assert_eq!(b_calls.load(AtomicOrdering::SeqCst), 1, "the now-due destination delivered");
+        assert_eq!(
+            worker.process_item(&item, 6_000).await,
+            ItemState::Completed
+        );
+        assert_eq!(
+            a_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "already-Verified destination never re-delivered"
+        );
+        assert_eq!(
+            b_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "the now-due destination delivered"
+        );
         assert_eq!(store.stats(INST).unwrap().replicated, 1);
-        assert!(!src.path().join("f.txt").exists(), "source released only after BOTH verify");
+        assert!(
+            !src.path().join("f.txt").exists(),
+            "source released only after BOTH verify"
+        );
     }
 
     #[tokio::test]
@@ -3046,7 +3617,10 @@ mod tests {
         // Deliver to A for real to capture a genuine Verified checkpoint (checksum), then corrupt A's
         // object in place (same length, different bytes — only a checksum re-verify catches it).
         let a_backend = LocalDest::new(
-            &LocalEgress { path: dst_a.path().to_path_buf(), fsync: false },
+            &LocalEgress {
+                path: dst_a.path().to_path_buf(),
+                fsync: false,
+            },
             Algorithm::Crc32c,
         );
         let seed_item = WorkItem {
@@ -3063,13 +3637,20 @@ mod tests {
             updated_at: 0,
         };
         let delivered_a = a_backend
-            .deliver(&seed_item, None, &ProgressSink::noop(), &Bandwidth::unlimited())
+            .deliver(
+                &seed_item,
+                None,
+                &ProgressSink::noop(),
+                &Bandwidth::unlimited(),
+            )
             .await
             .unwrap();
         std::fs::write(dst_a.path().join("f.txt"), b"CORRUPT").unwrap(); // 7 bytes, wrong content
 
         store.upsert_ready(INST, "f.txt", 7, 0, 1).unwrap();
-        store.set_state(INST, "f.txt", ItemState::InProgress, 2).unwrap();
+        store
+            .set_state(INST, "f.txt", ItemState::InProgress, 2)
+            .unwrap();
         store
             .save_resume(
                 INST,
@@ -3081,7 +3662,9 @@ mod tests {
                 },
             )
             .unwrap();
-        store.set_dest_phase(INST, "f.txt", "ay", DestPhase::Verified, 2).unwrap();
+        store
+            .set_dest_phase(INST, "f.txt", "ay", DestPhase::Verified, 2)
+            .unwrap();
         // No dest_state row for "bee" — implicitly Pending.
 
         let a = CountingDest::named("ay", dst_a.path());
@@ -3102,28 +3685,53 @@ mod tests {
         // Recovery: InProgress → re-verify A's prior-session Verified phase. The corrupted object fails
         // re-verification → A is demoted to Pending, its stale checkpoint cleared, item re-readied.
         worker.recover(100).await.unwrap();
-        assert_eq!(store.get(INST, "f.txt").unwrap().unwrap().state, ItemState::Ready);
+        assert_eq!(
+            store.get(INST, "f.txt").unwrap().unwrap().state,
+            ItemState::Ready
+        );
         let ay = store
             .dest_states(INST, "f.txt")
             .unwrap()
             .into_iter()
             .find(|d| d.dest == "ay")
             .unwrap();
-        assert_eq!(ay.phase, DestPhase::Pending, "corrupted prior-session Verified destination demoted");
-        assert!(store.load_resume(INST, "f.txt", "ay").unwrap().is_none(), "stale checkpoint cleared");
-        assert_eq!(a_calls.load(AtomicOrdering::SeqCst), 0, "recovery re-verifies, never re-delivers");
+        assert_eq!(
+            ay.phase,
+            DestPhase::Pending,
+            "corrupted prior-session Verified destination demoted"
+        );
+        assert!(
+            store.load_resume(INST, "f.txt", "ay").unwrap().is_none(),
+            "stale checkpoint cleared"
+        );
+        assert_eq!(
+            a_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "recovery re-verifies, never re-delivers"
+        );
 
         // Next claim re-delivers BOTH (A because it was demoted): completes only after both truly verify.
         let item = store.claim_ready(INST, 10, 200).unwrap().pop().unwrap();
         assert_eq!(worker.process_item(&item, 200).await, ItemState::Completed);
-        assert_eq!(a_calls.load(AtomicOrdering::SeqCst), 1, "the demoted destination is re-delivered (copy healed)");
-        assert_eq!(b_calls.load(AtomicOrdering::SeqCst), 1, "the pending destination delivered");
+        assert_eq!(
+            a_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "the demoted destination is re-delivered (copy healed)"
+        );
+        assert_eq!(
+            b_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "the pending destination delivered"
+        );
         assert_eq!(
             std::fs::read(dst_a.path().join("f.txt")).unwrap(),
             b"payload",
             "A's corrupted object replaced with the correct bytes — no silent data loss"
         );
-        assert!(!src.path().join("f.txt").exists(), "source released only after both truly verified");
+        assert!(
+            !src.path().join("f.txt").exists(),
+            "source released only after both truly verified"
+        );
         assert_eq!(store.stats(INST).unwrap().replicated, 1);
     }
 
@@ -3142,7 +3750,10 @@ mod tests {
         // A: deliver for real → genuine object + checkpoint. B: seed a Verified checkpoint but leave its
         // object ABSENT (a wiped mount), so B's re-verify fails while A's passes.
         let a_backend = LocalDest::new(
-            &LocalEgress { path: dst_a.path().to_path_buf(), fsync: false },
+            &LocalEgress {
+                path: dst_a.path().to_path_buf(),
+                fsync: false,
+            },
             Algorithm::Crc32c,
         );
         let seed_item = WorkItem {
@@ -3159,7 +3770,12 @@ mod tests {
             updated_at: 0,
         };
         let delivered_a = a_backend
-            .deliver(&seed_item, None, &ProgressSink::noop(), &Bandwidth::unlimited())
+            .deliver(
+                &seed_item,
+                None,
+                &ProgressSink::noop(),
+                &Bandwidth::unlimited(),
+            )
             .await
             .unwrap();
         let fake_b = Delivered {
@@ -3169,7 +3785,9 @@ mod tests {
         };
 
         store.upsert_ready(INST, "f.txt", 7, 0, 1).unwrap();
-        store.set_state(INST, "f.txt", ItemState::Verified, 2).unwrap();
+        store
+            .set_state(INST, "f.txt", ItemState::Verified, 2)
+            .unwrap();
         store
             .save_resume(
                 INST,
@@ -3181,7 +3799,9 @@ mod tests {
                 },
             )
             .unwrap();
-        store.set_dest_phase(INST, "f.txt", "ay", DestPhase::Verified, 2).unwrap();
+        store
+            .set_dest_phase(INST, "f.txt", "ay", DestPhase::Verified, 2)
+            .unwrap();
         store
             .save_resume(
                 INST,
@@ -3193,7 +3813,9 @@ mod tests {
                 },
             )
             .unwrap();
-        store.set_dest_phase(INST, "f.txt", "bee", DestPhase::Verified, 2).unwrap();
+        store
+            .set_dest_phase(INST, "f.txt", "bee", DestPhase::Verified, 2)
+            .unwrap();
 
         let a = CountingDest::named("ay", dst_a.path());
         let b = CountingDest::named("bee", dst_b.path());
@@ -3214,24 +3836,56 @@ mod tests {
 
         // A re-verified clean (stays Verified, checkpoint intact); B failed → demoted, checkpoint cleared;
         // the aggregate item reverted to Ready. Neither destination was re-delivered during recovery.
-        assert_eq!(store.get(INST, "f.txt").unwrap().unwrap().state, ItemState::Ready);
+        assert_eq!(
+            store.get(INST, "f.txt").unwrap().unwrap().state,
+            ItemState::Ready
+        );
         let states = store.dest_states(INST, "f.txt").unwrap();
         let ay = states.iter().find(|d| d.dest == "ay").unwrap();
-        assert_eq!(ay.phase, DestPhase::Verified, "the intact destination stays Verified (not re-delivered)");
+        assert_eq!(
+            ay.phase,
+            DestPhase::Verified,
+            "the intact destination stays Verified (not re-delivered)"
+        );
         let bee = states.iter().find(|d| d.dest == "bee").unwrap();
-        assert_eq!(bee.phase, DestPhase::Pending, "the lost destination is demoted");
-        assert!(store.load_resume(INST, "f.txt", "ay").unwrap().is_some(), "A's checkpoint preserved");
-        assert!(store.load_resume(INST, "f.txt", "bee").unwrap().is_none(), "B's stale checkpoint cleared");
+        assert_eq!(
+            bee.phase,
+            DestPhase::Pending,
+            "the lost destination is demoted"
+        );
+        assert!(
+            store.load_resume(INST, "f.txt", "ay").unwrap().is_some(),
+            "A's checkpoint preserved"
+        );
+        assert!(
+            store.load_resume(INST, "f.txt", "bee").unwrap().is_none(),
+            "B's stale checkpoint cleared"
+        );
         assert_eq!(a_calls.load(AtomicOrdering::SeqCst), 0);
         assert_eq!(b_calls.load(AtomicOrdering::SeqCst), 0);
 
         // The next claim re-delivers ONLY B (A is skipped) and completes exactly once.
         let item = store.claim_ready(INST, 10, 200).unwrap().pop().unwrap();
         assert_eq!(worker.process_item(&item, 200).await, ItemState::Completed);
-        assert_eq!(a_calls.load(AtomicOrdering::SeqCst), 0, "already-Verified destination never re-delivered");
-        assert_eq!(b_calls.load(AtomicOrdering::SeqCst), 1, "only the requeued destination is re-delivered");
-        assert_eq!(std::fs::read(dst_b.path().join("f.txt")).unwrap(), b"payload");
+        assert_eq!(
+            a_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "already-Verified destination never re-delivered"
+        );
+        assert_eq!(
+            b_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "only the requeued destination is re-delivered"
+        );
+        assert_eq!(
+            std::fs::read(dst_b.path().join("f.txt")).unwrap(),
+            b"payload"
+        );
         assert!(!src.path().join("f.txt").exists());
-        assert_eq!(store.stats(INST).unwrap().replicated, 1, "completes exactly once");
+        assert_eq!(
+            store.stats(INST).unwrap().replicated,
+            1,
+            "completes exactly once"
+        );
     }
 }

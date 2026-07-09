@@ -174,3 +174,10 @@ Commands and events ride the edgecommons UNS core: `ecv1/{device}/FileReplicator
 UNS `state` class is reserved to the library's own RUNNING/STOPPED keepalive, and a dashboard wanting an
 instance's current picture calls `get-status` (a `cmd` verb) instead — which is what a late-connecting
 subscriber always had to fall back to anyway.
+
+Metrics ride the library-owned `metric` class through `gg.metrics()`. The compatibility
+`fileReplicator` group keeps durable cumulative counters (`filesReplicated`, `bytesReplicated`,
+`filesFailed`) plus per-completion `*Interval` deltas, while the richer groups describe discovery,
+queue/backlog, transfer outcomes, destination health, and schedule gating. Metric dimensions are bounded
+for CloudWatch (`instance`, `destinationType`, `result`, `mode`, `readinessStrategy`); filenames, paths,
+object keys, bucket names, endpoint URLs, and raw errors stay in events, logs, and `get-status`.

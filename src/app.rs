@@ -21,6 +21,7 @@ use crate::control::{ControlPlane, InstanceControl};
 use crate::dest::DestDeps;
 use crate::events::{Event, Events};
 use crate::instance::{now_ms, Instance};
+use crate::metrics::{MetricValues, ReplicatorMetrics};
 use crate::ratelimit::{parse_byte_rate, SystemClock, TokenBucket};
 use crate::state::{SqliteStore, StateStore};
 
@@ -46,6 +47,15 @@ fn dedup_instance_ids(cfgs: Vec<InstanceCfg>) -> (Vec<InstanceCfg>, Vec<String>)
 const DEFAULT_GLOBAL_SLOTS: usize = 64;
 /// The durable state DB filename, created under the component's working directory.
 const STATE_DB_FILE: &str = "file-replicator-state.db";
+
+fn readiness_strategy_name(readiness: &config::ReadinessCfg) -> &'static str {
+    match readiness {
+        config::ReadinessCfg::Stability(_) => "stability",
+        config::ReadinessCfg::Marker(_) => "marker",
+        config::ReadinessCfg::Rename => "rename",
+        config::ReadinessCfg::Glob(_) => "glob",
+    }
+}
 
 /// The component's parsed configuration and service handles.
 pub struct App {
@@ -113,16 +123,14 @@ impl App {
             .unwrap_or(0);
         let global_bw = Arc::new(TokenBucket::new(global_rate, Arc::new(SystemClock)));
 
-        // Define the completion/failure metric once; instances emit against it (undefined metrics are
-        // ignored by the library, so a metric-less target is harmless).
-        self.metrics.define_metric(
-            MetricBuilder::create("fileReplicator")
-                .with_config(&self.config)
-                .add_measure("filesReplicated", "Count", 60)
-                .add_measure("bytesReplicated", "Bytes", 60)
-                .add_measure("filesFailed", "Count", 60)
-                .build(),
-        );
+        // Define the compatibility metric plus the richer File Replicator groups. The richer groups
+        // carry bounded, CloudWatch-friendly dimensions at emit time via `ReplicatorMetrics`.
+        let replicator_metrics = Arc::new(ReplicatorMetrics::new(
+            self.metrics.clone(),
+            self.config.clone(),
+        ));
+        replicator_metrics.define_legacy();
+        replicator_metrics.define_static_groups();
 
         // Reject duplicate instance ids up front: all durable state is keyed by (id, relpath), so two
         // instances sharing an id would clobber each other's work rows/stats/activation and silently
@@ -158,7 +166,9 @@ impl App {
         // absent on some platforms, in which case every `events()`/`commands()` call below degrades to
         // a no-op (or is simply never registered) and the P1/P2 engine runs unchanged (DESIGN §6).
         if gg.messaging().is_err() {
-            tracing::warn!("messaging unavailable; UNS control/event plane disabled (engine runs normally)");
+            tracing::warn!(
+                "messaging unavailable; UNS control/event plane disabled (engine runs normally)"
+            );
         }
         // The component-level ("main" instance) event emitter — `ComponentReady` and the control
         // plane's scope-`"all"` `ScheduleTriggered` (crate::control module docs).
@@ -196,6 +206,22 @@ impl App {
             // `PermissionDenied` event, regardless of what the policy then does with it.
             let policy = config::resolve_permission_policy(&cfg, &global);
             let violations = crate::permission::validate_instance(&cfg);
+            if !violations.is_empty() {
+                replicator_metrics
+                    .emit_discovery(
+                        &id,
+                        readiness_strategy_name(&cfg.ingress.readiness),
+                        MetricValues::new()
+                            .add("scanCount", 0.0)
+                            .add("scanDurationMs", 0.0)
+                            .add("filesDiscovered", 0.0)
+                            .add("filesReady", 0.0)
+                            .add("filesIgnored", 0.0)
+                            .add("scanErrors", violations.len() as f64)
+                            .add("permissionDenied", violations.len() as f64),
+                    )
+                    .await;
+            }
             for v in &violations {
                 tracing::error!(
                     instance = %id, path = %v.path.display(), role = v.role.as_str(), error = %v.msg,
@@ -237,7 +263,9 @@ impl App {
                         id: id.clone(),
                         reason: violations
                             .iter()
-                            .map(|v| format!("{}: {} ({})", v.role.as_str(), v.path.display(), v.msg))
+                            .map(|v| {
+                                format!("{}: {} ({})", v.role.as_str(), v.path.display(), v.msg)
+                            })
                             .collect::<Vec<_>>()
                             .join("; "),
                         role: first.role.as_str().to_string(),
@@ -257,7 +285,7 @@ impl App {
                 store.clone(),
                 global_gate.clone(),
                 global_bw.clone(),
-                Some(self.metrics.clone()),
+                Some(replicator_metrics.clone()),
                 &deps,
                 events,
             ) {
@@ -277,7 +305,9 @@ impl App {
                     let run_inst = inst.clone();
                     handles.push(tokio::spawn(async move { run_inst.run(child).await }));
                 }
-                Err(e) => tracing::error!(instance = %id, error = %e, "failed to build instance; skipping"),
+                Err(e) => {
+                    tracing::error!(instance = %id, error = %e, "failed to build instance; skipping")
+                }
             }
         }
 
@@ -296,8 +326,13 @@ impl App {
         // verb used to (see `crate::control` module docs). No-op when no messaging transport was wired
         // (`gg.commands()` is then `None` — DESIGN §6).
         let control = Arc::new(
-            ControlPlane::new(self.config.clone(), store.clone(), control_instances, main_events.clone())
-                .with_disabled(disabled_infos),
+            ControlPlane::new(
+                self.config.clone(),
+                store.clone(),
+                control_instances,
+                main_events.clone(),
+            )
+            .with_disabled(disabled_infos),
         );
         if let Some(commands) = gg.commands() {
             control.clone().register(&commands);
@@ -370,9 +405,15 @@ mod tests {
         assert!(conns[0].connected, "an existing dir reports connected");
         assert_eq!(conns[0].detail, Some(present.display().to_string()));
         assert_eq!(conns[1].instance, "gone");
-        assert!(!conns[1].connected, "a missing source dir reports disconnected");
+        assert!(
+            !conns[1].connected,
+            "a missing source dir reports disconnected"
+        );
     }
-    use crate::config::{EgressCfg, IngressCfg, LocalEgress, ScheduleCfg};
+    use crate::config::{
+        EgressCfg, GlobReadiness, IngressCfg, LocalEgress, MarkerReadiness, ReadinessCfg,
+        ScheduleCfg,
+    };
 
     fn cfg(id: &str, path: &str) -> InstanceCfg {
         InstanceCfg {
@@ -410,7 +451,11 @@ mod tests {
         // First "a" (ingress /1) and "b" survive; the later "a"s are dropped.
         let kept_ids: Vec<&str> = kept.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(kept_ids, vec!["a", "b"]);
-        assert_eq!(kept[0].ingress.path, std::path::PathBuf::from("/1"), "first occurrence kept");
+        assert_eq!(
+            kept[0].ingress.path,
+            std::path::PathBuf::from("/1"),
+            "first occurrence kept"
+        );
         assert_eq!(dropped, vec!["a".to_string(), "a".to_string()]);
     }
 
@@ -426,6 +471,22 @@ mod tests {
         let (kept, dropped) = dedup_instance_ids(vec![]);
         assert!(kept.is_empty());
         assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn readiness_strategy_name_is_bounded() {
+        assert_eq!(readiness_strategy_name(&ReadinessCfg::default()), "stability");
+        assert_eq!(
+            readiness_strategy_name(&ReadinessCfg::Marker(MarkerReadiness {
+                suffix: ".ready".into()
+            })),
+            "marker"
+        );
+        assert_eq!(readiness_strategy_name(&ReadinessCfg::Rename), "rename");
+        assert_eq!(
+            readiness_strategy_name(&ReadinessCfg::Glob(GlobReadiness { ready: vec![] })),
+            "glob"
+        );
     }
 
     // ---- Feature A: the same startup-validation composition `App::run`'s per-instance loop uses -----
@@ -487,17 +548,22 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
         let mut clean = cfg("ok", src.path().to_str().unwrap());
-        clean.egress = vec![crate::config::EgressCfg::Local(crate::config::LocalEgress {
-            path: dst.path().to_path_buf(),
-            fsync: false,
-        })];
+        clean.egress = vec![crate::config::EgressCfg::Local(
+            crate::config::LocalEgress {
+                path: dst.path().to_path_buf(),
+                fsync: false,
+            },
+        )];
         for policy in [
             PermissionPolicy::DisableInstance,
             PermissionPolicy::Fatal,
             PermissionPolicy::Retain,
         ] {
             clean.on_permission_error = Some(policy);
-            assert_eq!(outcome_for(&clean, &config::GlobalCfg::default()), PolicyOutcome::Start);
+            assert_eq!(
+                outcome_for(&clean, &config::GlobalCfg::default()),
+                PolicyOutcome::Start
+            );
         }
     }
 
@@ -513,7 +579,10 @@ mod tests {
             .iter()
             .filter(|c| outcome_for(c, &global) == PolicyOutcome::Start)
             .count();
-        assert_eq!(started, 0, "an all-inaccessible instance set starts nothing");
+        assert_eq!(
+            started, 0,
+            "an all-inaccessible instance set starts nothing"
+        );
     }
 
     #[test]

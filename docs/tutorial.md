@@ -9,7 +9,7 @@ and query live status on demand. No cloud account required: this uses the built-
 - A Rust toolchain (stable) — build from the repo root with `cargo`.
 - A local MQTT broker on `localhost:1883` for the event/command plane
   (`docker run -d -p 1883:1883 emqx/emqx`). Replication itself is filesystem work and would run without a
-  broker, but the broker is what lets you *watch* events and call `get-status` in steps 5–6.
+  broker, but the broker is what lets you *watch* events/metrics and call `get-status` in steps 5–7.
 
 The default build features are `standalone` + `dest-s3`; the `local` destination is always compiled in, so
 a plain `cargo run` is all you need for this walkthrough (no destination feature flags).
@@ -87,7 +87,23 @@ disagree. The full catalog — every `type`, its severity, and its `context` fie
 [messaging interface reference](reference/messaging-interface.md) and
 [data-types reference](reference/data-types.md).
 
-## 6. Ask for status on demand
+## 6. Watch replication metrics
+
+The component emits metrics through the library-owned UNS `metric` class when `metricEmission.target`
+routes them to messaging:
+
+```bash
+mosquitto_sub -t 'ecv1/+/FileReplicator/+/metric/#' -v
+```
+
+The tutorial config emits the compatibility `fileReplicator` group plus richer operational groups such as
+`FileReplicatorTransfer`, `FileReplicatorQueue`, and `FileReplicatorDiscovery`. The compatibility
+`filesReplicated`, `bytesReplicated`, and `filesFailed` measures are durable cumulative totals; the
+`*Interval` measures are per-completion deltas for CloudWatch `Sum` views. Rich groups use bounded
+dimensions like `instance`, `destinationType`, `result`, and `readinessStrategy` rather than paths,
+filenames, bucket names, or raw errors.
+
+## 7. Ask for status on demand
 
 There is no retained state snapshot; the current picture is a request/reply command. Send a protobuf
 EdgeCommons command envelope to the `main` command inbox with `header.name = "get-status"` and a
@@ -108,7 +124,7 @@ summary. Use a request body of `{"instance":"spool-to-archive"}` to get that one
 (`awaiting`/`inProgress`/`replicated`/`failed` tallies). Both shapes are specified in the
 [data-types reference](reference/data-types.md).
 
-## 7. Where to next
+## 8. Where to next
 
 - Change the destination to S3, SFTP, HTTP, Azure, or GCS — [How-to guides](how-to-guides.md) and
   [Sample configurations](sample-configurations.md).
