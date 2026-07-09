@@ -262,8 +262,7 @@ dimensions and belong in events or `get-status`.
 
 The main groups are `FileReplicatorDiscovery`, `FileReplicatorQueue`, `FileReplicatorTransfer`,
 `FileReplicatorDestination`, and `FileReplicatorSchedule`. See
-[Reference › Messaging interface](reference/messaging-interface.md#metrics--library-owned) for the full
-measure list.
+[Reference - Metrics](reference/metrics.md) for the full measure list.
 
 ## 10. Per-platform (HOST / GREENGRASS / KUBERNETES)
 

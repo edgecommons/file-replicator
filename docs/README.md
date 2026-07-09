@@ -21,6 +21,7 @@ unified namespace for realtime UIs. Runs standalone (**HOST**), on **Greengrass*
 | Copy a complete, annotated config | [Sample configurations](sample-configurations.md) |
 | Understand the design & concepts | [Explanation](explanation.md) |
 | Look up every config field | [Reference › Configuration](reference/configuration.md) |
-| Integrate with control/events/metrics | [Reference › Messaging interface](reference/messaging-interface.md) |
+| Integrate with control/events | [Reference › Messaging interface](reference/messaging-interface.md) |
+| Interpret emitted metrics | [Reference › Metrics](reference/metrics.md) |
 | Compare destination backends + every field | [Reference › Destinations](reference/destinations.md) |
 | Parse `get-status` + event `context` payloads | [Reference › Data types](reference/data-types.md) |

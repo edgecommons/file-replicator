@@ -16,7 +16,7 @@ The component owns the `component` section (`component.global` + `component.inst
 `FileReplicatorDestination`, and `FileReplicatorSchedule` groups. With `target: "messaging"`, the
 library publishes to the reserved UNS `metric` class (`ecv1/{device}/FileReplicator/main/metric/{name}`);
 with CloudWatch or Prometheus, the same group names and bounded dimensions are used there. See
-[Reference › Messaging interface](messaging-interface.md#metrics--library-owned).
+[Reference - Metrics](metrics.md).
 
 ## `component.global`
 | Key | Type | Default | Notes |
