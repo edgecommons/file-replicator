@@ -14,7 +14,7 @@ The component owns the `component` section (`component.global` + `component.inst
 `metricEmission` routes the compatibility `fileReplicator` metric group and the richer
 `FileReplicatorDiscovery`, `FileReplicatorQueue`, `FileReplicatorTransfer`,
 `FileReplicatorDestination`, and `FileReplicatorSchedule` groups. With `target: "messaging"`, the
-library publishes to the reserved UNS `metric` class (`ecv1/{device}/FileReplicator/main/metric/{name}`);
+library publishes to the reserved UNS `metric` class (`ecv1/{device}/FileReplicator/metric/{name}`);
 with CloudWatch or Prometheus, the same group names and bounded dimensions are used there. See
 [Reference - Metrics](metrics.md).
 

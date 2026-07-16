@@ -4,7 +4,7 @@ The file-replicator emits metrics through the EdgeCommons metric service. With
 `metricEmission.target: messaging`, metric messages are published on the reserved UNS `metric` class:
 
 ```text
-ecv1/{device}/FileReplicator/main/metric/{metricName}
+ecv1/{device}/FileReplicator/metric/{metricName}
 ```
 
 The component does not publish directly to `metric` topics. It defines and emits metrics through

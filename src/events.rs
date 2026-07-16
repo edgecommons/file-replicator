@@ -130,7 +130,7 @@ pub enum Event {
     InstanceActivated { source: String },
     /// An instance was deactivated / reset (via the control plane).
     InstanceDeactivated { source: String },
-    /// The component finished initializing (`set_ready(true)`). Component-level (main instance).
+    /// The component finished initializing (`set_ready(true)`). Component-level (component scope, no instance token).
     ComponentReady { instances: u64, version: String },
     /// A trigger command forced a scan/replication, or a `cron` schedule fired (DESIGN §12.2: cron
     /// mode releases all ready work at each fire, reusing the same "the schedule released work now"
@@ -461,7 +461,7 @@ pub struct Events {
 
 impl Events {
     /// Build an emitter bound to a live facade (`gg.instance(id).events()` for an instance, or
-    /// `gg.events()` for the component-level "main" instance).
+    /// `gg.events()` for component-level traffic — component scope, no instance token).
     pub fn new(facade: EventsFacade) -> Self {
         Self {
             facade: Some(facade),

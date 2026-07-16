@@ -157,7 +157,7 @@ fn events_named(rec: &Recorder, wire_type: &str) -> Vec<(String, Message)> {
         .collect()
 }
 
-fn assert_core_protobuf_round_trip(msg: &Message, thing: &str, instance: &str) {
+fn assert_core_protobuf_round_trip(msg: &Message, thing: &str, instance: Option<&str>) {
     let bytes = msg.to_vec().expect("message encodes as EdgeCommons protobuf");
     assert!(
         serde_json::from_slice::<Value>(&bytes).is_err(),
@@ -323,8 +323,8 @@ async fn driving_replication_publishes_lifecycle_events() {
     assert_eq!(ready[0].1.body["context"]["size"], json!(size));
     assert!(ready[0].1.body.get("timestamp").is_some());
     assert_eq!(ready[0].1.identity.as_ref().unwrap().device(), thing);
-    assert_eq!(ready[0].1.identity.as_ref().unwrap().instance(), id);
-    assert_core_protobuf_round_trip(&ready[0].1, &thing, id);
+    assert_eq!(ready[0].1.identity.as_ref().unwrap().instance(), Some(id));
+    assert_core_protobuf_round_trip(&ready[0].1, &thing, Some(id));
 
     // replication-started body.
     let started = events_named(&rec, "replication-started");
@@ -393,7 +393,7 @@ async fn get_status_request_receives_reply() {
     assert_eq!(reply.header.name, "get-status");
     assert_eq!(reply.identity.as_ref().unwrap().device(), thing);
     assert_eq!(reply.body["ok"], json!(true));
-    assert_core_protobuf_round_trip(&reply, &thing, "main");
+    assert_core_protobuf_round_trip(&reply, &thing, None);
     let result = &reply.body["result"];
     assert_eq!(result["instance"], json!(id));
     assert_eq!(result["active"], json!(true));

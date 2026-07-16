@@ -170,7 +170,7 @@ impl App {
                 "messaging unavailable; UNS control/event plane disabled (engine runs normally)"
             );
         }
-        // The component-level ("main" instance) event emitter — `ComponentReady` and the control
+        // The component-level (component scope, no instance token) event emitter — `ComponentReady` and the control
         // plane's scope-`"all"` `ScheduleTriggered` (crate::control module docs).
         let main_events = Events::new(gg.events());
 
@@ -348,7 +348,7 @@ impl App {
         );
         gg.set_ready(true);
 
-        // Component-ready lifecycle event (DESIGN §17.1), on the component-level ("main" instance)
+        // Component-ready lifecycle event (DESIGN §17.1), on the component-level (component scope, no instance token)
         // emitter. No-op when messaging is absent.
         main_events
             .emit(Event::ComponentReady {

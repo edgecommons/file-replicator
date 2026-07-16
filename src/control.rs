@@ -2,7 +2,7 @@
 //!
 //! **One-liner purpose**: The inbound half of the control plane — register `get-status` / `trigger`
 //! / `set-activation` on the edgecommons component **command inbox** (`gg.commands()`,
-//! `ecv1/{device}/file-replicator/main/cmd/#`) and answer via the library's request/reply wrapping.
+//! `ecv1/{device}/file-replicator/cmd/#`) and answer via the library's request/reply wrapping.
 //! The built-in `ping` / `reload-config` / `get-configuration` verbs (registered by the library)
 //! answer everything the old custom `cmd/config` verb used to.
 //!
@@ -19,7 +19,7 @@
 //!
 //! **Scoping — body field, not topic segment.** The old scheme split `cmd/status` (all instances)
 //! from `cmd/instances/{id}/status` (one instance) by TOPIC. The command inbox is one subscription
-//! per component (bound to the `main` instance), so scoping now rides an optional `instance` field in
+//! per component (component scope, no instance token), so scoping now rides an optional `instance` field in
 //! the request body — the same convention opcua-adapter/modbus-adapter use for their multi-instance
 //! `sb/*` verbs and telemetry-processor uses for `pause`/`resume`'s `route` field. `get-status`/
 //! `trigger` omit `instance` for "all"; `set-activation` always requires it (it never had an "all"
@@ -46,7 +46,7 @@
 //! control plane does not hold a redundant one: it calls [`InstanceControl::notify`] on the SPECIFIC
 //! instance it already looked up, which emits through that instance's own bound
 //! [`crate::events::Events`]. The control plane keeps only its own component-level `Events` (bound to
-//! `gg.events()`, the `main` instance) for scope-`"all"` events (`ScheduleTriggered{scope:"all"}`).
+//! `gg.events()`, component scope, no instance token) for scope-`"all"` events (`ScheduleTriggered{scope:"all"}`).
 //!
 //! ## `state/…` — dropped (see `crate::events` module docs)
 //! The retained per-instance/component snapshot publish (`republish_after_transition`/
@@ -152,7 +152,7 @@ pub struct ControlPlane {
     config: Arc<Config>,
     store: Arc<dyn StateStore>,
     instances: Vec<Arc<dyn InstanceControl>>,
-    /// Component-level ("main" instance) event emitter — scope-`"all"` `ScheduleTriggered` only; every
+    /// Component-level (component scope, no instance token) event emitter — scope-`"all"` `ScheduleTriggered` only; every
     /// instance-scoped event is delegated to [`InstanceControl::notify`] instead (module docs).
     events: Events,
     /// Instances that never started (Feature A `onPermissionError: disableInstance`) — see
@@ -161,7 +161,7 @@ pub struct ControlPlane {
 }
 
 impl ControlPlane {
-    /// Assemble the dispatcher. `events` is the component-level ("main" instance) emitter (e.g.
+    /// Assemble the dispatcher. `events` is the component-level (component scope, no instance token) emitter (e.g.
     /// `Events::new(gg.events())`) — see the module docs' "Instance-scoped events" note for why this
     /// is the ONLY emitter the control plane itself holds.
     pub fn new(

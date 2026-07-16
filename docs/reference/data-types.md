@@ -14,7 +14,7 @@ unsigned 64-bit (a JavaScript consumer may lose precision above 2^53). Timestamp
 
 ## The `get-status` document
 
-`get-status` (`…/main/cmd/get-status`) returns different shapes depending on the request body:
+`get-status` (`…/cmd/get-status`) returns different shapes depending on the request body:
 
 - **`{}`** (no `instance`) → a **component-wide** document: a roster of every instance plus a summary.
 - **`{ "instance": "<id>" }`** → that one instance's **per-instance** document (or its **disabled** document
