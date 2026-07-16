@@ -1043,7 +1043,7 @@ the UNS core this validity guarantee is enforced by the library that mints the t
 
 > **Superseded by the UNS-core migration (see §1 status banner) — authoritative: `docs/reference/messaging-interface.md`.**
 > The hand-rolled local control dispatcher below was replaced by verb registrations on the edgecommons
-> **command inbox** (`gg.commands()`, `ecv1/{device}/FileReplicator/main/cmd/#`), which now provides the
+> **command inbox** (`gg.commands()`, `ecv1/{device}/FileReplicator/cmd/#`), which now provides the
 > generic control framework core previously lacked. Concretely: **`get-config` is retired** (the library's
 > built-in `get-configuration` verb answers it, redacted — plus `ping` / `reload-config`); the
 > instance-in-topic scoping (`…/cmd/instances/{id}/…`) became an instance **body field**

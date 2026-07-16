@@ -163,7 +163,7 @@ Pause or resume one instance at runtime without a redeploy, via the `set-activat
 "all" form — `instance` is required):
 
 ```
-request topic   ecv1/<device>/FileReplicator/main/cmd/set-activation
+request topic   ecv1/<device>/FileReplicator/cmd/set-activation
 header.name     set-activation
 body            { "instance": "plant-csv-to-s3", "active": false, "persist": true }
 reply body      { "ok": true, "result": { "instance": "plant-csv-to-s3", "active": false, "persisted": true } }
@@ -203,7 +203,7 @@ Both the event `context` shapes and the `get-status` document schema are in the
 ## Monitor replication throughput and backlog
 
 Route metrics with the standard `metricEmission` section. With `metricEmission.target: "messaging"`, the
-library publishes every metric group to `ecv1/{device}/FileReplicator/main/metric/{metricName}`; with
+library publishes every metric group to `ecv1/{device}/FileReplicator/metric/{metricName}`; with
 CloudWatch or Prometheus, the same groups and dimensions are used by those targets.
 
 Key groups:
@@ -226,17 +226,19 @@ errors as dimensions; those are intentionally kept in events/status documents, n
 ## Bridge status to the cloud for fleet-wide visibility
 
 Every device publishes under the same fixed UNS grammar
-`ecv1/{device}/FileReplicator/{instance}/{class}[/…]`, so a single cloud-side consumer sees every device
-with one subscription:
+`ecv1/{device}/FileReplicator/[{instance}/]{class}[/…]` — the instance segment is present only for
+per-instance events and absent for component-scope traffic — so a small cloud-side subscription set sees
+every device:
 
 ```
-ecv1/+/FileReplicator/+/evt/#         # every event, every instance, every device
-ecv1/+/FileReplicator/+/state         # the library RUNNING/STOPPED keepalive per device
-ecv1/+/FileReplicator/+/metric/#      # compatibility and operational metrics
+ecv1/+/FileReplicator/evt/#           # component-scope events (component-ready, scope-"all")
+ecv1/+/FileReplicator/+/evt/#         # per-instance events, every instance, every device
+ecv1/+/FileReplicator/state           # the library RUNNING/STOPPED keepalive per device
+ecv1/+/FileReplicator/metric/#        # compatibility and operational metrics
 ```
 
 `{device}` is the ThingName (`-t`), `{component}` is the short UNS token `FileReplicator`. There is no
 configurable prefix and no legacy alias. To fold status into a fleet dashboard, bridge these topics
-northbound and fan `get-status` requests to each device's `main` inbox as needed. Envelope `tags` (e.g.
+northbound and fan `get-status` requests to each device's command inbox as needed. Envelope `tags` (e.g.
 `enterprise`/`site`) travel in the protobuf envelope for grouping — they are **not** topic segments. See the
 [messaging interface reference](reference/messaging-interface.md).

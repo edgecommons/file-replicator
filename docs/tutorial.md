@@ -106,7 +106,7 @@ filenames, bucket names, or raw errors.
 ## 7. Ask for status on demand
 
 There is no retained state snapshot; the current picture is a request/reply command. Send a protobuf
-EdgeCommons command envelope to the `main` command inbox with `header.name = "get-status"` and a
+EdgeCommons command envelope to the component-scope command inbox with `header.name = "get-status"` and a
 `reply_to` topic. In Rust, that is the normal `MessageBuilder` + `MessagingService::request` path:
 
 ```rust
