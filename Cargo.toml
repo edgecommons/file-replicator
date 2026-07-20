@@ -3,7 +3,7 @@ name = "file-replicator"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-license = "Apache-2.0"
+license = "BUSL-1.1"
 description = "EdgeCommons file-replicator: watches directories and replicates files to local/S3 (and, phased, SFTP/HTTP/Azure/GCS) on arrival or on cron schedules/windows, with resumable uploads, integrity verification, bandwidth caps, per-instance activation, and a full control/event surface. See DESIGN.md."
 publish = false
 
