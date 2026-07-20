@@ -32,8 +32,8 @@ ComponentConfiguration:
         targetConfig:
           logFileName: "/greengrass/v2/work/{ComponentFullName}/metric.log"
       tags:
-        appId: "Test"
-        site: "Chantilly"
+        appId: "CHANGE_ME"
+        site: "CHANGE_ME"
       component:
         global:
           limits:
