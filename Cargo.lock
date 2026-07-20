@@ -1771,7 +1771,8 @@ dependencies = [
 
 [[package]]
 name = "edgecommons"
-version = "0.3.0"
+version = "0.2.0"
+source = "git+https://github.com/edgecommons/edgecommons.git?rev=36a70c48b65b35f77bfab70d3a73869debdfc407#36a70c48b65b35f77bfab70d3a73869debdfc407"
 dependencies = [
  "aes-gcm 0.10.3",
  "arc-swap",
