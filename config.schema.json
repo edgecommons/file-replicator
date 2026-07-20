@@ -1,0 +1,431 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.edgecommons.mbreissi.com/schemas/file-replicator/config.schema.json",
+  "title": "file-replicator component configuration",
+  "description": "The configuration file-replicator itself understands: the object at `component.global` (validated by `edgecommons component validate`), plus `$defs/instance` documenting the shape of each `component.instances[]` entry (one watched directory) for reference — mirrors `src/config.rs`'s `InstanceCfg` and `docs/reference/configuration.md`/`destinations.md`. The library envelope (logging, messaging, metricEmission, heartbeat, streaming, credentials, parameters, health, hierarchy, identity, topic, tags) is owned by the canonical schema and is deliberately not redeclared here. Keep `additionalProperties: false` so a typo'd key is caught at deploy time rather than silently ignored.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Cross-instance defaults an instance inherits when it sets none of its own.",
+      "properties": {
+        "retry": { "$ref": "#/$defs/retry" },
+        "timezone": {
+          "type": "string",
+          "default": "UTC",
+          "description": "Default schedule timezone, used when an instance's own `schedule` sets none."
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Aggregate caps across every instance (an instance's own `limits` is a per-instance cap on top of these).",
+      "properties": {
+        "maxConcurrentFiles": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 64,
+          "description": "Global in-flight-transfer semaphore size across all instances."
+        },
+        "maxBandwidth": {
+          "type": "string",
+          "description": "Global aggregate byte-rate cap every transfer's token bucket also passes, e.g. \"50MB/s\"."
+        }
+      }
+    },
+    "onPermissionError": {
+      "$ref": "#/$defs/permissionPolicy",
+      "default": "disableInstance",
+      "description": "Component-wide default for what happens when an instance's ingress/egress/archive/failed directory fails a startup readable/writable check. An instance's own `onPermissionError` overrides this."
+    }
+  },
+  "$defs": {
+    "permissionPolicy": {
+      "type": "string",
+      "enum": ["disableInstance", "fatal", "retain"],
+      "description": "`disableInstance` skips just the offending instance (siblings keep running) — the default. `fatal` aborts the whole component. `retain` starts the instance anyway, leaning on runtime dedup-logging + the `PermissionDenied` event for ongoing diagnostics."
+    },
+    "retry": {
+      "title": "Retry / backoff policy",
+      "description": "Exponential backoff with full jitter, governed by a TIME BUDGET (`giveUpAfter`) rather than an attempt count — 'keep trying for 7 days' means the same thing at every backoff cadence, which is what an operator can actually reason about.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "baseDelayMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1000,
+          "description": "The first backoff window. Each attempt doubles it, up to `maxDelayMs`."
+        },
+        "maxDelayMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 900000,
+          "description": "The backoff ceiling (default 15 min), so a long outage does not back off to next week."
+        },
+        "giveUpAfter": {
+          "type": "string",
+          "default": "7d",
+          "description": "The time budget before an item is reported exhausted, e.g. \"7d\". Governs long-outage tolerance (hours to ~2 days), not an attempt cap."
+        },
+        "maxAttempts": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional hard attempt cap on top of the time budget. Default: none (purely time-governed)."
+        }
+      }
+    },
+    "instance": {
+      "title": "One watched-directory instance",
+      "description": "One entry of `component.instances[]` (documented here; the CLI's schema check validates `component.global` above — this block is the reference shape for the per-instance surface, mirroring `src/config.rs`'s `InstanceCfg`).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "ingress"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+          "description": "Stable instance id. It is the `{instance}` token of this instance's UNS topics, so it must be a valid UNS token (lower-kebab) and stable across restarts (statistics, activation, and control target on it)."
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Initial activation. The persisted runtime state may override this after the first start (toggled via the activate/deactivate control message)."
+        },
+        "ingress": { "$ref": "#/$defs/ingress" },
+        "egress": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/egress" },
+          "description": "Ordered destination list. `N >= 1` entries fan out independently; the source completes (delete/archive) only once EVERY entry has delivered and verified."
+        },
+        "schedule": {
+          "$ref": "#/$defs/schedule",
+          "description": "When replication runs. Default: immediate (replicate as files become ready)."
+        },
+        "completion": { "$ref": "#/$defs/completion" },
+        "retry": { "$ref": "#/$defs/retry", "description": "Falls back to `component.global.defaults.retry`." },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Per-instance concurrency + bandwidth caps (on top of the global caps in `component.global.limits`).",
+          "properties": {
+            "maxConcurrentFiles": { "type": "integer", "minimum": 1 },
+            "maxBandwidth": { "type": "string", "description": "Human byte-rate, e.g. \"20MB/s\"." }
+          }
+        },
+        "onPermissionError": {
+          "$ref": "#/$defs/permissionPolicy",
+          "description": "Per-instance override of `component.global.onPermissionError`. Absent inherits the component default."
+        },
+        "priority": {
+          "type": "integer",
+          "default": 100,
+          "description": "Cross-instance GLOBAL concurrency-admission priority: under contention for the shared `component.global.limits.maxConcurrentFiles` cap, a LOWER number is admitted first (0-255-ish convention; ties broken FIFO). Governs only the global admission decision — no effect on this instance's own `limits.maxConcurrentFiles`, and no bandwidth weighting by priority."
+        }
+      }
+    },
+    "ingress": {
+      "title": "Source directory + discovery",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1, "description": "Source directory." },
+        "recursive": {
+          "type": "boolean",
+          "default": false,
+          "description": "Watch the whole tree; the source subtree is preserved at the destination."
+        },
+        "include": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Globs matched against the source-relative path. Empty means everything not excluded."
+        },
+        "exclude": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Globs matched against the source-relative path."
+        },
+        "rescanSecs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30,
+          "description": "Reconciliation-rescan interval — the fallback discovery path used when the OS file watch cannot be established or misses an event (common on NFS/SMB, container bind-mounts/overlay volumes, FUSE)."
+        },
+        "readiness": {
+          "$ref": "#/$defs/readiness",
+          "description": "How the replicator decides a file is fully written. Default: stability (quietSecs: 5)."
+        }
+      }
+    },
+    "readiness": {
+      "title": "Readiness strategy",
+      "type": "object",
+      "required": ["strategy"],
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategy"],
+          "properties": {
+            "strategy": { "const": "stability" },
+            "quietSecs": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 5,
+              "description": "Ready once size and mtime are unchanged for this many seconds."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategy"],
+          "properties": {
+            "strategy": { "const": "marker" },
+            "suffix": {
+              "type": "string",
+              "default": ".done",
+              "description": "Companion marker suffix, e.g. `.done` replicates `FILE` when `FILE.done` appears."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategy"],
+          "properties": {
+            "strategy": { "const": "rename" }
+          },
+          "description": "Ready only for files renamed/moved into the watch directory."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["strategy"],
+          "properties": {
+            "strategy": { "const": "glob" },
+            "ready": {
+              "type": "array",
+              "items": { "type": "string" },
+              "default": [],
+              "description": "Anything matching one of these globs (and not excluded) is ready immediately."
+            }
+          }
+        }
+      ]
+    },
+    "egress": {
+      "title": "One destination",
+      "description": "A tagged object selected by `type`. Delivery is idempotent to a stable key (a retry overwrites rather than duplicating) and is verified before the source is released, whatever the backend. Full per-backend field tables: docs/reference/destinations.md.",
+      "type": "object",
+      "required": ["type"],
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "path"],
+          "properties": {
+            "type": { "const": "local" },
+            "path": { "type": "string", "minLength": 1, "description": "Destination root; the source subtree is recreated under it. Also covers NFS/SMB shares." },
+            "fsync": { "type": "boolean", "default": false, "description": "fsync the written file before completion." }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "bucket"],
+          "properties": {
+            "type": { "const": "s3" },
+            "bucket": { "type": "string", "minLength": 1 },
+            "prefix": { "type": "string", "default": "" },
+            "region": { "type": "string" },
+            "endpointUrl": { "type": "string", "description": "MinIO / S3-compatible / GovCloud." },
+            "credentials": { "$ref": "#/$defs/secretRef" },
+            "storageClass": { "type": "string", "examples": ["INTELLIGENT_TIERING", "STANDARD_IA"] },
+            "sse": { "type": "string", "examples": ["AES256", "aws:kms"] },
+            "kmsKeyId": { "type": "string" },
+            "accelerate": { "type": "boolean", "default": false },
+            "unsignedPayload": { "type": "boolean", "default": false },
+            "checksumAlgorithm": { "type": "string", "default": "CRC32C", "enum": ["CRC32C", "SHA256"] },
+            "multipart": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "thresholdBytes": { "type": "integer", "minimum": 1 },
+                "partSizeBytes": { "type": "integer", "minimum": 1 },
+                "maxConcurrentParts": { "type": "integer", "minimum": 1 }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "host"],
+          "properties": {
+            "type": { "const": "sftp" },
+            "host": { "type": "string", "minLength": 1 },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 22 },
+            "baseDir": { "type": "string", "default": "" },
+            "username": { "type": "string" },
+            "password": { "type": "string", "description": "Ambient password (discouraged in favor of `credentials`)." },
+            "privateKey": { "type": "string", "description": "Path to a private key file on local disk." },
+            "passphrase": { "type": "string" },
+            "credentials": { "$ref": "#/$defs/secretRef" },
+            "hostKey": { "type": "string", "description": "Pinned server host key (OpenSSH `algo base64[ comment]` line)." },
+            "insecureAcceptAnyHostKey": { "type": "boolean", "default": false, "description": "Fail-open escape hatch when no `hostKey` is pinned. Disables MITM protection — use only as a documented exception." },
+            "tempSuffix": { "type": "string", "default": ".part" },
+            "fsync": { "type": "boolean", "default": false },
+            "checksumAlgorithm": { "type": "string", "default": "CRC32C", "enum": ["CRC32C", "SHA256"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "host"],
+          "properties": {
+            "type": { "const": "ftps" },
+            "host": { "type": "string", "minLength": 1 },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 21 },
+            "baseDir": { "type": "string", "default": "" },
+            "username": { "type": "string" },
+            "password": { "type": "string" },
+            "credentials": { "$ref": "#/$defs/secretRef" },
+            "explicitTls": { "type": "boolean", "default": true, "description": "true = explicit AUTH TLS on the plain control port; false = implicit TLS." },
+            "passive": { "type": "boolean", "default": true },
+            "tempSuffix": { "type": "string" },
+            "checksumAlgorithm": { "type": "string", "default": "CRC32C", "enum": ["CRC32C", "SHA256"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "url"],
+          "properties": {
+            "type": { "const": "http" },
+            "url": { "type": "string", "minLength": 1, "description": "Base URL; the source-relative path is joined onto it." },
+            "method": { "type": "string", "default": "PUT", "enum": ["PUT", "POST"], "description": "PUT is resumable; POST is single-shot (resume forced off)." },
+            "headers": { "type": "object", "additionalProperties": { "type": "string" }, "default": {} },
+            "bearerToken": { "type": "string" },
+            "username": { "type": "string" },
+            "password": { "type": "string" },
+            "credentials": { "$ref": "#/$defs/secretRef" },
+            "resumable": { "type": "boolean", "default": true },
+            "chunkBytes": { "type": "integer", "minimum": 1, "default": 8388608 },
+            "checksumAlgorithm": { "type": "string", "default": "CRC32C", "enum": ["CRC32C", "SHA256"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "account", "container"],
+          "properties": {
+            "type": { "const": "azure" },
+            "account": { "type": "string", "minLength": 1 },
+            "container": { "type": "string", "minLength": 1 },
+            "prefix": { "type": "string", "default": "" },
+            "endpointUrl": { "type": "string", "description": "Azurite or a sovereign cloud." },
+            "accountKey": { "type": "string" },
+            "connectionString": { "type": "string" },
+            "credentials": { "$ref": "#/$defs/secretRef" },
+            "blocks": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "thresholdBytes": { "type": "integer", "minimum": 1 },
+                "blockSizeBytes": { "type": "integer", "minimum": 1 }
+              }
+            },
+            "checksumAlgorithm": { "type": "string", "default": "CRC32C", "enum": ["CRC32C", "SHA256"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "bucket"],
+          "properties": {
+            "type": { "const": "gcs" },
+            "bucket": { "type": "string", "minLength": 1 },
+            "prefix": { "type": "string", "default": "" },
+            "endpointUrl": { "type": "string", "description": "fake-gcs-server; absent = the public GCS JSON API." },
+            "accessToken": { "type": "string" },
+            "anonymous": { "type": "boolean", "default": false },
+            "credentials": { "$ref": "#/$defs/secretRef" },
+            "chunkBytes": { "type": "integer", "minimum": 1, "default": 8388608 },
+            "checksumAlgorithm": { "type": "string", "default": "CRC32C", "enum": ["CRC32C", "SHA256"] }
+          }
+        }
+      ]
+    },
+    "secretRef": {
+      "type": "object",
+      "description": "An optional `{\"$secret\": \"name\"}` vault reference resolved through `gg.credentials()`. Omit to use the ambient/platform-default credential chain (backend-specific — see docs/reference/destinations.md).",
+      "properties": {
+        "$secret": { "type": "string", "minLength": 1 }
+      }
+    },
+    "schedule": {
+      "title": "When replication runs",
+      "type": "object",
+      "required": ["mode"],
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": { "const": "immediate" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "expression"],
+          "properties": {
+            "mode": { "const": "cron" },
+            "expression": { "type": "string", "minLength": 1, "description": "Standard cron expression, or an English sugar phrase, evaluated tz/DST-aware." },
+            "timezone": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "open"],
+          "properties": {
+            "mode": { "const": "window" },
+            "open": { "type": "string", "minLength": 1, "description": "Window-open cron expression." },
+            "close": { "type": "string", "description": "Window-close cron expression. Use this or `durationMins`." },
+            "durationMins": { "type": "integer", "minimum": 1 },
+            "timezone": { "type": "string" },
+            "onWindowClose": {
+              "type": "string",
+              "enum": ["pauseResume", "finishCurrent"],
+              "default": "pauseResume",
+              "description": "pauseResume: pause in-flight and resume next window if the destination supports resume, else finish current. finishCurrent: let in-flight transfers finish past close; admit no new files until the next open."
+            }
+          }
+        }
+      ]
+    },
+    "completion": {
+      "title": "Source-file lifecycle on success / retry-exhaustion",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "onSuccess": { "type": "string", "enum": ["archive", "delete"], "default": "archive" },
+        "archiveDir": { "type": "string", "description": "Required when `onSuccess: archive`." },
+        "onExhausted": { "type": "string", "enum": ["retainInPlace", "quarantine"], "default": "retainInPlace" },
+        "failedDir": { "type": "string", "description": "Quarantine directory + `.error.json` sidecar; required when `onExhausted: quarantine`." },
+        "onCollision": { "type": "string", "enum": ["suffix", "overwrite", "fail"], "default": "suffix" },
+        "verify": { "type": "string", "enum": ["checksum", "size", "none"], "default": "checksum" }
+      }
+    }
+  }
+}

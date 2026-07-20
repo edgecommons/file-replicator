@@ -5,15 +5,11 @@
   },
   "heartbeat": {
     "intervalSecs": 10,
+    "destination": "local",
     "measures": {
       "cpu": true,
       "memory": true
-    },
-    "targets": [
-      {
-        "type": "metric"
-      }
-    ]
+    }
   },
   "metricEmission": {
     "target": "log",
