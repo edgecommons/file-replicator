@@ -1,0 +1,25 @@
+name: deploy-docs
+
+# Doc-only pushes skip the build CI (see paths-ignore in ci.yml) but should still refresh the
+# EdgeCommons docs site, which aggregates this repo's docs/ at build time. This hits the Cloudflare
+# Workers Builds deploy hook for the edgecommons-docs project to trigger a rebuild (a few seconds of
+# Actions, not the full build). Enable by setting the repo Actions secret CLOUDFLARE_DEPLOY_HOOK to
+# the deploy-hook URL; without it this is a no-op (docs rebuild on the next edgecommons main push).
+on:
+  push:
+    branches: [main]
+    paths: ['docs/**', '**.md']
+
+jobs:
+  trigger-docs-rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Cloudflare docs rebuild
+        env:
+          HOOK: ${{ secrets.CLOUDFLARE_DEPLOY_HOOK }}
+        run: |
+          if [ -n "$HOOK" ]; then
+            curl -fsS -X POST "$HOOK" && echo "triggered edgecommons-docs rebuild"
+          else
+            echo "CLOUDFLARE_DEPLOY_HOOK not set; skipping (docs rebuild on the next edgecommons main push)"
+          fi
