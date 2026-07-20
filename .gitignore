@@ -6,14 +6,6 @@
 # Gitignored so CI uses the git rev; see the org CLAUDE.md "Local-dev notes".
 /.cargo/config.toml
 
-# Cargo.lock excluded until the edgecommons pin is bumped from the current pre-UNS placeholder rev to
-# the published UNS-core rev on main and regenerated (the local build's lock records the `.cargo`
-# `paths` override's resolution against the sibling checkout — a fresh clone/CI has no sibling, and a
-# pure git-rev build of this placeholder rev does not compile anyway — see Cargo.toml's "UNS MIGRATION
-# NOTE"). Re-commit the lock at release once the pin is bumped (mirrors telemetry-processor's UNS-core
-# migration).
-/Cargo.lock
-
 # Greengrass build output
 /greengrass-build
 /zip-build

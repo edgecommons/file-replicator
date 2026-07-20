@@ -11,7 +11,11 @@
 # `image:` in k8s/deployment.yaml.
 
 # ---- stage 1: build -------------------------------------------------------------------------
-FROM rust:1.85-slim AS build
+# Build base tracks a current Rust (org policy: use the latest compiler unless there's a specific
+# reason not to) — separate from the `rust-version` MSRV floor in Cargo.toml, which stays as-is.
+# The committed Cargo.lock's resolved transitive tree needs a newer rustc than 1.85 (e.g. `time`
+# and `icu_*` via the edgecommons dependency), so 1.85 can no longer build the locked tree.
+FROM rust:1.88-slim AS build
 
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
@@ -25,7 +29,7 @@ COPY Cargo.toml ./
 COPY Cargo.lock* ./
 COPY src ./src
 
-RUN cargo build --release --bin file-replicator
+RUN cargo build --release --locked --bin file-replicator
 
 # ---- stage 2: runtime -----------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
