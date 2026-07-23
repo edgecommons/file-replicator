@@ -9,9 +9,9 @@ on:
 
 jobs:
   ci:
-    # Reusable component CI from the org defaults repo. `secrets: inherit` passes the org-level
-    # EDGECOMMONS_READ_TOKEN so cargo can fetch the private edgecommons git dependency. The repo must be
-    # added to that secret's repository allow-list (org Actions secrets, via the REST API).
+    # Reusable component CI from the org defaults repo (build + test + clippy -D warnings).
+    # `edgecommons/edgecommons` is public, so cargo fetches the git dependency anonymously and no
+    # token is required; `secrets: inherit` is retained but passes nothing CI now depends on.
     permissions:
       contents: read
     uses: edgecommons/.github/.github/workflows/component-ci.yml@main
@@ -55,23 +55,9 @@ jobs:
         run: rustup toolchain install stable --profile minimal --component llvm-tools-preview
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Authenticate to the private edgecommons git dependency
-        env:
-          # Same org read token the reusable workflow uses (secrets: inherit); the repo must be on that
-          # secret's allow-list. Rewrites the https git URL so cargo can fetch the private dep.
-          EDGECOMMONS_READ_TOKEN: ${{ secrets.EDGECOMMONS_READ_TOKEN }}
-        run: |
-          git config --global \
-            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons.git".insteadOf \
-            "https://github.com/edgecommons/edgecommons.git"
-          git config --global \
-            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons".insteadOf \
-            "https://github.com/edgecommons/edgecommons"
-          git config --global \
-            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/".insteadOf \
-            "https://github.com/"
       - name: Coverage gate (90% lines; SDK/protocol-call seams + self-skipping integration tests excluded)
         env:
+          # edgecommons/edgecommons is public; cargo fetches the git dependency anonymously.
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         run: >
           cargo llvm-cov --features dest-s3,dest-sftp,dest-ftps,dest-http,dest-azure,dest-gcs
