@@ -1045,10 +1045,33 @@ the UNS core this validity guarantee is enforced by the library that mints the t
 > The hand-rolled local control dispatcher below was replaced by verb registrations on the edgecommons
 > **command inbox** (`gg.commands()`, `ecv1/{device}/FileReplicator/cmd/#`), which now provides the
 > generic control framework core previously lacked. Concretely: **`get-config` is retired** (the library's
-> built-in `get-configuration` verb answers it, redacted — plus `ping` / `reload-config`); the
-> instance-in-topic scoping (`…/cmd/instances/{id}/…`) became an instance **body field**
-> (`cmd/get-status` + `{instance?}`); verbs are `cmd/get-status`, `cmd/trigger`, `cmd/set-activation`. The
-> table below is the ORIGINAL design; the `get-status` reply *shape* it describes is still accurate.
+> built-in `get-configuration` verb answers it, redacted — plus `ping` / `reload-config`); verbs are
+> `cmd/get-status`, `cmd/trigger`, `cmd/set-activation`. The table below is the ORIGINAL design; the
+> `get-status` reply *shape* it describes is still accurate.
+>
+> **Instance addressing (core 0.5.0 scoped commands, core `DESIGN-scoped-commands.md`).** Each verb
+> declares an addressing scope at registration, which the library enforces before dispatch:
+>
+> | Verb | Scope | No instance named | One instance named |
+> |---|---|---|---|
+> | `get-status` | `Both` | component-wide roster + summary | that instance's document |
+> | `trigger` | `Both` | every active instance | that instance |
+> | `set-activation` | `Instance` | `INSTANCE_REQUIRED` | that instance |
+>
+> `get-status`/`trigger` are `Both` because "no instance named" has always carried a meaningful
+> *component-wide* answer here rather than being a default to resolve — D-SC-3's dual-semantics use.
+> `set-activation` is `Instance`: it never had an "all" form, and per D-SC-4 the "no instance named"
+> policy (`INSTANCE_REQUIRED`) and the unknown-id check (`UNKNOWN_INSTANCE`) stay component-side,
+> because the library owns addressing and has no configuration knowledge.
+>
+> An instance is named **either** by the delivery topic
+> (`ecv1/{device}/FileReplicator/{instance}/cmd/{verb}`, the library's per-instance inbox) **or** by the
+> `instance` body field over the component topic. The topic wins (D-SC-4), and the library rejects a
+> request whose topic and `body.instance` disagree with `BAD_ARGS`. `src/control.rs`'s `address()` folds
+> the topic-addressed instance into the body selector, so the handlers keep reading exactly one
+> selector. The original design's instance-in-topic scoping is therefore back — as the library's UNS
+> instance inbox rather than a hand-rolled route — alongside the body field that replaced it in the UNS
+> migration.
 
 Uses the edgecommons request/reply primitive (`request`/`reply`, `reply_to`). At design time core had **no
 generic control framework** — each component wired its own handlers — so this speced a small local **control

@@ -74,15 +74,15 @@ dest-azure = ["dep:azure_storage_blobs", "dep:azure_storage", "dep:azure_core", 
 dest-gcs = ["dep:reqwest", "reqwest/json", "dep:base64", "edgecommons/credentials"]
 
 [dependencies]
-# edgecommons Rust library, pinned to a commit on edgecommons/edgecommons (private). Building standalone needs
-# read access to that repo. The fetch goes through the git CLI (see .cargo/config.toml); locally use your
-# gh/git credential helper, and CI's reusable workflow rewrites the https URL with EDGECOMMONS_READ_TOKEN.
+# edgecommons Rust library, pinned to the `rust-lib/v0.5.0` release tag on edgecommons/edgecommons — a
+# public repo, so the fetch needs no credentials in CI or locally.
 #
-# UNS MIGRATION NOTE: this code REQUIRES the UNS core (top-level `identity`, `gg.uns()`, `gg.commands()`,
-# the reserved-class guard, the `data()`/`events()`/`app()` class facades) plus the rebranded Rust crate
-# metadata. The pin below points at the current core `main`; LOCAL DEV may still build against the sibling
-# checkout via the gitignored `.cargo/config.toml` `paths` override, which replaces this source outright.
-edgecommons = { git = "https://github.com/edgecommons/edgecommons.git", rev = "36a70c48b65b35f77bfab70d3a73869debdfc407", default-features = false }
+# This code REQUIRES the UNS core (top-level `identity`, `gg.uns()`, `gg.commands()`, the reserved-class
+# guard, the `data()`/`events()`/`app()` class facades) and 0.5.0's scoped command registration
+# (`register(verb, scope, handler)`). LOCAL DEV may build against the sibling checkout via the gitignored
+# `.cargo/config.toml` `[patch]` override, which replaces this source outright — never commit a
+# `Cargo.lock` regenerated while that override is active.
+edgecommons = { git = "https://github.com/edgecommons/edgecommons.git", rev = "a14a3285573ef2bb6a531e1e1936c6dc40a85ef4", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -16,9 +16,11 @@ ecv1/{device}/{component}/[{instance}/]{class}[/{channel…}]
   `.` — `com.mbreissi.edgecommons.FileReplicator` → **`FileReplicator`**), not the `file-replicator`
   registry slug.
 - `{instance}` — OPTIONAL. Present (a `component.instances[].id`) for instance-scoped traffic — a
-  replication instance's own events (`file-ready`, `replication-*`, …) ride `gg.instance(id).events()`.
-  **Absent** for component-scope traffic: the built-in command verbs, `ComponentReady`, the scope-`"all"`
-  `trigger`/`get-status` events, and the library's own `state`/`cfg`/`metric` keepalives.
+  replication instance's own events (`file-ready`, `replication-*`, …) ride `gg.instance(id).events()`,
+  and a command addressed at one instance rides that instance's own command inbox.
+  **Absent** for component-scope traffic: a command addressed at the whole component, `ComponentReady`,
+  the scope-`"all"` `trigger`/`get-status` events, and the library's own `state`/`cfg`/`metric`
+  keepalives.
 - `{class}` ∈ `cmd` (inbound commands, request/reply) · `evt` (event stream) · the **reserved**,
   library-owned `state`/`cfg`/`metric`/`log` (this component never publishes to them directly).
 
@@ -27,24 +29,37 @@ There is no configurable topic prefix and no legacy alias — the UNS grammar ab
 
 ## Commands (`cmd`, request/reply via `reply_to`)
 
-Registered on the component-scope command inbox (`ecv1/{device}/FileReplicator/cmd/#`); an instance token
-is optional and present only for explicit multi-instance addressing. Scoping an instance is a request-body
-field, not a topic segment (mirroring how opcua-adapter/
-modbus-adapter address their multi-instance `sb/*` verbs and telemetry-processor's `route`/`pause`/
-`resume`). Publish commands with the edgecommons client APIs (`MessageBuilder` + `MessagingService`
-request/reply, or an equivalent protobuf producer), not by sending JSON text to MQTT. Every decoded reply
-body is `{"ok": true, "result": <value>}` or `{"ok": false, "error": {"code", "message"}}` (the
-edgecommons command-inbox contract — the request's `header.name` MUST equal the verb).
+Two inboxes carry commands: the component one, `ecv1/{device}/FileReplicator/cmd/#`, and one per
+replication instance, `ecv1/{device}/FileReplicator/{instance}/cmd/#`. Publish commands with the
+edgecommons client APIs (`MessageBuilder` + `MessagingService` request/reply, or an equivalent protobuf
+producer), not by sending JSON text to MQTT. Every decoded reply body is
+`{"ok": true, "result": <value>}` or `{"ok": false, "error": {"code", "message"}}` (the edgecommons
+command-inbox contract — the request's `header.name` MUST equal the verb).
 
-| Verb | Topic | Body | Result / error codes |
+| Verb | Scope | Body | Result / error codes |
 |---|---|---|---|
-| `get-status` | `…/cmd/get-status` | `{ "instance"?: string }` | omitted `instance` → component-wide roster+summary; present → that instance's document; `UNKNOWN_INSTANCE` |
-| `trigger` | `…/cmd/trigger` | `{ "instance"?: string, "ignoreWindow"?: bool }` | accepted + counts; `UNKNOWN_INSTANCE` |
-| `set-activation` | `…/cmd/set-activation` | `{ "instance": string, "active"?: bool, "persist"?: bool, "reset"?: bool }` | new state; `INSTANCE_REQUIRED` (no "all" form), `UNKNOWN_INSTANCE`, `INVALID_REQUEST` (neither `active` nor `reset`), `ACTIVATION_FAILED` |
+| `get-status` | both | `{ "instance"?: string }` | no instance named → component-wide roster+summary; one named → that instance's document; `UNKNOWN_INSTANCE` |
+| `trigger` | both | `{ "instance"?: string, "ignoreWindow"?: bool }` | accepted + counts; `UNKNOWN_INSTANCE` |
+| `set-activation` | instance | `{ "instance": string, "active"?: bool, "persist"?: bool, "reset"?: bool }` | new state; `INSTANCE_REQUIRED` (no "all" form), `UNKNOWN_INSTANCE`, `INVALID_REQUEST` (neither `active` nor `reset`), `ACTIVATION_FAILED` |
 
-The library's own built-in verbs are also available: `ping` (liveness), `reload-config` (re-fetch +
-re-apply), and **`get-configuration`** — returns the **redacted** effective config (`{"config":
-<redacted>}`, with secrets replaced rather than left as unresolved `$secret` refs).
+### Addressing an instance
+
+Each verb declares an addressing **scope**, which the library enforces before the verb runs:
+
+- **`both`** (`get-status`, `trigger`) — either inbox is meaningful. Address the component
+  (`…/FileReplicator/cmd/{verb}`) for the fleet-wide answer, or one instance
+  (`…/FileReplicator/{instance}/cmd/{verb}`) for that instance alone.
+- **`instance`** (`set-activation`) — this verb has no "all" form. It answers `INSTANCE_REQUIRED`
+  when neither the topic nor the body names an instance.
+
+The `instance` body field remains the way to target one instance over the component inbox. When the
+topic names an instance it wins; a request that names one instance in the topic and a different one
+in `body.instance` is rejected with `BAD_ARGS` before the verb runs.
+
+The library's own built-in verbs are also available on both inboxes: `ping` (liveness),
+`reload-config` (re-fetch + re-apply), and **`get-configuration`** — returns the **redacted**
+effective config (`{"config": <redacted>}`, with secrets replaced rather than left as unresolved
+`$secret` refs).
 
 ## Events (`evt`, `evt/{severity}/{type}`)
 

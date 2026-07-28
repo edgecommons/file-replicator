@@ -71,6 +71,13 @@ first.
   minted by the library's `commands()`/`events()` facades — no hand-rolled topic builder, no
   configurable prefix, no legacy alias (all retired in the UNS-core migration; see
   `docs/reference/messaging-interface.md`). `state`/`cfg`/`metric` are reserved, library-owned classes.
+- **Command verbs declare their addressing scope** (core 0.5.0, `DESIGN-scoped-commands.md` D-SC-2;
+  register entry in DESIGN §16): `get-status` and `trigger` are `CommandScope::Both` — no instance named
+  means the component-wide answer, one named means that instance — and `set-activation` is
+  `CommandScope::Instance` (it has no "all" form; `INSTANCE_REQUIRED`/`UNKNOWN_INSTANCE` stay
+  component-side per D-SC-4). An instance is named by the topic (the library's per-instance inbox) or by
+  the `instance` body field; the topic wins, and `src/control.rs`'s `address()` folds it into the body
+  selector so every handler reads one selector.
 - Durable **write-ahead** state → crash-safe move+delete with checksum-verify-before-complete.
 - **Long-outage tolerant** (hours–~2d): time-based `giveUpAfter` (default 7d, not attempt caps, shipped) and
   resume in-flight (shipped). The **disconnection circuit-breaker** (§13.4) is still **not implemented** —
