@@ -35,6 +35,9 @@ ComponentConfiguration:
         appId: "CHANGE_ME"
         site: "CHANGE_ME"
       component:
+        # UNS component token. The Greengrass ComponentName is reverse-DNS PascalCase; the token the
+        # wire carries is lower-kebab, so it is set explicitly rather than derived from the name.
+        token: file-replicator
         global:
           limits:
             maxConcurrentFiles: 8
