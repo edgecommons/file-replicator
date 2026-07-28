@@ -17,13 +17,27 @@
 //! message}}` body shape. Handlers return `Result<Option<Value>, CommandError>` instead of building
 //! their own reply.
 //!
-//! **Scoping — body field, not topic segment.** The old scheme split `cmd/status` (all instances)
-//! from `cmd/instances/{id}/status` (one instance) by TOPIC. The command inbox is one subscription
-//! per component (component scope, no instance token), so scoping now rides an optional `instance` field in
-//! the request body — the same convention opcua-adapter/modbus-adapter use for their multi-instance
-//! `sb/*` verbs and telemetry-processor uses for `pause`/`resume`'s `route` field. `get-status`/
-//! `trigger` omit `instance` for "all"; `set-activation` always requires it (it never had an "all"
-//! form).
+//! **Scoping — declared per verb, topic first, body second.** The old scheme split `cmd/status`
+//! (all instances) from `cmd/instances/{id}/status` (one instance) by a hand-rolled TOPIC layout.
+//! Under the UNS core the library owns both inboxes — the component's
+//! `ecv1/{device}/file-replicator/cmd/#` and each instance's
+//! `ecv1/{device}/file-replicator/{instance}/cmd/#` — and core 0.5.0 makes each verb declare its
+//! addressing [`CommandScope`] (`DESIGN-scoped-commands.md` D-SC-2), enforced before dispatch:
+//!
+//! | Verb | Scope | Component-addressed | Instance-addressed |
+//! |---|---|---|---|
+//! | `get-status` | [`CommandScope::Both`] | every instance + the summary | that instance's status |
+//! | `trigger` | [`CommandScope::Both`] | every active instance | that instance |
+//! | `set-activation` | [`CommandScope::Instance`] | the `instance` body field, else `INSTANCE_REQUIRED` | that instance |
+//!
+//! `get-status`/`trigger` are `Both` because "no instance named" has always been a meaningful
+//! *component-wide* answer here, not a default to resolve — D-SC-3's dual-semantics use.
+//! `set-activation` is `Instance`: it never had an "all" form, and D-SC-4 leaves the
+//! "no instance named" policy (this component's `INSTANCE_REQUIRED`) and the unknown-id check
+//! (`UNKNOWN_INSTANCE`) on the component side, since the library does not know the configuration.
+//!
+//! The optional `instance` body field is unchanged for component-addressed callers; when the topic
+//! names an instance it wins ([`address`]).
 //!
 //! ## get-config — retired, not migrated
 //! The custom `get-config` verb (and its optional `legacyConfigTopic` alias) is dropped outright: the
@@ -62,7 +76,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use edgecommons::commands::{command_handler, CommandError, CommandHandler, CommandInbox};
+use edgecommons::commands::{
+    command_handler, CommandError, CommandHandler, CommandInbox, CommandScope,
+};
 use edgecommons::messaging::Message;
 use edgecommons::prelude::Config;
 use serde_json::{json, Value};
@@ -199,9 +215,10 @@ impl ControlPlane {
             try_register(
                 commands,
                 "get-status",
-                command_handler(move |req| {
+                CommandScope::Both,
+                command_handler(move |req, addressed| {
                     let me = me.clone();
-                    async move { me.on_get_status(req).await }
+                    async move { me.on_get_status(address(req, addressed)).await }
                 }),
             );
         }
@@ -210,9 +227,10 @@ impl ControlPlane {
             try_register(
                 commands,
                 "trigger",
-                command_handler(move |req| {
+                CommandScope::Both,
+                command_handler(move |req, addressed| {
                     let me = me.clone();
-                    async move { me.on_trigger(req).await }
+                    async move { me.on_trigger(address(req, addressed)).await }
                 }),
             );
         }
@@ -221,9 +239,10 @@ impl ControlPlane {
             try_register(
                 commands,
                 "set-activation",
-                command_handler(move |req| {
+                CommandScope::Instance,
+                command_handler(move |req, addressed| {
                     let me = me.clone();
-                    async move { me.on_set_activation(req).await }
+                    async move { me.on_set_activation(address(req, addressed)).await }
                 }),
             );
         }
@@ -417,16 +436,45 @@ impl ControlPlane {
     }
 }
 
-/// Registers a verb, logging (not failing) if the inbox rejects it — mirrors
-/// telemetry-processor's `try_register`.
-fn try_register(commands: &CommandInbox, verb: &str, handler: Arc<dyn CommandHandler>) {
-    if let Err(e) = commands.register(verb, handler) {
+/// Registers a verb at its declared [`CommandScope`], logging (not failing) if the inbox rejects it
+/// — mirrors telemetry-processor's `try_register`.
+fn try_register(
+    commands: &CommandInbox,
+    verb: &str,
+    scope: CommandScope,
+    handler: Arc<dyn CommandHandler>,
+) {
+    if let Err(e) = commands.register(verb, scope, handler) {
         tracing::warn!(verb, error = %e, "failed to register command verb");
     }
 }
 
-/// The request body's `"instance"` selector (absent → "all", except `set-activation`, which requires
-/// it — see [`ControlPlane::on_set_activation`]).
+/// Fold the delivery's **topic-addressed** instance (core 0.5.0's `addressed_instance`, D-SC-4) into
+/// the request's `"instance"` body selector, so every handler below reads exactly one selector —
+/// [`instance_of`] — no matter which of the two inboxes the request arrived on.
+///
+/// The topic is authoritative: an instance-addressed delivery overwrites whatever the body said.
+/// That can only ever *fill in* a missing value in practice, because the library already refuses a
+/// request whose topic token and `body.instance` disagree (`BAD_ARGS`) before dispatch. A
+/// component-addressed delivery leaves the request untouched, so the established
+/// "`instance` in the body, absent = all" convention keeps working unchanged.
+fn address(mut req: Message, addressed_instance: Option<String>) -> Message {
+    let Some(id) = addressed_instance else {
+        return req;
+    };
+    match req.body.as_object_mut() {
+        Some(obj) => {
+            obj.insert("instance".to_string(), Value::String(id));
+        }
+        // A non-object body carries no selector to preserve; the addressing must not be lost.
+        None => req.body = json!({ "instance": id }),
+    }
+    req
+}
+
+/// The request's `"instance"` selector — the topic-addressed instance when the delivery named one
+/// (folded in by [`address`]), else the body field (absent → "all", except `set-activation`, which
+/// requires it — see [`ControlPlane::on_set_activation`]).
 fn instance_of(req: &Message) -> Option<&str> {
     req.body.get("instance").and_then(Value::as_str)
 }
@@ -898,6 +946,32 @@ mod tests {
         assert!(v["failed"]["items"][0].get("quarantinedAt").is_none());
         assert_eq!(v["failed"]["items"][1]["state"], json!("quarantined"));
         assert_eq!(v["failed"]["items"][1]["quarantinedAt"], json!("2026-07-01T09:15:22Z"));
+    }
+
+    // ---- addressing (core 0.5.0 scoped commands, D-SC-4) ----------------------------------------
+
+    #[test]
+    fn the_topic_addressed_instance_becomes_the_selector_and_wins_over_the_body() {
+        // Instance-addressed delivery, no body selector: the addressing must not be lost.
+        let r = address(req("get-status", json!({ "ignoreWindow": true })), Some("i2".into()));
+        assert_eq!(instance_of(&r), Some("i2"));
+        assert_eq!(r.body["ignoreWindow"], json!(true), "other body fields survive");
+
+        // The topic wins (the library has already refused an outright conflicting pair).
+        let r = address(req("trigger", json!({ "instance": "i1" })), Some("i1".into()));
+        assert_eq!(instance_of(&r), Some("i1"));
+
+        // Component-addressed delivery: the body selector is untouched, absent still means "all".
+        let r = address(req("get-status", json!({ "instance": "i1" })), None);
+        assert_eq!(instance_of(&r), Some("i1"));
+        let r = address(req("get-status", json!({})), None);
+        assert_eq!(instance_of(&r), None);
+    }
+
+    #[test]
+    fn a_non_object_body_still_carries_the_addressed_instance() {
+        let r = address(req("trigger", json!("not-an-object")), Some("i3".into()));
+        assert_eq!(instance_of(&r), Some("i3"));
     }
 
     // ---- get-status -----------------------------------------------------------------------------

@@ -159,15 +159,20 @@ lean on resume:
 
 ## Activate / deactivate an instance from the control plane
 
-Pause or resume one instance at runtime without a redeploy, via the `set-activation` command (it has **no**
-"all" form — `instance` is required):
+Pause or resume one instance at runtime without a redeploy, via the `set-activation` command. It is an
+**instance-scoped** verb with **no** "all" form: name the instance in the topic, or in the `instance`
+body field over the component topic.
 
 ```
-request topic   ecv1/<device>/FileReplicator/cmd/set-activation
+request topic   ecv1/<device>/FileReplicator/plant-csv-to-s3/cmd/set-activation
 header.name     set-activation
-body            { "instance": "plant-csv-to-s3", "active": false, "persist": true }
+body            { "active": false, "persist": true }
 reply body      { "ok": true, "result": { "instance": "plant-csv-to-s3", "active": false, "persisted": true } }
 ```
+
+The equivalent over the component topic — `ecv1/<device>/FileReplicator/cmd/set-activation` with
+`{ "instance": "plant-csv-to-s3", "active": false, "persist": true }` — is accepted unchanged. Naming
+no instance at all answers `INSTANCE_REQUIRED`.
 
 Send the request through an edgecommons client API or another protobuf-aware producer. The body and reply
 above are decoded JSON content inside the EdgeCommons command envelope; raw MQTT JSON is not accepted as a

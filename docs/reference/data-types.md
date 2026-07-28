@@ -14,11 +14,13 @@ unsigned 64-bit (a JavaScript consumer may lose precision above 2^53). Timestamp
 
 ## The `get-status` document
 
-`get-status` (`…/cmd/get-status`) returns different shapes depending on the request body:
+`get-status` returns different shapes depending on which instance, if any, the request names:
 
-- **`{}`** (no `instance`) → a **component-wide** document: a roster of every instance plus a summary.
-- **`{ "instance": "<id>" }`** → that one instance's **per-instance** document (or its **disabled** document
-  if it was disabled at startup). An unknown id is the error `UNKNOWN_INSTANCE`.
+- **No instance named** — `…/FileReplicator/cmd/get-status` with no `instance` body field → a
+  **component-wide** document: a roster of every instance plus a summary.
+- **One instance named** — `…/FileReplicator/{id}/cmd/get-status`, or the component topic with
+  `{ "instance": "<id>" }` → that one instance's **per-instance** document (or its **disabled**
+  document if it was disabled at startup). An unknown id is the error `UNKNOWN_INSTANCE`.
 
 The reply is always wrapped by the command contract: `{ "ok": true, "result": <document> }`.
 
