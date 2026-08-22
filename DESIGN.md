@@ -831,8 +831,15 @@ move, a missing or unwritable `archiveDir`, a failing delete, or an archived cop
 (`retry.baseDelayMs` → `retry.maxDelayMs`) bounded by `retry.maxAttempts`, or 10 attempts when that is unset.
 The transfer's time-based `giveUpAfter` is deliberately not reused — it starts at discovery and is usually
 largely spent by the time a slow transfer finishes, which would leave exactly the files that struggled hardest
-with no cleanup retries at all. A permanent error (a missing `archiveDir`, a permission denial, a mismatched
-archive copy) gives up on the first attempt: no retry can change any of them.
+with no cleanup retries at all. A permanent error (an unconfigured `archiveDir`, a mismatched archive copy)
+gives up on the first attempt: no retry can change either.
+
+**A locked source file is transient on this path.** A `PermissionDenied`/`ResourceBusy` I/O error — Windows
+`ERROR_SHARING_VIOLATION` (32), Unix `EBUSY` (16) — usually means a producer, antivirus scanner, indexer, or
+backup agent still holds the source open, which clears on its own within seconds. Cleanup retries it under
+the backoff rather than parking the file after one attempt. The **transfer** path keeps the opposite rule
+(`PermissionDenied` is a credential/ACL problem an operator must fix, so it fails fast to `Exhausted`); the
+two classifications are `ReplError::classify_cleanup_io` and `ReplError::classify_io`.
 
 Every reconciliation tick re-drives the `CleanupPending` rows and the `CleanupFailed` rows whose gate has
 elapsed. Once the budget is spent, the item stays `CleanupFailed` with a `FileCleanupFailed` event (§17.1),
@@ -1305,7 +1312,9 @@ rehash of the config keys.
   fire only on a proven action, `FileArchived.archivePath` reports the path the file really landed at (which
   the `suffix` collision policy can rename) rather than a computed one, and the `replicated` statistic counts
   only `Completed`. Cleanup retries use the shared full-jitter backoff on their own attempt budget
-  (`retry.maxAttempts`, else 10), independent of the transfer's time-based `giveUpAfter`. Exhausted items stay
+  (`retry.maxAttempts`, else 10), independent of the transfer's time-based `giveUpAfter`, and a **locked**
+  source (`PermissionDenied`/`ResourceBusy`, Windows `ERROR_SHARING_VIOLATION`, Unix `EBUSY`) is transient on
+  this path even though it stays permanent on the transfer path. Exhausted items stay
   `CleanupFailed`, emit `FileCleanupFailed`, appear in `get-status` under `failed.items[]` with
   `state: "cleanup_failed"` + `cleanupAttempts`, and are re-driven only by `trigger`. §8.1, §13.2, §16, §17.1.
 
@@ -1319,7 +1328,11 @@ rehash of the config keys.
   non-terminal: `upsert_ready` only resets a *terminal* row, so a re-discovered `CleanupPending`/`CleanupFailed`
   source keeps its row and is never re-enqueued as new work. An attempt-bounded cleanup budget was chosen over
   reusing `giveUpAfter` because that clock starts at discovery: a file that spent six days retrying a transfer
-  would otherwise get no cleanup retry at all. The alternative of a separate top-level `cleanup` section in the
+  would otherwise get no cleanup retry at all. The cleanup path's locked-file rule diverges from the transfer
+  path deliberately: on egress a `PermissionDenied` is a credential or ACL an operator must fix, but on the
+  source it is normally a producer, antivirus scanner, indexer, or backup agent still holding the file — the
+  common case on Windows, and one that clears itself in seconds. Failing fast there would demand operator
+  action for a self-healing condition. The alternative of a separate top-level `cleanup` section in the
   `get-status` document was rejected in favor of the existing `failed` bucket — the item genuinely needs an
   operator, `failed.items[].state` already discriminates, and consumers need no new schema.
 

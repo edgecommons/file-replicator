@@ -85,9 +85,14 @@ for a file still sitting in the watch directory is worse than an explicit failur
 Completion attempts retry on their own budget: the same exponential backoff as transfers
 (`retry.baseDelayMs` → `retry.maxDelayMs`), bounded by `retry.maxAttempts` or, when that is unset, 10
 attempts. This is separate from the transfer's `retry.giveUpAfter` clock, which starts when the file is
-discovered and is often nearly spent by the time a long transfer finishes. Errors that no retry can fix — a
-missing `archiveDir`, a permission denial, an archived copy that does not match — stop after the first
-attempt.
+discovered and is often nearly spent by the time a long transfer finishes. Errors that no retry can fix — an
+unconfigured `archiveDir`, an archived copy that does not match — stop after the first attempt.
+
+A **locked source file** is retried, not parked. When a producer, antivirus scanner, indexer, or backup agent
+still holds the file open, the delete or move fails with a sharing violation or a permission error that
+clears on its own within seconds — the ordinary case on Windows. Completion treats these as transient and
+retries them on the backoff above. Transfers keep the opposite rule: there a permission error means a
+credential or ACL you have to fix, so it fails fast rather than retrying for days.
 
 Each reconciliation scan re-drives the files whose completion is still owed. Once a file's completion budget
 is spent it stays `cleanup_failed` and publishes a `file-cleanup-failed` event (severity `critical`, with the

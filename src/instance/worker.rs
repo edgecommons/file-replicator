@@ -893,9 +893,11 @@ impl Worker {
     ///
     /// Deliberately NOT the transfer's time-based `giveUpAfter`: that clock starts at discovery and is
     /// usually largely spent by the time a slow or long-retried transfer finishes, which would leave
-    /// exactly the files that struggled hardest with no cleanup retries at all. A permanent error — a
-    /// missing `archiveDir`, a permission denial, an archived copy that does not match — gives up
-    /// immediately, because retrying cannot change any of them and the operator needs it surfaced.
+    /// exactly the files that struggled hardest with no cleanup retries at all. A permanent error — an
+    /// unconfigured `archiveDir`, an archived copy that does not match — gives up immediately, because
+    /// retrying cannot change either and the operator needs it surfaced. A **locked** source (another
+    /// process holding it open) is deliberately transient here and retried, unlike on the transfer path:
+    /// see [`ReplError::classify_cleanup_io`].
     fn decide_cleanup(&self, permanent: bool, attempts_so_far: u32, now: i64) -> RetryDecision {
         if permanent {
             return RetryDecision::GiveUp;
@@ -1839,6 +1841,12 @@ impl SourceFs {
     }
 }
 
+/// How a filesystem `io::Error` is turned into a [`ReplError`]. Passed explicitly so the shared
+/// [`move_file`] helper keeps each caller's own policy: the source completion action classifies a
+/// locked file as transient ([`ReplError::classify_cleanup_io`]), while quarantine keeps the ordinary
+/// [`ReplError::classify_io`] rules (DESIGN §20-I).
+type IoClassifier = fn(std::io::Error) -> ReplError;
+
 /// The [`SourceFs`] operations a test can fault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FsOp {
@@ -1918,11 +1926,17 @@ fn join_rel(root: &Path, relpath: &str) -> PathBuf {
 ///
 /// Every filesystem call goes through [`SourceFs`] so the failure branches are testable (DESIGN §20-I);
 /// the caller reports the returned path and verifies the file landed there.
-fn move_file(src: &Path, dst: &Path, collision: Collision, fs: &SourceFs) -> Result<PathBuf> {
+fn move_file(
+    src: &Path,
+    dst: &Path,
+    collision: Collision,
+    fs: &SourceFs,
+    classify: IoClassifier,
+) -> Result<PathBuf> {
     if let Some(parent) = dst.parent() {
-        fs.create_dir_all(parent).map_err(ReplError::classify_io)?;
+        fs.create_dir_all(parent).map_err(classify)?;
     }
-    let target = resolve_collision(dst, collision, fs)?;
+    let target = resolve_collision(dst, collision, fs, classify)?;
     // Fast path: same-filesystem rename is already atomic.
     if fs.rename(src, &target).is_ok() {
         return Ok(target);
@@ -1931,7 +1945,7 @@ fn move_file(src: &Path, dst: &Path, collision: Collision, fs: &SourceFs) -> Res
     let tmp = move_temp_path(&target);
     if let Err(e) = fs.copy(src, &tmp) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(ReplError::classify_io(e));
+        return Err(classify(e));
     }
     if fs.rename(&tmp, &target).is_err() {
         // Windows rename won't overwrite; `resolve_collision` should have freed the target, but be
@@ -1939,15 +1953,15 @@ fn move_file(src: &Path, dst: &Path, collision: Collision, fs: &SourceFs) -> Res
         if target.exists() {
             if let Err(e) = fs.remove_file(&target) {
                 let _ = std::fs::remove_file(&tmp);
-                return Err(ReplError::classify_io(e));
+                return Err(classify(e));
             }
         }
         if let Err(e) = fs.rename(&tmp, &target) {
             let _ = std::fs::remove_file(&tmp);
-            return Err(ReplError::classify_io(e));
+            return Err(classify(e));
         }
     }
-    fs.remove_file(src).map_err(ReplError::classify_io)?;
+    fs.remove_file(src).map_err(classify)?;
     Ok(target)
 }
 
@@ -2023,7 +2037,7 @@ fn apply_success_action(ctx: &CleanupCtx, fs: &SourceFs) -> Result<CleanupDone> 
                 Ok(()) => {}
                 // Already gone: a prior attempt (or one interrupted by a crash) succeeded.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(ReplError::classify_io(e)),
+                Err(e) => return Err(ReplError::classify_cleanup_io(e)),
             }
             if ctx.src.exists() {
                 return Err(ReplError::Transient(format!(
@@ -2057,7 +2071,13 @@ fn apply_success_action(ctx: &CleanupCtx, fs: &SourceFs) -> Result<CleanupDone> 
                 );
                 return Ok(CleanupDone::Archived(None));
             }
-            let target = move_file(&ctx.src, &dst, ctx.collision, fs)?;
+            let target = move_file(
+                &ctx.src,
+                &dst,
+                ctx.collision,
+                fs,
+                ReplError::classify_cleanup_io,
+            )?;
             verify_archived(&target, ctx)?;
             Ok(CleanupDone::Archived(Some(target)))
         }
@@ -2074,7 +2094,7 @@ fn apply_success_action(ctx: &CleanupCtx, fs: &SourceFs) -> Result<CleanupDone> 
 /// and the operator needs the item parked in `CleanupFailed` with the reason immediately.
 fn verify_archived(target: &Path, ctx: &CleanupCtx) -> Result<()> {
     let len = std::fs::metadata(target)
-        .map_err(ReplError::classify_io)?
+        .map_err(ReplError::classify_cleanup_io)?
         .len();
     verify_size(ctx.expected_size, len).map_err(permanent_mismatch)?;
     if ctx.verify != Verify::Checksum {
@@ -2086,8 +2106,8 @@ fn verify_archived(target: &Path, ctx: &CleanupCtx) -> Result<()> {
         // Nothing was hashed on delivery, so the size check above is the whole proof available.
         Checksum::None => return Ok(()),
     };
-    let mut f = std::fs::File::open(target).map_err(ReplError::classify_io)?;
-    let (_, actual) = hash_reader(&mut f, algo).map_err(ReplError::classify_io)?;
+    let mut f = std::fs::File::open(target).map_err(ReplError::classify_cleanup_io)?;
+    let (_, actual) = hash_reader(&mut f, algo).map_err(ReplError::classify_cleanup_io)?;
     verify_checksum(&ctx.expected_checksum, &actual).map_err(permanent_mismatch)
 }
 
@@ -2126,7 +2146,7 @@ fn apply_quarantine_action(
         Some(dir) => {
             let dst = join_rel(dir, &ctx.relpath);
             if src.exists() {
-                if let Err(e) = move_file(src, &dst, collision, fs) {
+                if let Err(e) = move_file(src, &dst, collision, fs, ReplError::classify_io) {
                     tracing::warn!(
                         src = %src.display(), dst = %dst.display(), error = %e,
                         "quarantine move failed"
@@ -2170,13 +2190,18 @@ fn write_error_sidecar(dst: &Path, ctx: &QuarantineCtx) {
 
 /// Resolve the effective target path for a collision policy: `overwrite` removes the existing file,
 /// `suffix` finds a free `name.N.ext`, `fail` errors permanently.
-fn resolve_collision(dst: &Path, collision: Collision, fs: &SourceFs) -> Result<PathBuf> {
+fn resolve_collision(
+    dst: &Path,
+    collision: Collision,
+    fs: &SourceFs,
+    classify: IoClassifier,
+) -> Result<PathBuf> {
     if !dst.exists() {
         return Ok(dst.to_path_buf());
     }
     match collision {
         Collision::Overwrite => {
-            fs.remove_file(dst).map_err(ReplError::classify_io)?;
+            fs.remove_file(dst).map_err(classify)?;
             Ok(dst.to_path_buf())
         }
         Collision::Fail => Err(ReplError::Permanent(format!(
@@ -2368,7 +2393,14 @@ mod tests {
         let src = dir.path().join("src.txt");
         std::fs::write(&src, b"hi").unwrap();
         let dst = dir.path().join("sub/dir/out.txt");
-        move_file(&src, &dst, Collision::Fail, &SourceFs::real()).unwrap();
+        move_file(
+            &src,
+            &dst,
+            Collision::Fail,
+            &SourceFs::real(),
+            ReplError::classify_io,
+        )
+        .unwrap();
         assert!(!src.exists());
         assert_eq!(std::fs::read(&dst).unwrap(), b"hi");
     }
@@ -2385,18 +2417,39 @@ mod tests {
 
         // Fail → error, source untouched.
         let s1 = mk("s1.txt", b"a");
-        assert!(move_file(&s1, &dst, Collision::Fail, &SourceFs::real()).is_err());
+        assert!(move_file(
+            &s1,
+            &dst,
+            Collision::Fail,
+            &SourceFs::real(),
+            ReplError::classify_io
+        )
+        .is_err());
         assert!(s1.exists());
 
         // Suffix → writes dst.1.txt, original preserved.
         let s2 = mk("s2.txt", b"b");
-        move_file(&s2, &dst, Collision::Suffix, &SourceFs::real()).unwrap();
+        move_file(
+            &s2,
+            &dst,
+            Collision::Suffix,
+            &SourceFs::real(),
+            ReplError::classify_io,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(dir.path().join("dst.1.txt")).unwrap(), b"b");
         assert_eq!(std::fs::read(&dst).unwrap(), b"existing");
 
         // Overwrite → replaces dst.
         let s3 = mk("s3.txt", b"c");
-        move_file(&s3, &dst, Collision::Overwrite, &SourceFs::real()).unwrap();
+        move_file(
+            &s3,
+            &dst,
+            Collision::Overwrite,
+            &SourceFs::real(),
+            ReplError::classify_io,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"c");
     }
 
@@ -4483,12 +4536,17 @@ mod tests {
         let store = store();
         enqueue_file(&store, src.path(), "r.csv", b"evidence");
         let (fake, events) = recording_events();
+        // Two cleanup attempts, so the retry and the give-up are both observable.
+        let retry = RetryPolicy {
+            max_attempts: Some(2),
+            ..RetryPolicy::default()
+        };
         let worker = archiving_worker(
             store.clone(),
             src.path(),
             dst.path(),
             Some(archive.path()),
-            RetryPolicy::default(),
+            retry,
             SourceFaults::always(FsOp::CreateDirAll, std::io::ErrorKind::PermissionDenied),
         )
         .with_events(events);
@@ -4500,8 +4558,79 @@ mod tests {
         assert!(src.path().join("r.csv").exists());
         assert!(fake.events_named("FileArchived").is_empty());
         assert_eq!(store.stats(INST).unwrap().replicated, 0);
-        // A permission denial is permanent for the retry engine, so the operator hears about it now.
+        // On the cleanup path a permission denial is TRANSIENT (the archive volume may be briefly
+        // unavailable, or something may hold the target), so the first attempt schedules a retry rather
+        // than parking the file.
+        assert!(fake.events_named("FileCleanupFailed").is_empty());
+        assert!(
+            store.get(INST, "r.csv").unwrap().unwrap().next_attempt_at > 100,
+            "a retry gate, not the parked sentinel"
+        );
+
+        // Once the cleanup budget is spent it parks and reports, still without ever completing.
+        worker.drive_cleanup(10_000_000, false).await.unwrap();
+        let row = store.get(INST, "r.csv").unwrap().unwrap();
+        assert_eq!(row.state, ItemState::CleanupFailed);
+        assert_eq!(row.next_attempt_at, CLEANUP_NO_RETRY);
         assert_eq!(fake.events_named("FileCleanupFailed").len(), 1);
+        assert_eq!(store.stats(INST).unwrap().replicated, 0);
+    }
+
+    #[tokio::test]
+    async fn a_locked_source_file_retries_and_completes_once_the_lock_clears() {
+        // The ordinary Windows case: a producer, antivirus scanner, indexer, or backup agent still
+        // holds the source open, so the delete fails with a sharing/permission error. On the CLEANUP
+        // path that is transient — the file must be retried under the cleanup backoff, not parked after
+        // a single attempt the way an egress permission denial is (DESIGN §20-I).
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "r.csv", b"evidence");
+        let (fake, events) = recording_events();
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            RetryPolicy::default(),
+        )
+        .with_source_faults(
+            SourceFaults::always(FsOp::RemoveFile, std::io::ErrorKind::PermissionDenied)
+                .heal_after(1),
+        )
+        .with_events(events);
+
+        // Attempt 1: the file is locked → retry scheduled, nothing completed, nothing announced.
+        assert_eq!(
+            process_only_item(&worker, &store, 100).await,
+            ItemState::CleanupFailed
+        );
+        let row = store.get(INST, "r.csv").unwrap().unwrap();
+        assert_eq!(row.cleanup_attempts, 1);
+        assert!(
+            row.next_attempt_at > 100 && row.next_attempt_at != CLEANUP_NO_RETRY,
+            "a locked source is retried on the backoff, not parked: {row:?}"
+        );
+        assert!(
+            row.last_error.as_deref().unwrap().starts_with("transient:"),
+            "classified transient on the cleanup path, got {:?}",
+            row.last_error
+        );
+        assert!(fake.events_named("FileCleanupFailed").is_empty());
+        assert!(fake.events_named("FileDeleted").is_empty());
+        assert_eq!(store.stats(INST).unwrap().replicated, 0);
+        assert!(src.path().join("r.csv").exists());
+
+        // Attempt 2, after the lock clears: the source is released and the file completes.
+        worker.drive_cleanup(10_000_000, false).await.unwrap();
+        assert_eq!(
+            store.get(INST, "r.csv").unwrap().unwrap().state,
+            ItemState::Completed
+        );
+        assert!(!src.path().join("r.csv").exists());
+        assert_eq!(store.stats(INST).unwrap().replicated, 1);
+        assert_eq!(fake.events_named("FileDeleted").len(), 1);
+        assert!(fake.events_named("FileCleanupFailed").is_empty());
     }
 
     #[tokio::test]
