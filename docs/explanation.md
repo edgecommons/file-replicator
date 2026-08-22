@@ -58,6 +58,46 @@ side effect it authorizes (write-ahead), so a crash between "verified" and "sour
 idempotently on restart — never re-uploading, never losing the file. Object keys are stable/deterministic
 so re-delivery overwrites identically.
 
+On restart, a file caught mid-completion is re-evaluated against what is actually on disk rather than
+re-applied blindly: a source still present means the completion action runs again, and a source already
+gone means it landed, so the file completes. Archiving removes the source only after the target is in
+place, which is what makes "the source is gone" a safe signal.
+
+## Completion is proven, not assumed
+A file counts as replicated only when its **source completion action verifiably happened**. After every
+destination has delivered and verified, file-replicator archives or deletes the source and then proves it:
+under `onSuccess: "archive"` the target must exist at the source's byte count and, with
+`completion.verify: "checksum"`, re-hash to the checksum the destinations verified against; under
+`onSuccess: "delete"` the source must be gone.
+
+When the action does not succeed — the archive move fails, `archiveDir` is missing or unwritable, the
+delete fails, or the archived copy does not match — the file becomes **`cleanup_failed`**:
+
+- it is **not** counted in `replicated`, and no `file-archived` or `file-deleted` event is published;
+- the source stays where it is, so nothing is lost;
+- it appears in `get-status` under `failed.items[]` with `state: "cleanup_failed"` and a
+  `cleanupAttempts` count.
+
+The delivered copies are already safe on every destination — what is unresolved is the source. That
+distinction matters for evidence and chain-of-custody pipelines, where "archived" appearing in a dashboard
+for a file still sitting in the watch directory is worse than an explicit failure.
+
+Completion attempts retry on their own budget: the same exponential backoff as transfers
+(`retry.baseDelayMs` → `retry.maxDelayMs`), bounded by `retry.maxAttempts` or, when that is unset, 10
+attempts. This is separate from the transfer's `retry.giveUpAfter` clock, which starts when the file is
+discovered and is often nearly spent by the time a long transfer finishes. Errors that no retry can fix — a
+missing `archiveDir`, a permission denial, an archived copy that does not match — stop after the first
+attempt.
+
+Each reconciliation scan re-drives the files whose completion is still owed. Once a file's completion budget
+is spent it stays `cleanup_failed` and publishes a `file-cleanup-failed` event (severity `critical`, with the
+`action` that failed and the attempt count). To recover it: fix the cause, then send the `trigger` command,
+which re-drives every `cleanup_failed` file regardless of its backoff.
+
+Because the source of such a file is still in the watch directory, every scan re-discovers it. It is not
+re-queued as new work — the bytes already reached every destination, and only the source's release is
+outstanding.
+
 ## Scheduling vs windows
 `cron` releases ready work at each fire; a `window` (open→close cron, or open+duration) gates continuous
 flow to a time span, for bandwidth conservation. Work outside the window waits; a transfer crossing a

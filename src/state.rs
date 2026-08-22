@@ -8,8 +8,11 @@
 //! inline and pushes bulk scans through `spawn_blocking`. One DB is shared across instances, keyed by
 //! `instance`. Every state transition is persisted *before* the side effect it authorizes (§13.2):
 //! `Ready → InProgress` ([`claim_ready`](StateStore::claim_ready)) precedes the transfer, `Verified`
-//! ([`set_state`](StateStore::set_state)) precedes the source delete/archive, so a crash at any point
-//! is recovered idempotently via [`recover_incomplete`](StateStore::recover_incomplete).
+//! precedes the aggregate completion decision, and `CleanupPending`
+//! ([`set_state`](StateStore::set_state)) precedes the source delete/archive — `Completed` is written
+//! only once that action is proven done (DESIGN §20-I). A crash at any point is recovered
+//! idempotently via [`recover_incomplete`](StateStore::recover_incomplete), which returns the
+//! `InProgress`, `Verified`, and `CleanupPending` rows a prior run left behind.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -45,6 +48,19 @@ pub trait StateStore: Send + Sync {
     /// Failure path: `attempts += 1`, record `err`, set `next_attempt_at`, move to `next_state`
     /// (`Failed` while retrying, `Exhausted` on give-up).
     fn record_attempt(
+        &self,
+        instance: &str,
+        relpath: &str,
+        err: &str,
+        next_state: ItemState,
+        next_attempt_at: i64,
+        now: i64,
+    ) -> Result<()>;
+
+    /// Cleanup failure path (DESIGN §20-I): `cleanup_attempts += 1`, record `err`, set the cleanup
+    /// backoff gate in `next_attempt_at`, and move to `next_state` (`CleanupFailed`). The transfer's
+    /// own `attempts` are left untouched — the two retry budgets are independent.
+    fn record_cleanup_attempt(
         &self,
         instance: &str,
         relpath: &str,
@@ -173,7 +189,9 @@ pub struct Stats {
 
 /// The DDL for the state DB. One DB per component data dir; instances share every table, keyed by
 /// `instance`. `next_attempt_at` is the P1 addition to the §14.2 schema (the backoff re-claim gate,
-/// see [`WorkItem::next_attempt_at`]). `resume.blob` is a JSON-serialized [`ResumeState`] so the S3
+/// see [`WorkItem::next_attempt_at`]); `cleanup_attempts` is the source-completion retry counter
+/// (DESIGN §20-I), kept separate from the transfer's `attempts` so the two budgets are independent —
+/// it is also applied to an already-existing DB via [`ADDED_ITEM_COLUMNS`]. `resume.blob` is a JSON-serialized [`ResumeState`] so the S3
 /// backend (P2) reuses the column for `{uploadId, completedParts}` with no migration. `dest_state` is
 /// the P6 addition (DESIGN §20-B): independent per-destination completion tracking for
 /// multi-destination fan-out, keyed the same way as `resume` — `(instance, relpath, dest)`. The DB is
@@ -189,6 +207,7 @@ CREATE TABLE IF NOT EXISTS work_items(
   mtime_ms        INTEGER NOT NULL DEFAULT 0,
   discovered_at   INTEGER NOT NULL,
   attempts        INTEGER NOT NULL DEFAULT 0,
+  cleanup_attempts INTEGER NOT NULL DEFAULT 0,
   next_attempt_at INTEGER NOT NULL DEFAULT 0,
   last_error      TEXT,
   bytes_done      INTEGER NOT NULL DEFAULT 0,
@@ -219,7 +238,12 @@ CREATE TABLE IF NOT EXISTS stats(
 
 /// The column list for every `work_items` full-row read, in [`row_to_item`] order.
 const ITEM_COLS: &str = "instance, relpath, state, size, discovered_at, attempts, \
-                         next_attempt_at, last_error, bytes_done, updated_at";
+                         next_attempt_at, last_error, bytes_done, updated_at, cleanup_attempts";
+
+/// Columns added to `work_items` after the original release, applied to an already-existing DB with a
+/// guarded `ALTER TABLE` (SQLite has no `ADD COLUMN IF NOT EXISTS`, and `CREATE TABLE IF NOT EXISTS`
+/// only covers a *fresh* file — see [`SqliteStore::init`]).
+const ADDED_ITEM_COLUMNS: &[&str] = &["cleanup_attempts INTEGER NOT NULL DEFAULT 0"];
 
 /// Crash-safe durable state backed by SQLite in WAL mode (DESIGN §14).
 ///
@@ -254,6 +278,15 @@ impl SqliteStore {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        // `CREATE TABLE IF NOT EXISTS` covers a fresh DB and a whole new table, but not a column added
+        // to an existing table. Add each late column with a guarded `ALTER TABLE`: SQLite reports an
+        // already-present column as a plain error, which is the "nothing to do" case here.
+        for col in ADDED_ITEM_COLUMNS {
+            let name = col.split_whitespace().next().unwrap_or(col);
+            if !column_exists(&conn, "work_items", name)? {
+                conn.execute(&format!("ALTER TABLE work_items ADD COLUMN {col}"), [])?;
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -265,6 +298,20 @@ impl SqliteStore {
         // cascading the panic through every subsequent state op.
         self.conn.lock().unwrap_or_else(|p| p.into_inner())
     }
+}
+
+/// Whether `table` already has a column named `column` (drives the guarded `ALTER TABLE` migration in
+/// [`SqliteStore::init`]).
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let name: String = r.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Map a full `work_items` row (in [`ITEM_COLS`] order) to a [`WorkItem`]. `abs_source` is derived
@@ -293,6 +340,7 @@ fn row_to_item(r: &Row<'_>) -> rusqlite::Result<WorkItem> {
         last_error: r.get(7)?,
         bytes_done: r.get::<_, i64>(8)? as u64,
         updated_at: r.get(9)?,
+        cleanup_attempts: r.get::<_, i64>(10)? as u32,
     })
 }
 
@@ -375,6 +423,10 @@ impl StateStore for SqliteStore {
                  WHEN work_items.state IN ('completed','quarantined','retained')
                       AND (work_items.size <> excluded.size OR work_items.mtime_ms <> excluded.mtime_ms)
                  THEN 0 ELSE work_items.bytes_done END,
+               cleanup_attempts = CASE
+                 WHEN work_items.state IN ('completed','quarantined','retained')
+                      AND (work_items.size <> excluded.size OR work_items.mtime_ms <> excluded.mtime_ms)
+                 THEN 0 ELSE work_items.cleanup_attempts END,
                discovered_at = CASE
                  WHEN work_items.state IN ('completed','quarantined','retained')
                       AND (work_items.size <> excluded.size OR work_items.mtime_ms <> excluded.mtime_ms)
@@ -467,6 +519,32 @@ impl StateStore for SqliteStore {
         Ok(())
     }
 
+    fn record_cleanup_attempt(
+        &self,
+        instance: &str,
+        relpath: &str,
+        err: &str,
+        next_state: ItemState,
+        next_attempt_at: i64,
+        now: i64,
+    ) -> Result<()> {
+        self.lock().execute(
+            "UPDATE work_items
+             SET cleanup_attempts = cleanup_attempts + 1, last_error = ?3, state = ?4,
+                 next_attempt_at = ?5, updated_at = ?6
+             WHERE instance = ?1 AND relpath = ?2",
+            params![
+                instance,
+                relpath,
+                err,
+                next_state.as_str(),
+                next_attempt_at,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
     fn set_bytes_done(&self, instance: &str, relpath: &str, bytes: u64, now: i64) -> Result<()> {
         self.lock().execute(
             "UPDATE work_items SET bytes_done = ?3, updated_at = ?4
@@ -494,7 +572,7 @@ impl StateStore for SqliteStore {
         let guard = self.lock();
         let mut stmt = guard.prepare(&format!(
             "SELECT {ITEM_COLS} FROM work_items
-             WHERE instance = ?1 AND state IN ('in_progress', 'verified')
+             WHERE instance = ?1 AND state IN ('in_progress', 'verified', 'cleanup_pending')
              ORDER BY discovered_at ASC"
         ))?;
         let rows = stmt.query_map(params![instance], row_to_item)?;
@@ -921,20 +999,150 @@ mod tests {
     }
 
     #[test]
-    fn recover_incomplete_returns_in_progress_and_verified_only() {
+    fn recover_incomplete_returns_the_non_terminal_in_flight_states_only() {
         let (s, _d) = temp_store();
-        for (rel, disc) in [("a", 1), ("b", 2), ("c", 3), ("d", 4)] {
+        for (rel, disc) in [("a", 1), ("b", 2), ("c", 3), ("d", 4), ("e", 5), ("f", 6)] {
             s.upsert_ready(INST, rel, 1, 0, disc).unwrap();
         }
         s.set_state(INST, "a", ItemState::InProgress, 10).unwrap();
         s.set_state(INST, "b", ItemState::Verified, 10).unwrap();
         s.set_state(INST, "c", ItemState::Completed, 10).unwrap();
+        // A crash inside the write-ahead cleanup window must be recovered too (DESIGN §20-I).
+        s.set_state(INST, "e", ItemState::CleanupPending, 10)
+            .unwrap();
+        // A cleanup FAILURE carries its own backoff gate and is re-driven by the cleanup pass on the
+        // next tick, not by crash recovery — so it must NOT appear here.
+        s.set_state(INST, "f", ItemState::CleanupFailed, 10)
+            .unwrap();
         // "d" stays Ready.
         let rec = s.recover_incomplete(INST).unwrap();
         assert_eq!(
             rec.iter().map(|i| i.relpath.as_str()).collect::<Vec<_>>(),
-            vec!["a", "b"]
+            vec!["a", "b", "e"]
         );
+    }
+
+    #[test]
+    fn record_cleanup_attempt_counts_separately_from_transfer_attempts() {
+        // DESIGN §20-I: the two retry budgets are independent, so a cleanup attempt must never disturb
+        // the transfer's `attempts` (which `get-status` reports and the transfer backoff reads).
+        let (s, _d) = temp_store();
+        s.upsert_ready(INST, "f", 10, 0, 1).unwrap();
+        s.record_attempt(INST, "f", "transfer boom", ItemState::Failed, 100, 5)
+            .unwrap();
+        s.record_attempt(INST, "f", "transfer boom", ItemState::Failed, 200, 6)
+            .unwrap();
+
+        s.record_cleanup_attempt(INST, "f", "archive boom", ItemState::CleanupFailed, 900, 10)
+            .unwrap();
+        let it = s.get(INST, "f").unwrap().unwrap();
+        assert_eq!(it.state, ItemState::CleanupFailed);
+        assert_eq!(it.attempts, 2, "transfer attempts untouched");
+        assert_eq!(it.cleanup_attempts, 1);
+        assert_eq!(
+            it.next_attempt_at, 900,
+            "the cleanup gate reuses next_attempt_at"
+        );
+        assert_eq!(it.last_error.as_deref(), Some("archive boom"));
+        assert_eq!(it.updated_at, 10);
+
+        s.record_cleanup_attempt(
+            INST,
+            "f",
+            "archive boom 2",
+            ItemState::CleanupFailed,
+            950,
+            11,
+        )
+        .unwrap();
+        let it = s.get(INST, "f").unwrap().unwrap();
+        assert_eq!(it.cleanup_attempts, 2);
+        assert_eq!(it.attempts, 2);
+    }
+
+    #[test]
+    fn rediscovery_never_reenqueues_a_cleanup_state() {
+        // DESIGN §20-I / FR-REL-1: the source of a `CleanupPending`/`CleanupFailed` item is still on
+        // disk, so every rescan re-discovers it. Neither state is terminal, so `upsert_ready` must
+        // preserve the row rather than resurrect an already-replicated file as new work.
+        let (s, _d) = temp_store();
+        for (rel, state) in [
+            ("pending", ItemState::CleanupPending),
+            ("failed", ItemState::CleanupFailed),
+        ] {
+            s.upsert_ready(INST, rel, 10, 111, 1).unwrap();
+            s.set_state(INST, rel, state, 2).unwrap();
+            // Re-discovered unchanged, and re-discovered with a different signature: neither resets.
+            s.upsert_ready(INST, rel, 10, 111, 3).unwrap();
+            assert_eq!(s.get(INST, rel).unwrap().unwrap().state, state);
+            s.upsert_ready(INST, rel, 999, 222, 4).unwrap();
+            assert_eq!(
+                s.get(INST, rel).unwrap().unwrap().state,
+                state,
+                "{rel}: a cleanup-state row is never re-enqueued as new work"
+            );
+        }
+        assert!(
+            s.claim_ready(INST, 10, 100).unwrap().is_empty(),
+            "and neither is claimable"
+        );
+    }
+
+    #[test]
+    fn cleanup_attempts_reset_when_a_changed_file_reuses_a_completed_relpath() {
+        // The rotating-filename producer pattern: a genuinely new file at a completed relpath starts
+        // with a fresh cleanup budget, not the prior file's spent one.
+        let (s, _d) = temp_store();
+        s.upsert_ready(INST, "report.csv", 10, 111, 1).unwrap();
+        s.record_cleanup_attempt(INST, "report.csv", "boom", ItemState::CleanupFailed, 500, 2)
+            .unwrap();
+        s.set_state(INST, "report.csv", ItemState::Completed, 3)
+            .unwrap();
+        s.upsert_ready(INST, "report.csv", 10, 222, 10).unwrap();
+        let it = s.get(INST, "report.csv").unwrap().unwrap();
+        assert_eq!(it.state, ItemState::Ready);
+        assert_eq!(
+            it.cleanup_attempts, 0,
+            "fresh cleanup budget for a new file"
+        );
+    }
+
+    #[test]
+    fn a_db_written_before_the_cleanup_column_is_migrated_on_open() {
+        // `CREATE TABLE IF NOT EXISTS` cannot add a column to an existing table, so opening a DB from
+        // an earlier build must apply the guarded ALTER (see `ADDED_ITEM_COLUMNS`) rather than fail
+        // every subsequent `SELECT`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE work_items(
+                   instance        TEXT    NOT NULL,
+                   relpath         TEXT    NOT NULL,
+                   state           TEXT    NOT NULL,
+                   size            INTEGER NOT NULL,
+                   mtime_ms        INTEGER NOT NULL DEFAULT 0,
+                   discovered_at   INTEGER NOT NULL,
+                   attempts        INTEGER NOT NULL DEFAULT 0,
+                   next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                   last_error      TEXT,
+                   bytes_done      INTEGER NOT NULL DEFAULT 0,
+                   updated_at      INTEGER NOT NULL,
+                   PRIMARY KEY(instance, relpath));
+                 INSERT INTO work_items(instance, relpath, state, size, discovered_at, updated_at)
+                 VALUES ('inst-a', 'old.csv', 'ready', 7, 1, 1);",
+            )
+            .unwrap();
+        }
+        let s = SqliteStore::open(&path).unwrap();
+        let it = s.get(INST, "old.csv").unwrap().unwrap();
+        assert_eq!(it.size, 7);
+        assert_eq!(it.cleanup_attempts, 0, "back-filled at the column default");
+        // The migration is idempotent across reopens.
+        drop(s);
+        let s = SqliteStore::open(&path).unwrap();
+        assert_eq!(s.claim_ready(INST, 10, 100).unwrap().len(), 1);
     }
 
     #[test]

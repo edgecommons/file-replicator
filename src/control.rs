@@ -574,6 +574,14 @@ pub(crate) fn instance_state_snapshot(
             .list_by_state(id, ItemState::Quarantined)
             .unwrap_or_default(),
     );
+    // `CleanupFailed` belongs here too (DESIGN §20-I): the bytes reached every destination, but the
+    // source was never released, so the file still needs an operator. It is discriminated by
+    // `items[].state` and carries `cleanupAttempts`, and it is deliberately absent from `replicated`.
+    failed.extend(
+        store
+            .list_by_state(id, ItemState::CleanupFailed)
+            .unwrap_or_default(),
+    );
     instance_status_json(
         &StatusInputs {
             id,
@@ -628,6 +636,11 @@ fn instance_status_json(inp: &StatusInputs, now: i64) -> Value {
             });
             if w.state == ItemState::Quarantined {
                 m["quarantinedAt"] = json!(rfc3339_ms(w.updated_at));
+            }
+            // A cleanup failure's `attempts` are transfer attempts (all of which succeeded), so the
+            // count that explains the row is the separate source-completion one (DESIGN §20-I).
+            if w.state == ItemState::CleanupFailed {
+                m["cleanupAttempts"] = json!(w.cleanup_attempts);
             }
             m
         })
@@ -860,6 +873,7 @@ mod tests {
             size,
             discovered_at: 0,
             attempts: 0,
+            cleanup_attempts: 0,
             next_attempt_at: 0,
             last_error: None,
             bytes_done: 0,
@@ -946,6 +960,59 @@ mod tests {
         assert!(v["failed"]["items"][0].get("quarantinedAt").is_none());
         assert_eq!(v["failed"]["items"][1]["state"], json!("quarantined"));
         assert_eq!(v["failed"]["items"][1]["quarantinedAt"], json!("2026-07-01T09:15:22Z"));
+    }
+
+    #[test]
+    fn a_cleanup_failed_item_is_reported_as_needing_attention() {
+        // DESIGN §20-I: the bytes reached every destination but the source was never released, so the
+        // file still needs an operator. `state` discriminates it from a transfer failure, and the
+        // count that explains it is `cleanupAttempts` (its transfer `attempts` all succeeded).
+        let mut c = work_item("evidence.bin", ItemState::CleanupFailed, 12);
+        c.attempts = 1;
+        c.cleanup_attempts = 10;
+        c.last_error = Some("permanent: onSuccess=archive requires completion.archiveDir".into());
+        let failed = vec![c];
+        let inp = StatusInputs {
+            id: "i1",
+            active: true,
+            configured_enabled: true,
+            schedule_mode: "immediate",
+            dest_label: "local",
+            stats: Stats {
+                replicated: 0,
+                failed: 0,
+                bytes: 0,
+            },
+            awaiting: &[],
+            in_progress: &[],
+            failed: &failed,
+        };
+        let v = instance_status_json(&inp, 100_000);
+        assert_eq!(v["failed"]["count"], json!(1));
+        assert_eq!(v["failed"]["items"][0]["state"], json!("cleanup_failed"));
+        assert_eq!(v["failed"]["items"][0]["cleanupAttempts"], json!(10));
+        assert_eq!(
+            v["replicated"]["count"],
+            json!(0),
+            "a cleanup failure is never counted as replicated"
+        );
+        assert!(v["failed"]["items"][0].get("quarantinedAt").is_none());
+    }
+
+    #[test]
+    fn cleanup_failed_rows_reach_the_status_document_from_the_store() {
+        // Proves the wiring, not just the serializer: `instance_state_snapshot` must actually query
+        // the CleanupFailed state alongside failed/exhausted/quarantined.
+        let store = mem_store();
+        store.upsert_ready("i1", "evidence.bin", 12, 0, 1).unwrap();
+        store
+            .set_state("i1", "evidence.bin", ItemState::CleanupFailed, 2)
+            .unwrap();
+        let v =
+            instance_state_snapshot(store.as_ref(), "i1", true, true, "immediate", "local", 100);
+        assert_eq!(v["failed"]["count"], json!(1));
+        assert_eq!(v["failed"]["items"][0]["path"], json!("evidence.bin"));
+        assert_eq!(v["failed"]["items"][0]["state"], json!("cleanup_failed"));
     }
 
     // ---- addressing (core 0.5.0 scoped commands, D-SC-4) ----------------------------------------

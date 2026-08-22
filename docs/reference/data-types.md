@@ -71,11 +71,18 @@ The reply is always wrapped by the command contract: `{ "ok": true, "result": <d
 | `inProgress[]` | array | Up to 100 in-flight transfers: `path`, `size`, `bytesDone` (int), `percent` (float 0.0–100.0, one decimal), `destination` (backend label, e.g. `local`/`s3`), `attempt` (int, 1-based). |
 | `replicated.count` | int | Lifetime successfully-replicated count (running stat). |
 | `replicated.bytes` | int | Lifetime replicated bytes. |
-| `failed.count` | int | Current failed/exhausted/quarantined item count. |
-| `failed.items[]` | array | Up to 100 entries: `path`, `attempts` (int), `lastError` (string), `state`, and `quarantinedAt` **only** when `state == "quarantined"`. |
+| `failed.count` | int | Current count of items needing attention: failed, exhausted, quarantined, and cleanup-failed. |
+| `failed.items[]` | array | Up to 100 entries: `path`, `attempts` (int), `lastError` (string), `state`, plus `quarantinedAt` **only** when `state == "quarantined"` and `cleanupAttempts` **only** when `state == "cleanup_failed"`. |
 
 `failed.items[].state` is one of `failed` (retrying), `exhausted` (retry budget spent, retained in place),
-or `quarantined` (moved to `failedDir`). `quarantinedAt` is an RFC3339 UTC timestamp.
+`quarantined` (moved to `failedDir`), or `cleanup_failed`. `quarantinedAt` is an RFC3339 UTC timestamp.
+
+A `cleanup_failed` item is not a transfer failure: the file reached and verified on every destination, but
+its source completion action did not succeed — the archive move failed, `archiveDir` is missing or
+unwritable, the delete failed, or the archived copy did not match the source. The source is still in the
+watch directory, the item is not counted in `replicated`, and its `cleanupAttempts` (not `attempts`, which
+counts transfers) says how many completion attempts were made. Fix the cause, then send `trigger` to re-drive
+it. See [Explanation - Completion is proven, not assumed](../explanation.md#completion-is-proven-not-assumed).
 
 > There is no `link` (destination-connectivity) field — file-replicator has no destination circuit-breaker
 > (see [explanation › Resilience](../explanation.md#resilience-across-long-outages)). Do not depend on it.
@@ -125,7 +132,8 @@ object carries the event-specific data; its fields, across all event types, have
 | `size` | int | `file-ready`, `replication-*` | File size in bytes. |
 | `destination` | string | `replication-*` | Backend label of the target (`local`/`s3`/…). |
 | `attempt` | int | `replication-started`/`-progress`/`-failed` | Current attempt, 1-based. |
-| `attempts` | int | `retries-exhausted`, `file-quarantined` | Total attempts made. |
+| `attempts` | int | `retries-exhausted`, `file-quarantined`, `file-cleanup-failed` | Total attempts made — transfer attempts, except on `file-cleanup-failed`, where it counts source completion attempts. |
+| `action` | string | `file-cleanup-failed` | The source completion action that failed: `archive` or `delete`. |
 | `bytesDone` | int | `replication-progress` | Bytes transferred so far. |
 | `percent` | float | `replication-progress` | Percent complete, 0.0–100.0. |
 | `bytes` | int | `replication-completed` | Bytes transferred (total). |
@@ -145,7 +153,7 @@ object carries the event-specific data; its fields, across all event types, have
 | `link` | string | `disconnected` — not emitted | Destination link label (there is no destination circuit-breaker). |
 
 **`message` vs `context`.** For the events with a natural error string — `replication-failed`,
-`retries-exhausted`, `file-quarantined`, `permission-denied` — the error is promoted to the top-level
+`retries-exhausted`, `file-quarantined`, `file-cleanup-failed`, `permission-denied` — the error is promoted to the top-level
 `message` field and **removed from `context`** (never duplicated in the decoded body). So a consumer reads
 the human error from `message`, and the machine fields (`path`, `attempt`, `willRetry`, `role`, …) from
 `context`.

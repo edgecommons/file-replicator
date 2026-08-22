@@ -133,6 +133,37 @@ items also show up in `get-status` under `failed.items[]` with `state: "quaranti
 
 ---
 
+## Recover files whose source could not be archived or deleted
+
+A file that reached every destination but whose source could not be released stops in `cleanup_failed`. It
+is never reported as replicated, and the source stays in the watch directory. Find these files and clear
+them:
+
+1. Call `get-status` and look for `failed.items[]` entries with `state: "cleanup_failed"`. Each carries
+   `lastError`, the failing `path`, and `cleanupAttempts`.
+
+   ```jsonc
+   { "path": "batch-07/evidence.bin", "state": "cleanup_failed",
+     "attempts": 1, "cleanupAttempts": 10,
+     "lastError": "permanent: onSuccess=archive requires completion.archiveDir" }
+   ```
+
+2. Fix what `lastError` names. The usual causes are a missing or misspelled `completion.archiveDir`, an
+   archive volume that is full, read-only, or unmounted, and directory permissions that block the component's
+   user.
+
+3. Send the `trigger` command to the instance. It re-drives every `cleanup_failed` file, including the ones
+   whose completion budget is spent.
+
+4. Confirm with `get-status`: the files move out of `failed` and into `replicated`, and a `file-archived` or
+   `file-deleted` event is published for each.
+
+Subscribe to `file-cleanup-failed` (severity `critical`) to be alerted the moment a file lands in this state
+rather than discovering it at the next status poll. See
+[explanation › Completion is proven, not assumed](explanation.md#completion-is-proven-not-assumed).
+
+---
+
 ## Survive a multi-day disconnection
 
 Two mechanisms tolerate an endpoint being down for hours to days — configure the time budget and
@@ -194,8 +225,8 @@ RUNNING/STOPPED keepalive). Build a live view by combining two sources:
 1. **Subscribe to the event stream** for a device (or the whole fleet):
    `ecv1/+/FileReplicator/+/evt/#`. Apply each `type` (`file-ready`, `replication-started`,
    `replication-progress`, `replication-completed`, `replication-failed`, `retries-exhausted`,
-   `file-archived`/`file-deleted`/`file-quarantined`, …) to your in-memory model. `replication-progress`
-   carries `percent`/`bytesDone` (throttled).
+   `file-archived`/`file-deleted`/`file-cleanup-failed`/`file-quarantined`, …) to your in-memory model.
+   `replication-progress` carries `percent`/`bytesDone` (throttled).
 2. **Prime and re-sync with `get-status`** — call it on connect (and periodically) to get the exact
    `awaiting`/`inProgress`/`replicated`/`failed` document a late subscriber would otherwise have missed.
    Keep your own timestamped app-layer cache as the retain substitute.

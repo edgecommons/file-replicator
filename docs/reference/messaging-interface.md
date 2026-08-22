@@ -79,6 +79,7 @@ severity + type — the topic and the body can never disagree. Body:
 | `retries-exhausted` | critical | — | `path`, `destination`, `attempts` (`message` carries the last error) |
 | `file-archived` | info | — | `path`, `archivePath`? |
 | `file-deleted` | info | — | `path` |
+| `file-cleanup-failed` | critical | — | `path`, `action` (`archive`\|`delete`), `attempts` (`message` carries the last error) |
 | `file-quarantined` | critical | — | `path`, `attempts`, `quarantinePath`? (`message` carries the last error) |
 | `scan-complete` | info | — | `discovered`, `awaiting` |
 | `instance-activated` / `instance-deactivated` | info | — | `source` |
@@ -88,6 +89,16 @@ severity + type — the topic and the body can never disagree. Body:
 | `schedule-complete` | info | — | `mode` (`"cron"` \| `"window"`) |
 | `disconnected` | critical | `raise_alarm` | `link` — not emitted (there is no destination circuit-breaker) |
 | `permission-denied` | critical | — | `path`, `role` (`ingress`\|`egress`\|`archive`\|`failed`) (`message` carries the error) |
+
+`file-archived` / `file-deleted` — published only for a source completion action that verifiably happened:
+the archive target exists and matches the source, or the deleted source is gone. `archivePath` is the path
+the file actually landed at, which the `suffix` collision policy can rename.
+
+`file-cleanup-failed` — the file replicated and verified on every destination, but its source could not be
+released and the completion retry budget is spent. The file is **not** counted in `replicated`, its source
+stays in the watch directory, and it appears in `get-status` under `failed.items[]` with
+`state: "cleanup_failed"`. Fix what `message` reports, then send `trigger` to re-drive it. See
+**Completion is proven, not assumed** in `explanation.md`.
 
 `permission-denied` — a directory/target the instance depends on is unreadable/unwritable, at startup or
 at runtime. ALWAYS emitted, but **deduplicated** so it is not repeated on every rescan or every file: for

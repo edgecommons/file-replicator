@@ -297,6 +297,7 @@ mod tests {
             size,
             discovered_at: 0,
             attempts: 0,
+            cleanup_attempts: 0,
             next_attempt_at: 0,
             last_error: None,
             bytes_done: 0,

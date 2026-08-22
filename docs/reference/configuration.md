@@ -96,16 +96,20 @@ cron, tz/DST-aware.
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `onSuccess` | enum | `archive` | `archive` (needs `archiveDir`) \| `delete`. |
-| `archiveDir` | string | — | Required when `onSuccess=archive`. |
+| `archiveDir` | string | — | Required when `onSuccess=archive`. Without it, no file can be archived: each one is recorded as a cleanup failure rather than a success. |
 | `onExhausted` | enum | `retainInPlace` | `retainInPlace` \| `quarantine` (needs `failedDir`). |
 | `failedDir` | string | — | Quarantine dir + `.error.json` sidecar. |
 | `onCollision` | enum | `suffix` | `suffix` \| `overwrite` \| `fail`. |
-| `verify` | enum | `checksum` | `checksum` \| `size` \| `none`. |
+| `verify` | enum | `checksum` | `checksum` \| `size` \| `none`. Also decides how the archived copy is proven: `checksum` re-hashes it against the delivered checksum, `size` and `none` check its byte count. |
+
+The completion action is proven before a file counts as replicated: under `archive` the target must exist
+and match, and under `delete` the source must be gone. An action that fails leaves the file in
+`cleanup_failed` — see [Explanation - Completion is proven, not assumed](../explanation.md#completion-is-proven-not-assumed).
 
 ### `retry`
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `baseDelayMs` | int | 1000 | Backoff base. |
-| `maxDelayMs` | int | 900000 | Backoff cap (15 min). |
-| `giveUpAfter` | string | `7d` | Time budget; governs long-outage tolerance. |
-| `maxAttempts` | int | — | Optional hard cap (default: none — time-governed). |
+| `baseDelayMs` | int | 1000 | Backoff base. Also the base for source-completion retries. |
+| `maxDelayMs` | int | 900000 | Backoff cap (15 min). Also caps source-completion retries. |
+| `giveUpAfter` | string | `7d` | Time budget for transfers; governs long-outage tolerance. Source-completion retries are bounded by attempts instead. |
+| `maxAttempts` | int | — | Optional hard cap on transfer attempts (default: none — time-governed). It also caps source-completion attempts, which use 10 when it is unset. |
