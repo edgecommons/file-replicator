@@ -9,7 +9,9 @@
 //!                   └─ error → record per-dest attempt + backoff → retry | dest Exhausted
 //!
 //! once EVERY destination is DestPhase::Verified:
-//!   persist ItemState::Verified (write-ahead) → completion (delete|archive) → persist Completed
+//!   persist ItemState::Verified → persist CleanupPending (write-ahead)
+//!     → completion (delete|archive) → PROVE it landed → persist Completed
+//!         └─ error → record cleanup attempt + backoff → CleanupFailed → retry | give up
 //!
 //! if ANY destination permanently exhausts its retry budget:
 //!   the item can never complete (even though other destinations already succeeded) →
@@ -18,11 +20,21 @@
 //!
 //! The **write-ahead** ordering is load-bearing (DESIGN §13.2/§20-B): each destination's
 //! `DestPhase::Verified` is persisted *before* the aggregate item is promoted to `ItemState::Verified`,
-//! which itself is persisted *before* the source side effect, and `Completed` *after* — so a crash at
-//! any point is recovered idempotently by [`recover`](Worker::recover): an already-`Verified`
-//! destination is never re-delivered (the destination object already matches — stable key → idempotent
-//! overwrite), and the completion action (delete/archive) fires **exactly once**, only after the last
-//! destination verifies.
+//! which itself is persisted *before* `ItemState::CleanupPending`, which is persisted *before* the
+//! source side effect — so a crash at any point is recovered idempotently by
+//! [`recover`](Worker::recover): an already-`Verified` destination is never re-delivered (the
+//! destination object already matches — stable key → idempotent overwrite), and the completion action
+//! (delete/archive) fires **exactly once**, only after the last destination verifies.
+//!
+//! ## Completion is proven, not assumed (DESIGN §20-I)
+//! `Completed` means the source was **verifiably** released: the archive target exists at the expected
+//! size (and re-hashes to the delivered checksum under `completion.verify = checksum`), or the deleted
+//! source is really gone. A failed archive move, an unwritable or unconfigured `archiveDir`, or a
+//! failed delete is a **cleanup failure**, not a success: the item stays `CleanupFailed`, `FileArchived`
+//! /`FileDeleted` are not emitted, and the `replicated` statistic does not move. Cleanup retries run on
+//! their own bounded budget ([`Worker::decide_cleanup`]), independent of the transfer's time-based
+//! `giveUpAfter`; when it is spent the item stays `CleanupFailed` with a `FileCleanupFailed` event,
+//! visible in `get-status` and re-drivable with the `trigger` command.
 //!
 //! Failures are classified by [`ReplError`](crate::error::ReplError): *permanent* errors fail fast to
 //! that destination's `Exhausted`; *transient*/*integrity* errors back off with **full-jitter
@@ -48,6 +60,7 @@ use crate::domain::{
 };
 use crate::error::{ReplError, Result};
 use crate::events::{Event, Events, ProgressThrottle};
+use crate::integrity::{hash_reader, verify_checksum, verify_size, Algorithm};
 use crate::metrics::{MetricValues, ReplicatorMetrics};
 use crate::permission::{PermissionLog, Role};
 use crate::ratelimit::Bandwidth;
@@ -63,6 +76,18 @@ const PROGRESS_STEP_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_BASE_DELAY_MS: u64 = 1_000;
 const DEFAULT_MAX_DELAY_MS: u64 = 900_000;
 const DEFAULT_GIVE_UP_AFTER_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// Cleanup attempt budget when `retry.maxAttempts` is not configured (DESIGN §20-I). The source
+/// completion action is a local filesystem operation, so it is bounded by **attempts** rather than by
+/// the transfer's time-based `giveUpAfter` — that clock starts at discovery and is often largely spent
+/// by the time the transfer finishes, which would leave a slow file with no cleanup retries at all.
+/// Ten attempts on the shared full-jitter backoff (capped at `retry.maxDelayMs`, default 15 min) spans
+/// roughly an hour of transient unavailability before an operator is asked to intervene.
+const DEFAULT_CLEANUP_MAX_ATTEMPTS: u32 = 10;
+
+/// The `next_attempt_at` written for a `CleanupFailed` item whose cleanup budget is spent: no
+/// reconciliation scan will ever re-drive it, only an explicit operator `trigger` (DESIGN §20-I).
+const CLEANUP_NO_RETRY: i64 = i64::MAX;
 
 /// The resolved retry/backoff policy for an instance (instance `retry` ▸ `global.defaults.retry` ▸
 /// built-in defaults, field-by-field).
@@ -259,8 +284,8 @@ pub struct Worker {
     /// Optional metric emitter.
     metrics: Option<Arc<ReplicatorMetrics>>,
     /// UNS event emitter for the per-file lifecycle events (`ReplicationStarted`/`…Progress`/
-    /// `…Completed`/`…Failed`/`FileDeleted`/`FileArchived`/`RetriesExhausted`/`FileQuarantined`,
-    /// DESIGN §17). A no-op [`Events::disabled`] by default, so a worker built without messaging (or
+    /// `…Completed`/`…Failed`/`FileDeleted`/`FileArchived`/`FileCleanupFailed`/`RetriesExhausted`/
+    /// `FileQuarantined`, DESIGN §17). A no-op [`Events::disabled`] by default, so a worker built without messaging (or
     /// in a unit test) runs the exact P1/P2 pipeline with zero event overhead.
     events: Events,
     /// Feature A (`src/permission.rs`) dedup-log for egress permission errors — ALWAYS logged once
@@ -273,6 +298,10 @@ pub struct Worker {
     /// (ingress evicts recovered paths every tick; egress is inherently bounded by destination count),
     /// so they are deliberately NOT shared. A fresh, unshared [`PermissionLog`] by default.
     perm_log: Arc<PermissionLog>,
+    /// The source-side filesystem the completion action runs against. Always the real filesystem in
+    /// production ([`SourceFs::real`]); tests swap in a faulting handle to exercise the cleanup-failure
+    /// paths (DESIGN §20-I).
+    source_fs: SourceFs,
 }
 
 impl Worker {
@@ -335,7 +364,17 @@ impl Worker {
             metrics,
             events: Events::disabled(),
             perm_log: Arc::new(PermissionLog::new()),
+            source_fs: SourceFs::real(),
         }
+    }
+
+    /// Swap in a faulting source filesystem (tests only — see [`SourceFs`]).
+    #[cfg(test)]
+    fn with_source_faults(mut self, faults: SourceFaults) -> Self {
+        self.source_fs = SourceFs {
+            faults: Some(Arc::new(faults)),
+        };
+        self
     }
 
     /// Attach the UNS event emitter (the P3 control-plane wiring path, [`crate::app`]). Consumes and
@@ -379,8 +418,9 @@ impl Worker {
         join_rel(&self.ingress_root, &item.relpath)
     }
 
-    /// Process one claimed (`InProgress`) item to a terminal (or `Failed` retry) state, emitting
-    /// metrics. A durable-store fault is logged and the item is left as-is for the next recovery pass.
+    /// Process one claimed (`InProgress`) item to a terminal state, a `Failed` transfer retry, or a
+    /// `CleanupFailed` completion retry (DESIGN §20-I), emitting metrics. A durable-store fault is
+    /// logged and the item is left as-is for the next recovery pass.
     pub async fn process_item(&self, item: &WorkItem, now: i64) -> ItemState {
         // The store returns `relpath` only; rebuild the live absolute source path for delivery.
         let mut item = item.clone();
@@ -651,42 +691,103 @@ impl Worker {
             .clear_resume(&self.instance, &item.relpath, label);
     }
 
-    /// Run the success completion action (`delete` | `archive`) on the source, then persist
-    /// `Completed`. Idempotent: a missing source (already completed before a crash) is fine. Filesystem
-    /// errors are logged but still advance to `Completed` — the delivery succeeded and the durable
-    /// `Completed` marker stops the file being re-discovered, so a stale source can never loop.
+    /// Drive an item whose every destination is `Verified` through the source completion action
+    /// (`delete` | `archive`) to `Completed` — or, if that action fails, to `CleanupFailed`
+    /// (DESIGN §20-I).
     ///
-    /// The source-side filesystem work runs on the blocking pool: a cross-device archive falls back to
-    /// a whole-file copy, which must not block a shared async worker thread (DESIGN §6.3).
+    /// Thin wrapper over [`run_cleanup`](Self::run_cleanup), kept as the name the aggregate-`Verified`
+    /// call sites use ([`run_pipeline`](Self::run_pipeline), [`recover_verified`](Self::recover_verified),
+    /// and the window-close pause path).
     async fn complete_verified(&self, item: &WorkItem, now: i64) -> Result<ItemState> {
-        let src = self.abs_source(item);
-        let on_success = self.completion.on_success;
-        let archive_dir = self.completion.archive_dir.clone();
-        let collision = self.completion.on_collision;
-        let relpath = item.relpath.clone();
-        let instance = self.instance.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || {
-            apply_success_action(
-                on_success,
-                &src,
-                archive_dir.as_deref(),
-                &relpath,
-                collision,
-                &instance,
-            )
-        })
-        .await
-        {
-            tracing::warn!(
-                instance = %self.instance, relpath = %item.relpath, error = %e,
-                "completion task join failed; marking complete anyway (delivery already succeeded)"
-            );
+        self.run_cleanup(item, now).await
+    }
+
+    /// Apply the source completion action and persist the outcome (DESIGN §13.2/§20-I).
+    ///
+    /// **Write-ahead:** `CleanupPending` is persisted *before* the filesystem is touched, so a crash
+    /// mid-action is found by [`recover`](Self::recover) and re-evaluated against observed state.
+    /// `Completed` is persisted only once [`apply_success_action`] has **proven** the action landed —
+    /// the archive target exists at the source's size (re-hashed to the delivered checksum under
+    /// `completion.verify = checksum`), or the deleted source is really gone. Anything else is a
+    /// cleanup failure: the item moves to `CleanupFailed`, no `FileArchived`/`FileDeleted` is emitted,
+    /// and the `replicated` statistic does not move. For an evidence pipeline a source left behind, or
+    /// an archive copy that never landed, is not a success and must never be recorded as one.
+    ///
+    /// The filesystem work runs on the blocking pool: a cross-device archive falls back to a whole-file
+    /// copy plus a re-hash, which must not block a shared async worker thread (DESIGN §6.3).
+    ///
+    /// Callers own the metric emission ([`emit`](Self::emit)) for the returned state.
+    pub(crate) async fn run_cleanup(&self, item: &WorkItem, now: i64) -> Result<ItemState> {
+        self.store.set_state(
+            &self.instance,
+            &item.relpath,
+            ItemState::CleanupPending,
+            now,
+        )?;
+
+        let ctx = CleanupCtx {
+            on_success: self.completion.on_success,
+            src: self.abs_source(item),
+            archive_dir: self.completion.archive_dir.clone(),
+            relpath: item.relpath.clone(),
+            collision: self.completion.on_collision,
+            verify: self.completion.verify,
+            expected_size: item.size,
+            expected_checksum: self.delivered_checksum(&item.relpath),
+        };
+        let action = ctx.action();
+        let fs = self.source_fs.clone();
+        let outcome =
+            match tokio::task::spawn_blocking(move || apply_success_action(&ctx, &fs)).await {
+                Ok(r) => r,
+                Err(join_err) => Err(ReplError::Transient(format!(
+                    "completion task join failed: {join_err}"
+                ))),
+            };
+        match outcome {
+            Ok(done) => self.finish_completed(item, done, now).await,
+            Err(e) => self.record_cleanup_failure(item, action, e, now).await,
         }
+    }
+
+    /// The checksum every destination verified this item's bytes against, read back from any
+    /// destination's `Verified` write-ahead checkpoint (they all hashed the same source bytes, and the
+    /// [`Checksum`] variant carries its own algorithm). The checkpoints are cleared only AFTER
+    /// `Completed`, so they are still present for every cleanup attempt, including one that runs after
+    /// a restart. [`Checksum::None`] when nothing was hashed on delivery.
+    fn delivered_checksum(&self, relpath: &str) -> Checksum {
+        for slot in &self.dests {
+            let Ok(Some(resume)) = self.store.load_resume(&self.instance, relpath, &slot.label)
+            else {
+                continue;
+            };
+            let delivered: Option<Delivered> = resume
+                .token
+                .get("verified")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok());
+            if let Some(d) = delivered {
+                if d.checksum != Checksum::None {
+                    return d.checksum;
+                }
+            }
+        }
+        Checksum::None
+    }
+
+    /// Persist `Completed` after the source action was proven done, then emit the source-side success
+    /// event and count the file as replicated.
+    async fn finish_completed(
+        &self,
+        item: &WorkItem,
+        done: CleanupDone,
+        now: i64,
+    ) -> Result<ItemState> {
         self.store
             .set_state(&self.instance, &item.relpath, ItemState::Completed, now)?;
         tracing::info!(
             instance = %self.instance, relpath = %item.relpath,
-            action = ?self.completion.on_success, "item completed; source side-effect applied"
+            action = ?self.completion.on_success, "item completed; source side-effect verified"
         );
         // Clear every destination's resume checkpoint + per-destination completion bookkeeping only
         // AFTER Completed is durable, so a crash in the aggregate Verified→Completed gap still finds
@@ -702,32 +803,148 @@ impl Worker {
             },
         )?;
 
-        // Lifecycle events (DESIGN §17.1): the source side effect that ran. `ReplicationCompleted` was
-        // already emitted per destination (by `run_one_dest`, or by `recover_verified` re-verifying on
-        // recovery) — this is the aggregate/source-side event, fired exactly once.
-        match self.completion.on_success {
-            OnSuccess::Delete => {
+        // Lifecycle events (DESIGN §17.1): the source side effect that actually ran.
+        // `ReplicationCompleted` was already emitted per destination (by `run_one_dest`, or by
+        // `recover_verified` re-verifying on recovery) — this is the aggregate/source-side event, fired
+        // exactly once, and only for an action that verifiably happened. `archivePath` is the path the
+        // file really landed at (which the `suffix` collision policy can rename), not a computed guess.
+        match done {
+            CleanupDone::Deleted => {
                 self.events
                     .emit(Event::FileDeleted {
                         path: item.relpath.clone(),
                     })
                     .await;
             }
-            OnSuccess::Archive => {
-                let archive_path = self
-                    .completion
-                    .archive_dir
-                    .as_ref()
-                    .map(|d| join_rel(d, &item.relpath).display().to_string());
+            CleanupDone::Archived(target) => {
                 self.events
                     .emit(Event::FileArchived {
                         path: item.relpath.clone(),
-                        archive_path,
+                        archive_path: target.map(|p| p.display().to_string()),
                     })
                     .await;
             }
         }
         Ok(ItemState::Completed)
+    }
+
+    /// Record a failed source completion action (DESIGN §20-I): `cleanup_attempts += 1`, the error, and
+    /// the move to `CleanupFailed` with the item's next cleanup gate. While the cleanup budget lasts the
+    /// gate is a full-jitter backoff and the next reconciliation scan re-drives the item; once the
+    /// budget is spent the gate is [`CLEANUP_NO_RETRY`] (only an operator `trigger` re-drives it) and a
+    /// `FileCleanupFailed` event is emitted.
+    async fn record_cleanup_failure(
+        &self,
+        item: &WorkItem,
+        action: &str,
+        error: ReplError,
+        now: i64,
+    ) -> Result<ItemState> {
+        let attempts = item.cleanup_attempts.saturating_add(1);
+        let err_str = error.to_string();
+        match self.decide_cleanup(error.is_permanent(), item.cleanup_attempts, now) {
+            RetryDecision::Retry { next_attempt_at } => {
+                self.store.record_cleanup_attempt(
+                    &self.instance,
+                    &item.relpath,
+                    &err_str,
+                    ItemState::CleanupFailed,
+                    next_attempt_at,
+                    now,
+                )?;
+                tracing::warn!(
+                    instance = %self.instance, relpath = %item.relpath, action,
+                    attempts, retry_at = next_attempt_at, error = %err_str,
+                    "source completion action failed; scheduled for retry (item NOT completed)"
+                );
+            }
+            RetryDecision::GiveUp => {
+                self.store.record_cleanup_attempt(
+                    &self.instance,
+                    &item.relpath,
+                    &err_str,
+                    ItemState::CleanupFailed,
+                    CLEANUP_NO_RETRY,
+                    now,
+                )?;
+                tracing::error!(
+                    instance = %self.instance, relpath = %item.relpath, action, attempts,
+                    error = %err_str,
+                    "source completion action failed permanently; item parked in CleanupFailed \
+                     (delivered and verified on every destination, source NOT released)"
+                );
+                self.events
+                    .emit(Event::FileCleanupFailed {
+                        path: item.relpath.clone(),
+                        action: action.to_string(),
+                        attempts,
+                        last_error: err_str,
+                    })
+                    .await;
+            }
+        }
+        Ok(ItemState::CleanupFailed)
+    }
+
+    /// Decide whether a failed cleanup attempt is retried (DESIGN §20-I). Uses the instance's
+    /// [`RetryPolicy`] backoff — the same full-jitter exponential curve, capped at `retry.maxDelayMs` —
+    /// but its OWN attempt budget: `retry.maxAttempts` when configured, otherwise
+    /// [`DEFAULT_CLEANUP_MAX_ATTEMPTS`].
+    ///
+    /// Deliberately NOT the transfer's time-based `giveUpAfter`: that clock starts at discovery and is
+    /// usually largely spent by the time a slow or long-retried transfer finishes, which would leave
+    /// exactly the files that struggled hardest with no cleanup retries at all. A permanent error — an
+    /// unconfigured `archiveDir`, an archived copy that does not match — gives up immediately, because
+    /// retrying cannot change either and the operator needs it surfaced. A **locked** source (another
+    /// process holding it open) is deliberately transient here and retried, unlike on the transfer path:
+    /// see [`ReplError::classify_cleanup_io`].
+    fn decide_cleanup(&self, permanent: bool, attempts_so_far: u32, now: i64) -> RetryDecision {
+        if permanent {
+            return RetryDecision::GiveUp;
+        }
+        let attempts = attempts_so_far.saturating_add(1);
+        let cap = self
+            .retry
+            .max_attempts
+            .unwrap_or(DEFAULT_CLEANUP_MAX_ATTEMPTS);
+        if attempts >= cap {
+            return RetryDecision::GiveUp;
+        }
+        let delay = {
+            let mut r = self.rng.lock().expect("rng mutex");
+            self.retry.backoff_ms(attempts, &mut *r)
+        } as i64;
+        RetryDecision::Retry {
+            next_attempt_at: now.saturating_add(delay),
+        }
+    }
+
+    /// Re-drive the items whose delivery is done but whose source completion action is not
+    /// (DESIGN §20-I) — every `CleanupPending` row (a crash or an abort left the action mid-flight)
+    /// plus the `CleanupFailed` rows whose cleanup backoff gate has elapsed.
+    ///
+    /// Called on every reconciliation tick, so a transient cleanup failure heals on its own. With
+    /// `redrive_all` (the operator `trigger` command) the gate is ignored, which is what rescues an
+    /// item whose cleanup budget is spent once the underlying cause — a full disk, a missing
+    /// `archiveDir`, a read-only mount — has been fixed.
+    pub async fn drive_cleanup(&self, now: i64, redrive_all: bool) -> Result<()> {
+        let mut due = self
+            .store
+            .list_by_state(&self.instance, ItemState::CleanupPending)?;
+        for it in self
+            .store
+            .list_by_state(&self.instance, ItemState::CleanupFailed)?
+        {
+            if redrive_all || it.next_attempt_at <= now {
+                due.push(it);
+            }
+        }
+        for mut it in due {
+            it.abs_source = self.abs_source(&it);
+            let state = self.run_cleanup(&it, now).await?;
+            self.emit(state, it.size).await;
+        }
+        Ok(())
     }
 
     /// Terminal handling for an `Exhausted` item: `quarantine` (move to `failedDir` + an
@@ -770,8 +987,9 @@ impl Worker {
                     destination: self.dest_labels_joined(),
                     bytes_done: item.bytes_done,
                 };
+                let fs = self.source_fs.clone();
                 if let Err(e) = tokio::task::spawn_blocking(move || {
-                    apply_quarantine_action(failed_dir.as_deref(), &src, collision, &ctx)
+                    apply_quarantine_action(failed_dir.as_deref(), &src, collision, &ctx, &fs)
                 })
                 .await
                 {
@@ -810,14 +1028,30 @@ impl Worker {
         }
     }
 
-    /// Crash recovery (DESIGN §13.2), idempotent. `Verified` items are **re-verified against the
-    /// destination before** the source side effect (see [`recover_verified`](Self::recover_verified));
-    /// `InProgress` items return to `Ready` for idempotent re-delivery; `Exhausted` items (a crash
-    /// before their terminal action) re-run `onExhausted`.
+    /// Crash recovery (DESIGN §13.2), idempotent, run before any new work. `Verified` items are
+    /// **re-verified against the destination before** the source side effect (see
+    /// [`recover_verified`](Self::recover_verified)); `CleanupPending` items — a crash caught between
+    /// the write-ahead cleanup marker and the proof that the action landed — are re-evaluated against
+    /// observed filesystem state by [`run_cleanup`](Self::run_cleanup) (DESIGN §20-I): a source still
+    /// present means the action is retried, a source already gone (deleted, or archived — `move_file`
+    /// removes it only after the target rename succeeds) means the item completes. `InProgress` items
+    /// return to `Ready` for idempotent re-delivery; `Exhausted` items (a crash before their terminal
+    /// action) re-run `onExhausted`.
+    ///
+    /// `CleanupFailed` items are NOT re-driven here: they carry their own backoff gate and are picked
+    /// up by [`drive_cleanup`](Self::drive_cleanup) on the reconciliation tick that follows startup.
     pub async fn recover(&self, now: i64) -> Result<()> {
         for it in self.store.recover_incomplete(&self.instance)? {
             match it.state {
                 ItemState::Verified => self.recover_verified(&it, now).await?,
+                ItemState::CleanupPending => {
+                    tracing::info!(
+                        instance = %self.instance, relpath = %it.relpath,
+                        "recovering CleanupPending → re-evaluating the source completion action"
+                    );
+                    let state = self.run_cleanup(&it, now).await?;
+                    self.emit(state, it.size).await;
+                }
                 ItemState::InProgress => {
                     // Before re-readying, re-verify any destination a PRIOR session already marked
                     // `DestPhase::Verified` (fan-out narrows the §13.2 crash window — see
@@ -883,8 +1117,10 @@ impl Worker {
 
         if all_ok {
             tracing::info!(instance = %self.instance, relpath = %it.relpath, "recovering Verified → every destination re-verified, completing");
-            let _ = self.complete_verified(it, now).await?;
-            self.emit(ItemState::Completed, it.size).await;
+            // The completion action can still fail (an unwritable archive, a vanished archiveDir), so
+            // report the state it actually reached — `Completed` or `CleanupFailed` (DESIGN §20-I).
+            let state = self.complete_verified(it, now).await?;
+            self.emit(state, it.size).await;
         } else {
             self.store
                 .set_state(&self.instance, &it.relpath, ItemState::Ready, now)?;
@@ -1547,6 +1783,124 @@ fn percent_int(done: u64, size: u64) -> i32 {
     (((done as f64 / size as f64) * 100.0).round() as i32).clamp(0, 100)
 }
 
+/// The source-side filesystem operations the completion action performs, behind one cloneable handle
+/// so tests can inject faults (a failing rename, an uncreatable archive directory, a failing delete, a
+/// cross-filesystem copy) deterministically — no real cross-device mount and no platform-specific
+/// permission tricks. In production every call delegates straight to `std::fs`; the fault table exists
+/// only in test builds, mirroring [`Events`]'s test recorder, so the shipping path carries nothing but
+/// the plain `std::fs` call.
+#[derive(Clone, Default)]
+pub(crate) struct SourceFs {
+    #[cfg(test)]
+    faults: Option<Arc<SourceFaults>>,
+}
+
+impl SourceFs {
+    /// The real filesystem (the only constructor used outside tests).
+    pub(crate) fn real() -> Self {
+        Self::default()
+    }
+
+    /// The injected error for `op`, if this handle is faulting it on this call.
+    #[cfg(test)]
+    fn fault(&self, op: FsOp) -> Option<std::io::Error> {
+        self.faults.as_ref().and_then(|f| f.take(op))
+    }
+    #[cfg(not(test))]
+    #[inline]
+    fn fault(&self, _op: FsOp) -> Option<std::io::Error> {
+        None
+    }
+
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        match self.fault(FsOp::RemoveFile) {
+            Some(e) => Err(e),
+            None => std::fs::remove_file(path),
+        }
+    }
+
+    fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        match self.fault(FsOp::CreateDirAll) {
+            Some(e) => Err(e),
+            None => std::fs::create_dir_all(path),
+        }
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        match self.fault(FsOp::Rename) {
+            Some(e) => Err(e),
+            None => std::fs::rename(from, to),
+        }
+    }
+
+    fn copy(&self, from: &Path, to: &Path) -> std::io::Result<u64> {
+        match self.fault(FsOp::Copy) {
+            Some(e) => Err(e),
+            None => std::fs::copy(from, to),
+        }
+    }
+}
+
+/// How a filesystem `io::Error` is turned into a [`ReplError`]. Passed explicitly so the shared
+/// [`move_file`] helper keeps each caller's own policy: the source completion action classifies a
+/// locked file as transient ([`ReplError::classify_cleanup_io`]), while quarantine keeps the ordinary
+/// [`ReplError::classify_io`] rules (DESIGN §20-I).
+type IoClassifier = fn(std::io::Error) -> ReplError;
+
+/// The [`SourceFs`] operations a test can fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsOp {
+    RemoveFile,
+    CreateDirAll,
+    Rename,
+    Copy,
+}
+
+/// Test-only fault table for [`SourceFs`]: each faulted operation returns `kind` instead of touching
+/// the filesystem. `heal_after` bounds how many faulted calls are served before the table stops
+/// faulting, which is what lets a test prove "cleanup retries, then succeeds".
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct SourceFaults {
+    ops: Vec<(FsOp, std::io::ErrorKind)>,
+    heal_after: Option<u32>,
+    calls: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(test)]
+impl SourceFaults {
+    /// Fault `op` with `kind` on every call.
+    pub(crate) fn always(op: FsOp, kind: std::io::ErrorKind) -> Self {
+        SourceFaults {
+            ops: vec![(op, kind)],
+            heal_after: None,
+            calls: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Also fault `op` with `kind` (chained onto an existing table).
+    pub(crate) fn and(mut self, op: FsOp, kind: std::io::ErrorKind) -> Self {
+        self.ops.push((op, kind));
+        self
+    }
+
+    /// Stop faulting after `n` faulted calls have been served.
+    pub(crate) fn heal_after(mut self, n: u32) -> Self {
+        self.heal_after = Some(n);
+        self
+    }
+
+    fn take(&self, op: FsOp) -> Option<std::io::Error> {
+        let kind = self.ops.iter().find(|(o, _)| *o == op).map(|(_, k)| *k)?;
+        if let Some(limit) = self.heal_after {
+            if self.calls.fetch_add(1, Ordering::SeqCst) >= limit {
+                return None;
+            }
+        }
+        Some(std::io::Error::new(kind, format!("injected {op:?} fault")))
+    }
+}
+
 /// Join a forward-slash `relpath` onto `root`, dropping empty/`.`/`..` segments so the result always
 /// stays under `root` (mirrors the destination key derivation).
 fn join_rel(root: &Path, relpath: &str) -> PathBuf {
@@ -1560,45 +1914,55 @@ fn join_rel(root: &Path, relpath: &str) -> PathBuf {
     p
 }
 
-/// Move `src` → `dst`, creating parents and honoring the collision policy. Prefers an atomic rename;
-/// falls back to a **crash-atomic** copy across filesystems.
+/// Move `src` → `dst`, creating parents and honoring the collision policy, returning the **resolved**
+/// target the file actually landed at (which differs from `dst` under the `suffix` policy). Prefers an
+/// atomic rename; falls back to a **crash-atomic** copy across filesystems.
 ///
 /// The cross-device fallback copies into a sibling temp file in the destination directory, then
 /// atomically renames it onto the resolved target and removes the source. Copying via a temp keeps
 /// the move crash-atomic: a crash *during* the (long) copy leaves only an orphan temp, never a
 /// partially-written `target` that a recovery pass would mistake for a real file and duplicate under
 /// the default `suffix` collision policy (`name` + `name.1.ext`). (DESIGN §13.2.)
-fn move_file(src: &Path, dst: &Path, collision: Collision) -> Result<()> {
+///
+/// Every filesystem call goes through [`SourceFs`] so the failure branches are testable (DESIGN §20-I);
+/// the caller reports the returned path and verifies the file landed there.
+fn move_file(
+    src: &Path,
+    dst: &Path,
+    collision: Collision,
+    fs: &SourceFs,
+    classify: IoClassifier,
+) -> Result<PathBuf> {
     if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent).map_err(ReplError::classify_io)?;
+        fs.create_dir_all(parent).map_err(classify)?;
     }
-    let target = resolve_collision(dst, collision)?;
+    let target = resolve_collision(dst, collision, fs, classify)?;
     // Fast path: same-filesystem rename is already atomic.
-    if std::fs::rename(src, &target).is_ok() {
-        return Ok(());
+    if fs.rename(src, &target).is_ok() {
+        return Ok(target);
     }
     // Cross-device (or Windows target-exists) fallback: copy → temp, atomic rename, remove source.
     let tmp = move_temp_path(&target);
-    if let Err(e) = std::fs::copy(src, &tmp) {
+    if let Err(e) = fs.copy(src, &tmp) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(ReplError::classify_io(e));
+        return Err(classify(e));
     }
-    if std::fs::rename(&tmp, &target).is_err() {
+    if fs.rename(&tmp, &target).is_err() {
         // Windows rename won't overwrite; `resolve_collision` should have freed the target, but be
         // defensive: remove an existing target then retry, cleaning the temp on any failure.
         if target.exists() {
-            if let Err(e) = std::fs::remove_file(&target) {
+            if let Err(e) = fs.remove_file(&target) {
                 let _ = std::fs::remove_file(&tmp);
-                return Err(ReplError::classify_io(e));
+                return Err(classify(e));
             }
         }
-        if let Err(e) = std::fs::rename(&tmp, &target) {
+        if let Err(e) = fs.rename(&tmp, &target) {
             let _ = std::fs::remove_file(&tmp);
-            return Err(ReplError::classify_io(e));
+            return Err(classify(e));
         }
     }
-    std::fs::remove_file(src).map_err(ReplError::classify_io)?;
-    Ok(())
+    fs.remove_file(src).map_err(classify)?;
+    Ok(target)
 }
 
 /// A collision-resistant temp path in the destination directory for the crash-atomic move fallback:
@@ -1616,42 +1980,143 @@ fn move_temp_path(target: &Path) -> PathBuf {
     dir.join(format!(".{name}.{tag:032x}.movetmp"))
 }
 
-/// The success completion side effect (`delete` | `archive`) on the source file, run on the blocking
-/// pool by [`Worker::complete_verified`]. Idempotent: a missing source (already completed before a
-/// crash) is fine. Errors are logged, not fatal — delivery already succeeded and the durable
-/// `Completed` marker stops re-discovery, so a stale source can never loop.
-fn apply_success_action(
+/// Everything the source-side completion action needs, carried into the blocking pool by
+/// [`Worker::run_cleanup`].
+struct CleanupCtx {
     on_success: OnSuccess,
-    src: &Path,
-    archive_dir: Option<&Path>,
-    relpath: &str,
+    /// Absolute source path.
+    src: PathBuf,
+    archive_dir: Option<PathBuf>,
+    relpath: String,
     collision: Collision,
-    instance: &str,
-) {
-    match on_success {
-        OnSuccess::Delete => {
-            if let Err(e) = std::fs::remove_file(src) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = %src.display(), error = %e, "delete source failed");
-                }
-            }
+    /// `completion.verify` — decides whether the archived copy is re-hashed or only size-checked.
+    verify: Verify,
+    /// The source's byte count, as every destination verified it.
+    expected_size: u64,
+    /// The checksum the destinations verified against, recovered from a `Verified` write-ahead
+    /// checkpoint. [`Checksum::None`] when nothing was hashed (`completion.verify` is `size`/`none`,
+    /// or the checkpoint is gone), which falls the archive proof back to the size check.
+    expected_checksum: Checksum,
+}
+
+impl CleanupCtx {
+    /// The wire token for the action this context performs (`FileCleanupFailed.action`).
+    fn action(&self) -> &'static str {
+        match self.on_success {
+            OnSuccess::Delete => "delete",
+            OnSuccess::Archive => "archive",
         }
-        OnSuccess::Archive => match archive_dir {
-            Some(dir) if src.exists() => {
-                let dst = join_rel(dir, relpath);
-                if let Err(e) = move_file(src, &dst, collision) {
-                    tracing::warn!(
-                        src = %src.display(), dst = %dst.display(), error = %e,
-                        "archive move failed; leaving source in place"
-                    );
-                }
+    }
+}
+
+/// What the completion action verifiably did — the input to the success event.
+enum CleanupDone {
+    /// The source is gone.
+    Deleted,
+    /// The source landed in the archive at this path. `None` only when a prior, crashed attempt had
+    /// already moved it under a collision-resolved name this pass cannot re-derive.
+    Archived(Option<PathBuf>),
+}
+
+/// The success completion side effect (`delete` | `archive`) on the source file, run on the blocking
+/// pool by [`Worker::run_cleanup`], returning **only** once the action is proven to have happened
+/// (DESIGN §20-I).
+///
+/// Idempotent for recovery: a source a prior attempt already released is re-checked against observed
+/// filesystem state rather than re-applied — an absent source under `delete` is done, and an absent
+/// source under `archive` means the move's final rename already succeeded (`move_file` removes the
+/// source only afterwards), so the archived copy is re-verified where it can still be identified.
+///
+/// Every failure is returned, never swallowed: an unwritable or unconfigured `archiveDir`, a failing
+/// rename or copy, a failing delete, and a target that does not match the source are all cleanup
+/// failures that keep the item out of `Completed`.
+fn apply_success_action(ctx: &CleanupCtx, fs: &SourceFs) -> Result<CleanupDone> {
+    match ctx.on_success {
+        OnSuccess::Delete => {
+            match fs.remove_file(&ctx.src) {
+                Ok(()) => {}
+                // Already gone: a prior attempt (or one interrupted by a crash) succeeded.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(ReplError::classify_cleanup_io(e)),
             }
-            Some(_) => {} // source already gone (idempotent recovery)
-            None => tracing::warn!(
-                instance = %instance, relpath = %relpath,
-                "onSuccess=archive but no archiveDir configured; leaving source in place"
-            ),
-        },
+            if ctx.src.exists() {
+                return Err(ReplError::Transient(format!(
+                    "delete returned success but the source is still present: {}",
+                    ctx.src.display()
+                )));
+            }
+            Ok(CleanupDone::Deleted)
+        }
+        OnSuccess::Archive => {
+            // A missing `archiveDir` cannot archive anything. Permanent: no number of retries makes a
+            // configuration appear, and the operator needs it surfaced now rather than in an hour.
+            let Some(dir) = ctx.archive_dir.as_deref() else {
+                return Err(ReplError::Permanent(format!(
+                    "onSuccess=archive requires completion.archiveDir; cannot archive {}",
+                    ctx.relpath
+                )));
+            };
+            let dst = join_rel(dir, &ctx.relpath);
+            if !ctx.src.exists() {
+                // The source was already released by a prior attempt. If the un-suffixed target is
+                // there, prove it; otherwise the file landed under a collision-resolved name, and with
+                // the source gone and every destination verified the item is complete.
+                if dst.exists() {
+                    verify_archived(&dst, ctx)?;
+                    return Ok(CleanupDone::Archived(Some(dst)));
+                }
+                tracing::warn!(
+                    relpath = %ctx.relpath, dst = %dst.display(),
+                    "source already archived under a collision-resolved name; completing without a path"
+                );
+                return Ok(CleanupDone::Archived(None));
+            }
+            let target = move_file(
+                &ctx.src,
+                &dst,
+                ctx.collision,
+                fs,
+                ReplError::classify_cleanup_io,
+            )?;
+            verify_archived(&target, ctx)?;
+            Ok(CleanupDone::Archived(Some(target)))
+        }
+    }
+}
+
+/// Prove an archived file is really there and really the file (DESIGN §20-I): it must exist at the
+/// source's byte count and, under `completion.verify = checksum`, re-hash to the checksum every
+/// destination verified against.
+///
+/// A failure to *read* the target (an unmounted archive volume, a transient I/O error) is classified
+/// as usual and retried. A genuine size/checksum **mismatch** is returned as
+/// [`ReplError::Permanent`]: the move already released the source, so no retry can change the outcome
+/// and the operator needs the item parked in `CleanupFailed` with the reason immediately.
+fn verify_archived(target: &Path, ctx: &CleanupCtx) -> Result<()> {
+    let len = std::fs::metadata(target)
+        .map_err(ReplError::classify_cleanup_io)?
+        .len();
+    verify_size(ctx.expected_size, len).map_err(permanent_mismatch)?;
+    if ctx.verify != Verify::Checksum {
+        return Ok(());
+    }
+    let algo = match ctx.expected_checksum {
+        Checksum::Crc32c(_) => Algorithm::Crc32c,
+        Checksum::Sha256(_) => Algorithm::Sha256,
+        // Nothing was hashed on delivery, so the size check above is the whole proof available.
+        Checksum::None => return Ok(()),
+    };
+    let mut f = std::fs::File::open(target).map_err(ReplError::classify_cleanup_io)?;
+    let (_, actual) = hash_reader(&mut f, algo).map_err(ReplError::classify_cleanup_io)?;
+    verify_checksum(&ctx.expected_checksum, &actual).map_err(permanent_mismatch)
+}
+
+/// Re-tag an integrity mismatch on an already-moved archive copy as permanent (see
+/// [`verify_archived`]); any other error keeps its classification.
+fn permanent_mismatch(e: ReplError) -> ReplError {
+    match e {
+        ReplError::Integrity(m) => ReplError::Permanent(format!("archived copy mismatch: {m}")),
+        other => other,
     }
 }
 
@@ -1675,12 +2140,13 @@ fn apply_quarantine_action(
     src: &Path,
     collision: Collision,
     ctx: &QuarantineCtx,
+    fs: &SourceFs,
 ) {
     match failed_dir {
         Some(dir) => {
             let dst = join_rel(dir, &ctx.relpath);
             if src.exists() {
-                if let Err(e) = move_file(src, &dst, collision) {
+                if let Err(e) = move_file(src, &dst, collision, fs, ReplError::classify_io) {
                     tracing::warn!(
                         src = %src.display(), dst = %dst.display(), error = %e,
                         "quarantine move failed"
@@ -1724,13 +2190,18 @@ fn write_error_sidecar(dst: &Path, ctx: &QuarantineCtx) {
 
 /// Resolve the effective target path for a collision policy: `overwrite` removes the existing file,
 /// `suffix` finds a free `name.N.ext`, `fail` errors permanently.
-fn resolve_collision(dst: &Path, collision: Collision) -> Result<PathBuf> {
+fn resolve_collision(
+    dst: &Path,
+    collision: Collision,
+    fs: &SourceFs,
+    classify: IoClassifier,
+) -> Result<PathBuf> {
     if !dst.exists() {
         return Ok(dst.to_path_buf());
     }
     match collision {
         Collision::Overwrite => {
-            std::fs::remove_file(dst).map_err(ReplError::classify_io)?;
+            fs.remove_file(dst).map_err(classify)?;
             Ok(dst.to_path_buf())
         }
         Collision::Fail => Err(ReplError::Permanent(format!(
@@ -1872,6 +2343,7 @@ mod tests {
             size: 1,
             discovered_at: 0,
             attempts: 0,
+            cleanup_attempts: 0,
             next_attempt_at: 0,
             last_error: None,
             bytes_done: 0,
@@ -1921,7 +2393,14 @@ mod tests {
         let src = dir.path().join("src.txt");
         std::fs::write(&src, b"hi").unwrap();
         let dst = dir.path().join("sub/dir/out.txt");
-        move_file(&src, &dst, Collision::Fail).unwrap();
+        move_file(
+            &src,
+            &dst,
+            Collision::Fail,
+            &SourceFs::real(),
+            ReplError::classify_io,
+        )
+        .unwrap();
         assert!(!src.exists());
         assert_eq!(std::fs::read(&dst).unwrap(), b"hi");
     }
@@ -1938,18 +2417,39 @@ mod tests {
 
         // Fail → error, source untouched.
         let s1 = mk("s1.txt", b"a");
-        assert!(move_file(&s1, &dst, Collision::Fail).is_err());
+        assert!(move_file(
+            &s1,
+            &dst,
+            Collision::Fail,
+            &SourceFs::real(),
+            ReplError::classify_io
+        )
+        .is_err());
         assert!(s1.exists());
 
         // Suffix → writes dst.1.txt, original preserved.
         let s2 = mk("s2.txt", b"b");
-        move_file(&s2, &dst, Collision::Suffix).unwrap();
+        move_file(
+            &s2,
+            &dst,
+            Collision::Suffix,
+            &SourceFs::real(),
+            ReplError::classify_io,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(dir.path().join("dst.1.txt")).unwrap(), b"b");
         assert_eq!(std::fs::read(&dst).unwrap(), b"existing");
 
         // Overwrite → replaces dst.
         let s3 = mk("s3.txt", b"c");
-        move_file(&s3, &dst, Collision::Overwrite).unwrap();
+        move_file(
+            &s3,
+            &dst,
+            Collision::Overwrite,
+            &SourceFs::real(),
+            ReplError::classify_io,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"c");
     }
 
@@ -2383,6 +2883,7 @@ mod tests {
             size: 18,
             discovered_at: 0,
             attempts: 0,
+            cleanup_attempts: 0,
             next_attempt_at: 0,
             last_error: None,
             bytes_done: 0,
@@ -2458,6 +2959,7 @@ mod tests {
             size: 16,
             discovered_at: 0,
             attempts: 0,
+            cleanup_attempts: 0,
             next_attempt_at: 0,
             last_error: None,
             bytes_done: 0,
@@ -3409,6 +3911,7 @@ mod tests {
             size: 7,
             discovered_at: 0,
             attempts: 0,
+            cleanup_attempts: 0,
             next_attempt_at: 0,
             last_error: None,
             bytes_done: 0,
@@ -3631,6 +4134,7 @@ mod tests {
             size: 7,
             discovered_at: 0,
             attempts: 0,
+            cleanup_attempts: 0,
             next_attempt_at: 0,
             last_error: None,
             bytes_done: 0,
@@ -3764,6 +4268,7 @@ mod tests {
             size: 7,
             discovered_at: 0,
             attempts: 0,
+            cleanup_attempts: 0,
             next_attempt_at: 0,
             last_error: None,
             bytes_done: 0,
@@ -3887,5 +4392,781 @@ mod tests {
             1,
             "completes exactly once"
         );
+    }
+
+    // ---- source-completion failures are NOT success (DESIGN §20-I) -------------------------------
+    //
+    // Every test below shares one invariant: a file that replicated and verified on every destination
+    // but whose source completion action did NOT verifiably happen must never reach `Completed`, never
+    // emit `FileArchived`/`FileDeleted`, and never move the `replicated` statistic. For an evidence
+    // pipeline that combination is a false record of custody.
+
+    /// A worker with an archive completion pointing at `archive_root`, and an injected source-side
+    /// filesystem fault table.
+    fn archiving_worker(
+        store: Arc<dyn StateStore>,
+        src_root: &Path,
+        dst_root: &Path,
+        archive_root: Option<&Path>,
+        retry: RetryPolicy,
+        faults: SourceFaults,
+    ) -> Worker {
+        let mut comp = completion(OnSuccess::Archive);
+        comp.archive_dir = archive_root.map(|p| p.to_path_buf());
+        local_worker(store, src_root, dst_root, comp, retry).with_source_faults(faults)
+    }
+
+    /// Claim the single ready item and run it through the whole pipeline.
+    async fn process_only_item(
+        worker: &Worker,
+        store: &Arc<dyn StateStore>,
+        now: i64,
+    ) -> ItemState {
+        let item = store.claim_ready(INST, 10, now).unwrap().pop().unwrap();
+        worker.process_item(&item, now).await
+    }
+
+    #[tokio::test]
+    async fn archive_move_failure_leaves_the_item_cleanup_failed_not_completed() {
+        // The defect this fixes: the transfer succeeded, the archive move did not, and the item was
+        // still recorded as `Completed` + `FileArchived` with a computed path that pointed at nothing.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let archive = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "r.csv", b"evidence");
+        let (fake, events) = recording_events();
+        // Both the rename fast path and the cross-device copy fallback fail: the move cannot happen.
+        let worker = archiving_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            Some(archive.path()),
+            RetryPolicy::default(),
+            SourceFaults::always(FsOp::Rename, std::io::ErrorKind::Other)
+                .and(FsOp::Copy, std::io::ErrorKind::Other),
+        )
+        .with_events(events);
+
+        assert_eq!(
+            process_only_item(&worker, &store, 100).await,
+            ItemState::CleanupFailed
+        );
+
+        let row = store.get(INST, "r.csv").unwrap().unwrap();
+        assert_eq!(row.state, ItemState::CleanupFailed, "never Completed");
+        assert_eq!(row.cleanup_attempts, 1);
+        assert!(row.last_error.is_some());
+        assert!(
+            src.path().join("r.csv").exists(),
+            "the source is still there — that is exactly why this is not a success"
+        );
+        assert!(
+            !archive.path().join("r.csv").exists(),
+            "nothing was archived"
+        );
+        assert!(
+            fake.events_named("FileArchived").is_empty(),
+            "no FileArchived for a move that never happened"
+        );
+        assert_eq!(
+            store.stats(INST).unwrap().replicated,
+            0,
+            "a cleanup failure is not a replicated file"
+        );
+        // The delivery itself did succeed and is still reported per destination.
+        assert_eq!(fake.events_named("ReplicationCompleted").len(), 1);
+        assert_eq!(
+            std::fs::read(dst.path().join("r.csv")).unwrap(),
+            b"evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_archive_dir_is_a_cleanup_failure_not_a_silent_retain() {
+        // `onSuccess: archive` with no `archiveDir` used to log a warning, leave the source in place,
+        // and still mark the item Completed. It is a permanent cleanup failure: no retry can conjure
+        // configuration, so the item is parked and the operator is told once.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "r.csv", b"evidence");
+        let (fake, events) = recording_events();
+        let worker = archiving_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            None, // no archiveDir configured
+            RetryPolicy::default(),
+            SourceFaults::default(),
+        )
+        .with_events(events);
+
+        assert_eq!(
+            process_only_item(&worker, &store, 100).await,
+            ItemState::CleanupFailed
+        );
+
+        let row = store.get(INST, "r.csv").unwrap().unwrap();
+        assert_eq!(row.state, ItemState::CleanupFailed);
+        assert_eq!(
+            row.next_attempt_at, CLEANUP_NO_RETRY,
+            "permanent → parked for the operator, not retried on a timer"
+        );
+        assert!(src.path().join("r.csv").exists(), "source retained");
+        assert!(fake.events_named("FileArchived").is_empty());
+        assert_eq!(store.stats(INST).unwrap().replicated, 0);
+
+        let failures = fake.events_named("FileCleanupFailed");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].body["path"], serde_json::json!("r.csv"));
+        assert_eq!(failures[0].body["action"], serde_json::json!("archive"));
+        assert_eq!(failures[0].body["attempts"], serde_json::json!(1));
+        assert!(failures[0].body["lastError"]
+            .as_str()
+            .unwrap()
+            .contains("archiveDir"));
+    }
+
+    #[tokio::test]
+    async fn uncreatable_archive_dir_is_a_cleanup_failure() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let archive = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "r.csv", b"evidence");
+        let (fake, events) = recording_events();
+        // Two cleanup attempts, so the retry and the give-up are both observable.
+        let retry = RetryPolicy {
+            max_attempts: Some(2),
+            ..RetryPolicy::default()
+        };
+        let worker = archiving_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            Some(archive.path()),
+            retry,
+            SourceFaults::always(FsOp::CreateDirAll, std::io::ErrorKind::PermissionDenied),
+        )
+        .with_events(events);
+
+        assert_eq!(
+            process_only_item(&worker, &store, 100).await,
+            ItemState::CleanupFailed
+        );
+        assert!(src.path().join("r.csv").exists());
+        assert!(fake.events_named("FileArchived").is_empty());
+        assert_eq!(store.stats(INST).unwrap().replicated, 0);
+        // On the cleanup path a permission denial is TRANSIENT (the archive volume may be briefly
+        // unavailable, or something may hold the target), so the first attempt schedules a retry rather
+        // than parking the file.
+        assert!(fake.events_named("FileCleanupFailed").is_empty());
+        assert!(
+            store.get(INST, "r.csv").unwrap().unwrap().next_attempt_at > 100,
+            "a retry gate, not the parked sentinel"
+        );
+
+        // Once the cleanup budget is spent it parks and reports, still without ever completing.
+        worker.drive_cleanup(10_000_000, false).await.unwrap();
+        let row = store.get(INST, "r.csv").unwrap().unwrap();
+        assert_eq!(row.state, ItemState::CleanupFailed);
+        assert_eq!(row.next_attempt_at, CLEANUP_NO_RETRY);
+        assert_eq!(fake.events_named("FileCleanupFailed").len(), 1);
+        assert_eq!(store.stats(INST).unwrap().replicated, 0);
+    }
+
+    #[tokio::test]
+    async fn a_locked_source_file_retries_and_completes_once_the_lock_clears() {
+        // The ordinary Windows case: a producer, antivirus scanner, indexer, or backup agent still
+        // holds the source open, so the delete fails with a sharing/permission error. On the CLEANUP
+        // path that is transient — the file must be retried under the cleanup backoff, not parked after
+        // a single attempt the way an egress permission denial is (DESIGN §20-I).
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "r.csv", b"evidence");
+        let (fake, events) = recording_events();
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            RetryPolicy::default(),
+        )
+        .with_source_faults(
+            SourceFaults::always(FsOp::RemoveFile, std::io::ErrorKind::PermissionDenied)
+                .heal_after(1),
+        )
+        .with_events(events);
+
+        // Attempt 1: the file is locked → retry scheduled, nothing completed, nothing announced.
+        assert_eq!(
+            process_only_item(&worker, &store, 100).await,
+            ItemState::CleanupFailed
+        );
+        let row = store.get(INST, "r.csv").unwrap().unwrap();
+        assert_eq!(row.cleanup_attempts, 1);
+        assert!(
+            row.next_attempt_at > 100 && row.next_attempt_at != CLEANUP_NO_RETRY,
+            "a locked source is retried on the backoff, not parked: {row:?}"
+        );
+        assert!(
+            row.last_error.as_deref().unwrap().starts_with("transient:"),
+            "classified transient on the cleanup path, got {:?}",
+            row.last_error
+        );
+        assert!(fake.events_named("FileCleanupFailed").is_empty());
+        assert!(fake.events_named("FileDeleted").is_empty());
+        assert_eq!(store.stats(INST).unwrap().replicated, 0);
+        assert!(src.path().join("r.csv").exists());
+
+        // Attempt 2, after the lock clears: the source is released and the file completes.
+        worker.drive_cleanup(10_000_000, false).await.unwrap();
+        assert_eq!(
+            store.get(INST, "r.csv").unwrap().unwrap().state,
+            ItemState::Completed
+        );
+        assert!(!src.path().join("r.csv").exists());
+        assert_eq!(store.stats(INST).unwrap().replicated, 1);
+        assert_eq!(fake.events_named("FileDeleted").len(), 1);
+        assert!(fake.events_named("FileCleanupFailed").is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_failure_leaves_the_item_cleanup_failed_not_completed() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "r.csv", b"evidence");
+        let (fake, events) = recording_events();
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            RetryPolicy::default(),
+        )
+        .with_source_faults(SourceFaults::always(
+            FsOp::RemoveFile,
+            std::io::ErrorKind::Other,
+        ))
+        .with_events(events);
+
+        assert_eq!(
+            process_only_item(&worker, &store, 100).await,
+            ItemState::CleanupFailed
+        );
+        assert_eq!(
+            store.get(INST, "r.csv").unwrap().unwrap().state,
+            ItemState::CleanupFailed
+        );
+        assert!(
+            src.path().join("r.csv").exists(),
+            "the source is still there"
+        );
+        assert!(fake.events_named("FileDeleted").is_empty());
+        assert_eq!(store.stats(INST).unwrap().replicated, 0);
+    }
+
+    #[tokio::test]
+    async fn cross_filesystem_archive_copies_then_verifies_and_completes() {
+        // The rename fast path fails (as it does across a device boundary); the copy → temp → rename
+        // fallback runs, the archived copy is re-hashed against the delivered checksum, and only then
+        // does the item complete.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let archive = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "r.csv", b"evidence");
+        let (fake, events) = recording_events();
+        let worker = archiving_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            Some(archive.path()),
+            RetryPolicy::default(),
+            // Only the FIRST rename (the same-filesystem fast path) fails; the fallback's temp→target
+            // rename then succeeds.
+            SourceFaults::always(FsOp::Rename, std::io::ErrorKind::Other).heal_after(1),
+        )
+        .with_events(events);
+
+        assert_eq!(
+            process_only_item(&worker, &store, 100).await,
+            ItemState::Completed
+        );
+        assert!(!src.path().join("r.csv").exists(), "source released");
+        assert_eq!(
+            std::fs::read(archive.path().join("r.csv")).unwrap(),
+            b"evidence"
+        );
+        assert_eq!(store.stats(INST).unwrap().replicated, 1);
+        let archived = fake.events_named("FileArchived");
+        assert_eq!(archived.len(), 1);
+        assert_eq!(
+            archived[0].body["archivePath"].as_str().unwrap(),
+            archive.path().join("r.csv").display().to_string(),
+            "the path reported is the one the file really landed at"
+        );
+        // No orphan temp left behind by the fallback.
+        let leftovers: Vec<_> = std::fs::read_dir(archive.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("movetmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file cleaned up");
+    }
+
+    #[tokio::test]
+    async fn a_cleanup_failure_is_retried_and_then_succeeds() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "r.csv", b"evidence");
+        let (fake, events) = recording_events();
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            RetryPolicy::default(),
+        )
+        .with_source_faults(
+            SourceFaults::always(FsOp::RemoveFile, std::io::ErrorKind::Other).heal_after(1),
+        )
+        .with_events(events);
+
+        assert_eq!(
+            process_only_item(&worker, &store, 100).await,
+            ItemState::CleanupFailed
+        );
+        assert_eq!(store.stats(INST).unwrap().replicated, 0);
+
+        // Past the backoff gate, the reconciliation pass re-drives it and it completes.
+        worker.drive_cleanup(10_000_000, false).await.unwrap();
+        let row = store.get(INST, "r.csv").unwrap().unwrap();
+        assert_eq!(row.state, ItemState::Completed);
+        assert!(!src.path().join("r.csv").exists());
+        assert_eq!(store.stats(INST).unwrap().replicated, 1);
+        assert_eq!(
+            fake.events_named("FileDeleted").len(),
+            1,
+            "the success event fires exactly once, on the attempt that worked"
+        );
+        assert!(fake.events_named("FileCleanupFailed").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cleanup_failure_that_exhausts_its_budget_parks_and_reports() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "r.csv", b"evidence");
+        let (fake, events) = recording_events();
+        let retry = RetryPolicy {
+            max_attempts: Some(3),
+            ..RetryPolicy::default()
+        };
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            retry,
+        )
+        .with_source_faults(SourceFaults::always(
+            FsOp::RemoveFile,
+            std::io::ErrorKind::Other,
+        ))
+        .with_events(events);
+
+        assert_eq!(
+            process_only_item(&worker, &store, 100).await,
+            ItemState::CleanupFailed
+        );
+        worker.drive_cleanup(10_000_000, false).await.unwrap(); // attempt 2 → still retrying
+        assert!(fake.events_named("FileCleanupFailed").is_empty());
+        worker.drive_cleanup(20_000_000, false).await.unwrap(); // attempt 3 → budget spent
+
+        let row = store.get(INST, "r.csv").unwrap().unwrap();
+        assert_eq!(row.state, ItemState::CleanupFailed);
+        assert_eq!(row.cleanup_attempts, 3);
+        assert_eq!(row.next_attempt_at, CLEANUP_NO_RETRY);
+        assert_eq!(row.attempts, 0, "the transfer budget was never touched");
+        assert!(src.path().join("r.csv").exists());
+        assert_eq!(store.stats(INST).unwrap().replicated, 0);
+
+        let failures = fake.events_named("FileCleanupFailed");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].body["action"], serde_json::json!("delete"));
+        assert_eq!(failures[0].body["attempts"], serde_json::json!(3));
+
+        // A parked item is no longer picked up by the ordinary reconciliation pass.
+        worker.drive_cleanup(i64::MAX - 1, false).await.unwrap();
+        assert_eq!(
+            store.get(INST, "r.csv").unwrap().unwrap().cleanup_attempts,
+            3,
+            "no further automatic attempts once the budget is spent"
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_redrives_a_parked_cleanup_failure() {
+        // The operator path back: fix the cause, then `trigger` (which re-drives regardless of the
+        // gate). Modelled here by the fault table healing before the forced re-drive.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "r.csv", b"evidence");
+        let retry = RetryPolicy {
+            max_attempts: Some(2),
+            ..RetryPolicy::default()
+        };
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            retry,
+        )
+        .with_source_faults(
+            SourceFaults::always(FsOp::RemoveFile, std::io::ErrorKind::Other).heal_after(2),
+        );
+
+        assert_eq!(
+            process_only_item(&worker, &store, 100).await,
+            ItemState::CleanupFailed
+        );
+        worker.drive_cleanup(10_000_000, false).await.unwrap(); // attempt 2 → budget spent, parked
+        assert_eq!(
+            store.get(INST, "r.csv").unwrap().unwrap().next_attempt_at,
+            CLEANUP_NO_RETRY
+        );
+
+        worker.drive_cleanup(20_000_000, true).await.unwrap();
+        assert_eq!(
+            store.get(INST, "r.csv").unwrap().unwrap().state,
+            ItemState::Completed
+        );
+        assert!(!src.path().join("r.csv").exists());
+        assert_eq!(store.stats(INST).unwrap().replicated, 1);
+    }
+
+    /// Drive a file all the way to `CleanupPending` with a failing source filesystem, then hand the
+    /// durable state to a fresh, fault-free worker — the shape of a crash inside the write-ahead
+    /// cleanup window.
+    async fn crash_into_cleanup_pending(
+        store: &Arc<dyn StateStore>,
+        src: &Path,
+        dst: &Path,
+        archive: Option<&Path>,
+        on_success: OnSuccess,
+    ) {
+        let mut comp = completion(on_success);
+        comp.archive_dir = archive.map(|p| p.to_path_buf());
+        let crashing = local_worker(store.clone(), src, dst, comp, RetryPolicy::default())
+            .with_source_faults(
+                SourceFaults::always(FsOp::Rename, std::io::ErrorKind::Other)
+                    .and(FsOp::Copy, std::io::ErrorKind::Other)
+                    .and(FsOp::RemoveFile, std::io::ErrorKind::Other),
+            );
+        process_only_item(&crashing, store, 100).await;
+        // The prior run died between the write-ahead marker and the proof, leaving the row pending.
+        store
+            .set_state(INST, "r.csv", ItemState::CleanupPending, 100)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_retries_a_cleanup_pending_item_whose_source_is_still_present() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let archive = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "r.csv", b"evidence");
+        crash_into_cleanup_pending(
+            &store,
+            src.path(),
+            dst.path(),
+            Some(archive.path()),
+            OnSuccess::Archive,
+        )
+        .await;
+        assert!(src.path().join("r.csv").exists(), "source still on disk");
+
+        let (fake, events) = recording_events();
+        let recovered = archiving_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            Some(archive.path()),
+            RetryPolicy::default(),
+            SourceFaults::default(),
+        )
+        .with_events(events);
+        recovered.recover(200).await.unwrap();
+
+        assert_eq!(
+            store.get(INST, "r.csv").unwrap().unwrap().state,
+            ItemState::Completed
+        );
+        assert_eq!(
+            std::fs::read(archive.path().join("r.csv")).unwrap(),
+            b"evidence"
+        );
+        assert!(!src.path().join("r.csv").exists());
+        assert_eq!(fake.events_named("FileArchived").len(), 1);
+        assert_eq!(store.stats(INST).unwrap().replicated, 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_completes_a_cleanup_pending_item_already_archived_before_the_crash() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let archive = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "r.csv", b"evidence");
+        crash_into_cleanup_pending(
+            &store,
+            src.path(),
+            dst.path(),
+            Some(archive.path()),
+            OnSuccess::Archive,
+        )
+        .await;
+        // The prior run's move DID land; the crash fell between the rename and the `Completed` write.
+        std::fs::rename(src.path().join("r.csv"), archive.path().join("r.csv")).unwrap();
+
+        let (fake, events) = recording_events();
+        let recovered = archiving_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            Some(archive.path()),
+            RetryPolicy::default(),
+            SourceFaults::default(),
+        )
+        .with_events(events);
+        recovered.recover(200).await.unwrap();
+
+        assert_eq!(
+            store.get(INST, "r.csv").unwrap().unwrap().state,
+            ItemState::Completed,
+            "source absent + target present → complete"
+        );
+        assert_eq!(
+            std::fs::read(archive.path().join("r.csv")).unwrap(),
+            b"evidence",
+            "the archived copy is untouched, not moved twice"
+        );
+        assert_eq!(fake.events_named("FileArchived").len(), 1);
+        assert_eq!(store.stats(INST).unwrap().replicated, 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_completes_a_cleanup_pending_item_whose_source_was_already_deleted() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "r.csv", b"evidence");
+        crash_into_cleanup_pending(&store, src.path(), dst.path(), None, OnSuccess::Delete).await;
+        // The prior run's delete DID land; the crash fell before the `Completed` write.
+        std::fs::remove_file(src.path().join("r.csv")).unwrap();
+
+        let (fake, events) = recording_events();
+        let recovered = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            RetryPolicy::default(),
+        )
+        .with_events(events);
+        recovered.recover(200).await.unwrap();
+
+        assert_eq!(
+            store.get(INST, "r.csv").unwrap().unwrap().state,
+            ItemState::Completed,
+            "source absent after a delete intent → complete"
+        );
+        assert_eq!(fake.events_named("FileDeleted").len(), 1);
+        assert_eq!(store.stats(INST).unwrap().replicated, 1);
+    }
+
+    #[tokio::test]
+    async fn a_cleanup_failed_source_is_never_re_enqueued_by_a_rescan() {
+        // The source of a cleanup-failed item stays on disk, so every rescan re-discovers it. It must
+        // not become new work: the bytes are already delivered and verified everywhere.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "r.csv", b"evidence");
+        let worker = local_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            RetryPolicy::default(),
+        )
+        .with_source_faults(SourceFaults::always(
+            FsOp::RemoveFile,
+            std::io::ErrorKind::Other,
+        ));
+        assert_eq!(
+            process_only_item(&worker, &store, 100).await,
+            ItemState::CleanupFailed
+        );
+
+        // A rescan re-discovers the still-present source and re-upserts it.
+        store.upsert_ready(INST, "r.csv", 8, 0, 300).unwrap();
+        assert_eq!(
+            store.get(INST, "r.csv").unwrap().unwrap().state,
+            ItemState::CleanupFailed
+        );
+        assert!(
+            store.claim_ready(INST, 10, 300).unwrap().is_empty(),
+            "not claimable as new work"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_archive_path_reported_is_the_collision_resolved_one() {
+        // Under the default `suffix` policy the file lands at `r.1.csv`; the event must say so rather
+        // than report the computed `r.csv` that belongs to somebody else's file.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let archive = tempfile::tempdir().unwrap();
+        std::fs::write(archive.path().join("r.csv"), b"an older run").unwrap();
+        let store = store();
+        enqueue_file(&store, src.path(), "r.csv", b"evidence");
+        let (fake, events) = recording_events();
+        let worker = archiving_worker(
+            store.clone(),
+            src.path(),
+            dst.path(),
+            Some(archive.path()),
+            RetryPolicy::default(),
+            SourceFaults::default(),
+        )
+        .with_events(events);
+
+        assert_eq!(
+            process_only_item(&worker, &store, 100).await,
+            ItemState::Completed
+        );
+        let archived = fake.events_named("FileArchived");
+        assert_eq!(archived.len(), 1);
+        assert_eq!(
+            archived[0].body["archivePath"].as_str().unwrap(),
+            archive.path().join("r.1.csv").display().to_string()
+        );
+        assert_eq!(
+            std::fs::read(archive.path().join("r.1.csv")).unwrap(),
+            b"evidence"
+        );
+        assert_eq!(
+            std::fs::read(archive.path().join("r.csv")).unwrap(),
+            b"an older run",
+            "the pre-existing file is untouched"
+        );
+    }
+
+    #[test]
+    fn verify_archived_rejects_a_target_that_does_not_match_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("archived.csv");
+        std::fs::write(&target, b"evidence").unwrap();
+        let (_, checksum) =
+            hash_reader(&mut std::io::Cursor::new(b"evidence"), Algorithm::Crc32c).unwrap();
+
+        let ok = CleanupCtx {
+            on_success: OnSuccess::Archive,
+            src: dir.path().join("r.csv"),
+            archive_dir: Some(dir.path().to_path_buf()),
+            relpath: "r.csv".into(),
+            collision: Collision::Suffix,
+            verify: Verify::Checksum,
+            expected_size: 8,
+            expected_checksum: checksum.clone(),
+        };
+        verify_archived(&target, &ok).expect("a matching copy verifies");
+
+        // Wrong size → permanent (the source is already gone; retrying cannot change the bytes).
+        let wrong_size = CleanupCtx {
+            expected_size: 99,
+            ..CleanupCtx {
+                expected_checksum: checksum.clone(),
+                ..clone_ctx(&ok)
+            }
+        };
+        let err = verify_archived(&target, &wrong_size).unwrap_err();
+        assert!(err.is_permanent(), "got {err:?}");
+
+        // Right size, wrong content → the checksum catches it.
+        std::fs::write(&target, b"tampered").unwrap();
+        let err = verify_archived(&target, &ok).unwrap_err();
+        assert!(err.is_permanent(), "got {err:?}");
+        assert!(err.to_string().contains("mismatch"));
+
+        // A target that is not there at all is an I/O failure, not a mismatch.
+        let err = verify_archived(&dir.path().join("nope.csv"), &ok).unwrap_err();
+        assert!(err.to_string().contains("io:"), "got {err:?}");
+
+        // Under `verify: size` a content change is not inspected at all.
+        let size_only = CleanupCtx {
+            verify: Verify::Size,
+            ..clone_ctx(&ok)
+        };
+        verify_archived(&target, &size_only).expect("size policy checks only the byte count");
+    }
+
+    /// `CleanupCtx` is deliberately not `Clone` in the shipping code (it is built once per attempt);
+    /// this rebuilds one for the struct-update syntax above.
+    #[cfg(test)]
+    fn clone_ctx(c: &CleanupCtx) -> CleanupCtx {
+        CleanupCtx {
+            on_success: c.on_success,
+            src: c.src.clone(),
+            archive_dir: c.archive_dir.clone(),
+            relpath: c.relpath.clone(),
+            collision: c.collision,
+            verify: c.verify,
+            expected_size: c.expected_size,
+            expected_checksum: c.expected_checksum.clone(),
+        }
+    }
+
+    #[test]
+    fn decide_cleanup_uses_its_own_attempt_budget_not_the_transfer_time_budget() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        // A transfer budget that is already fully spent — the cleanup decision must not read it.
+        let retry = RetryPolicy {
+            give_up_after_ms: Some(1),
+            max_attempts: None,
+            ..RetryPolicy::default()
+        };
+        let worker = local_worker(
+            store(),
+            src.path(),
+            dst.path(),
+            completion(OnSuccess::Delete),
+            retry,
+        );
+        assert!(
+            matches!(
+                worker.decide_cleanup(false, 0, 10_000_000_000),
+                RetryDecision::Retry { .. }
+            ),
+            "an expired transfer budget must not deny the first cleanup retry"
+        );
+        // The default attempt cap still bounds it.
+        assert_eq!(
+            worker.decide_cleanup(false, DEFAULT_CLEANUP_MAX_ATTEMPTS - 1, 100),
+            RetryDecision::GiveUp
+        );
+        // And a permanent error never retries.
+        assert_eq!(worker.decide_cleanup(true, 0, 100), RetryDecision::GiveUp);
     }
 }

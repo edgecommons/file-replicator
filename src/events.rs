@@ -117,6 +117,16 @@ pub enum Event {
     },
     /// The source file was deleted on success.
     FileDeleted { path: String },
+    /// Every destination is verified but the source completion action (`archive`/`delete`) failed and
+    /// its retry budget is spent (DESIGN §20-I). The item stays `CleanupFailed` — never `Completed`,
+    /// never counted as replicated — until an operator fixes the cause and re-drives it with
+    /// `trigger`. `action` is `"archive"` or `"delete"`.
+    FileCleanupFailed {
+        path: String,
+        action: String,
+        attempts: u32,
+        last_error: String,
+    },
     /// The source file was quarantined after exhaustion. `quarantinePath` omitted when unknown.
     FileQuarantined {
         path: String,
@@ -178,6 +188,7 @@ impl Event {
             Event::RetriesExhausted { .. } => "RetriesExhausted",
             Event::FileArchived { .. } => "FileArchived",
             Event::FileDeleted { .. } => "FileDeleted",
+            Event::FileCleanupFailed { .. } => "FileCleanupFailed",
             Event::FileQuarantined { .. } => "FileQuarantined",
             Event::ScanComplete { .. } => "ScanComplete",
             Event::InstanceActivated { .. } => "InstanceActivated",
@@ -267,6 +278,14 @@ impl Event {
                 m
             }
             Event::FileDeleted { path } => obj(json!({ "path": path })),
+            Event::FileCleanupFailed {
+                path,
+                action,
+                attempts,
+                last_error,
+            } => obj(json!({
+                "path": path, "action": action, "attempts": attempts, "lastError": last_error
+            })),
             Event::FileQuarantined {
                 path,
                 attempts,
@@ -321,6 +340,7 @@ impl Event {
             Event::ReplicationFailed { error, .. } => Some(error.clone()),
             Event::RetriesExhausted { last_error, .. } => Some(last_error.clone()),
             Event::FileQuarantined { last_error, .. } => Some(last_error.clone()),
+            Event::FileCleanupFailed { last_error, .. } => Some(last_error.clone()),
             Event::PermissionDenied { error, .. } => Some(error.clone()),
             _ => None,
         };
@@ -328,6 +348,7 @@ impl Event {
             Event::ReplicationFailed { .. } => Severity::Warning,
             Event::RetriesExhausted { .. }
             | Event::FileQuarantined { .. }
+            | Event::FileCleanupFailed { .. }
             | Event::Disconnected { .. }
             | Event::Reconnected { .. }
             | Event::PermissionDenied { .. } => Severity::Critical,
@@ -344,6 +365,7 @@ impl Event {
             Event::RetriesExhausted { .. } => "retries-exhausted",
             Event::FileArchived { .. } => "file-archived",
             Event::FileDeleted { .. } => "file-deleted",
+            Event::FileCleanupFailed { .. } => "file-cleanup-failed",
             Event::FileQuarantined { .. } => "file-quarantined",
             Event::ScanComplete { .. } => "scan-complete",
             Event::InstanceActivated { .. } => "instance-activated",
@@ -665,6 +687,37 @@ mod tests {
         assert_eq!(plan.event_type, "file-quarantined");
         assert_eq!(plan.context["quarantinePath"], json!("/f/a"));
         assert!(plan.context.get("lastError").is_none(), "promoted to message, not duplicated");
+    }
+
+    #[test]
+    fn file_cleanup_failed_plan_is_critical_and_promotes_the_last_error() {
+        // DESIGN §20-I: the file reached every destination, but the source completion action did not
+        // succeed, so this is a critical operator-facing event — never a `file-archived`/`file-deleted`.
+        let ev = Event::FileCleanupFailed {
+            path: "a/b.csv".into(),
+            action: "archive".into(),
+            attempts: 4,
+            last_error: "permanent: onSuccess=archive requires completion.archiveDir".into(),
+        };
+        let plan = ev.plan();
+        assert_eq!(plan.severity, Severity::Critical);
+        assert_eq!(plan.event_type, "file-cleanup-failed");
+        assert_eq!(
+            plan.message,
+            Some("permanent: onSuccess=archive requires completion.archiveDir".to_string())
+        );
+        assert_eq!(plan.context["path"], json!("a/b.csv"));
+        assert_eq!(plan.context["action"], json!("archive"));
+        assert_eq!(plan.context["attempts"], json!(4));
+        assert!(
+            plan.context.get("lastError").is_none(),
+            "promoted to message, not duplicated"
+        );
+        assert!(
+            plan.alarm.is_none(),
+            "a terminal per-file failure has no clear counterpart"
+        );
+        assert_eq!(ev.name(), "FileCleanupFailed");
     }
 
     #[test]

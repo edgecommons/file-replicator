@@ -101,6 +101,49 @@ impl ReplError {
         }
     }
 
+    /// Map a raw [`io::Error`] raised by the **source completion action** (`delete`/`archive`,
+    /// DESIGN §20-I) to a classified [`ReplError`]. Identical to [`classify_io`](Self::classify_io)
+    /// except that a **locked file** is [`Transient`](Self::Transient) rather than permanent.
+    ///
+    /// On the transfer path a `PermissionDenied` means a credential or ACL an operator has to fix, so
+    /// failing fast is right. On the cleanup path it usually means something else still has the source
+    /// open — a producer finishing its write, an antivirus scanner, an indexer, a backup agent — which
+    /// is the normal case on Windows and clears on its own within seconds. Parking such a file in
+    /// `CleanupFailed` after a single attempt would demand operator action for a condition that heals
+    /// itself, so these are retried under the cleanup backoff instead.
+    ///
+    /// Detection covers both the portable [`io::ErrorKind`] and the platform's raw code, because which
+    /// of the two a lock surfaces as depends on the OS and the toolchain version (see
+    /// [`is_locked_file`](Self::is_locked_file)).
+    pub fn classify_cleanup_io(e: io::Error) -> Self {
+        if Self::is_locked_file(&e) {
+            return ReplError::Transient(format!("io: {e} ({:?})", e.kind()));
+        }
+        Self::classify_io(e)
+    }
+
+    /// Whether `e` reports a file another process is holding open (see
+    /// [`classify_cleanup_io`](Self::classify_cleanup_io)): `PermissionDenied` or `ResourceBusy` by
+    /// [`io::ErrorKind`], or the platform's raw code — Windows `ERROR_SHARING_VIOLATION` (32), Unix
+    /// `EBUSY` (16). The raw codes are matched per platform because the same number means something
+    /// unrelated on the other (32 is `EPIPE` on Unix).
+    fn is_locked_file(e: &io::Error) -> bool {
+        if matches!(
+            e.kind(),
+            io::ErrorKind::PermissionDenied | io::ErrorKind::ResourceBusy
+        ) {
+            return true;
+        }
+        #[cfg(windows)]
+        const LOCKED_RAW: &[i32] = &[32]; // ERROR_SHARING_VIOLATION
+        #[cfg(unix)]
+        const LOCKED_RAW: &[i32] = &[16]; // EBUSY
+        #[cfg(not(any(windows, unix)))]
+        const LOCKED_RAW: &[i32] = &[];
+        e.raw_os_error()
+            .is_some_and(|code| LOCKED_RAW.contains(&code))
+    }
+
     fn io_kind_is_permanent(kind: io::ErrorKind) -> bool {
         matches!(
             kind,
@@ -173,6 +216,45 @@ mod tests {
         assert!(!ReplError::classify_io(io::Error::new(io::ErrorKind::NotFound, "gone")).is_permission_denied());
         assert!(!ReplError::Permanent("nope".into()).is_permission_denied());
         assert!(!ReplError::Transient("later".into()).is_permission_denied());
+    }
+
+    #[test]
+    fn classify_cleanup_io_treats_a_locked_file_as_transient() {
+        // On the CLEANUP path a held-open source (a producer, antivirus scanner, indexer, backup
+        // agent) must be retried under the cleanup backoff, not parked after one attempt — unlike the
+        // transfer path, where a permission denial is a credential/ACL problem that fails fast.
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::ResourceBusy] {
+            let e = ReplError::classify_cleanup_io(io::Error::new(kind, "locked"));
+            assert!(e.is_transient(), "{kind:?} → {e:?}");
+            assert!(!e.is_permanent(), "{kind:?} → {e:?}");
+        }
+        // The transfer path is deliberately unchanged.
+        let transfer =
+            ReplError::classify_io(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
+        assert!(matches!(transfer, ReplError::PermissionDenied(_)));
+        assert!(transfer.is_permanent());
+    }
+
+    #[test]
+    fn classify_cleanup_io_matches_the_platform_sharing_violation_code() {
+        // Windows ERROR_SHARING_VIOLATION (32) / Unix EBUSY (16) — matched by raw code as well as by
+        // `ErrorKind`, because which of the two a lock surfaces as depends on the OS and toolchain.
+        #[cfg(windows)]
+        let raw = 32;
+        #[cfg(not(windows))]
+        let raw = 16;
+        let e = ReplError::classify_cleanup_io(io::Error::from_raw_os_error(raw));
+        assert!(e.is_transient(), "raw {raw} → {e:?}");
+        assert!(!e.is_permanent());
+    }
+
+    #[test]
+    fn classify_cleanup_io_leaves_every_other_kind_alone() {
+        // Not-found still fails fast (nothing to retry), and an unrelated error stays transient.
+        let gone = ReplError::classify_cleanup_io(io::Error::new(io::ErrorKind::NotFound, "gone"));
+        assert!(gone.is_permanent(), "got {gone:?}");
+        let slow = ReplError::classify_cleanup_io(io::Error::new(io::ErrorKind::TimedOut, "slow"));
+        assert!(slow.is_transient(), "got {slow:?}");
     }
 
     #[test]

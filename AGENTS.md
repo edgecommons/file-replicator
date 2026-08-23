@@ -79,6 +79,15 @@ first.
   the `instance` body field; the topic wins, and `src/control.rs`'s `address()` folds it into the body
   selector so every handler reads one selector.
 - Durable **write-ahead** state → crash-safe move+delete with checksum-verify-before-complete.
+- **A source-completion failure is a failure, not a success** (DESIGN §20-I, register entry `I`): the
+  `Verified → CleanupPending → Completed` chain persists the cleanup intent *before* touching the source and
+  writes `Completed` only once the action is **proven** (archive target present + size/checksum match; delete
+  source absent). A failed move, a missing/unwritable `archiveDir`, a failed delete, or a mismatched archive
+  copy leaves the item `CleanupFailed` — no `FileArchived`/`FileDeleted`, no `replicated` increment. Cleanup
+  retries use the shared full-jitter backoff on their own attempt budget (`retry.maxAttempts`, else 10),
+  independent of the transfer's time-based `giveUpAfter`; exhaustion emits `FileCleanupFailed` and parks the
+  item until `trigger` re-drives it. Neither cleanup state is terminal, so a re-discovered source is never
+  re-enqueued. The `SourceFs` seam in `src/instance/worker.rs` is how the failure paths are tested.
 - **Long-outage tolerant** (hours–~2d): time-based `giveUpAfter` (default 7d, not attempt caps, shipped) and
   resume in-flight (shipped). The **disconnection circuit-breaker** (§13.4) is still **not implemented** —
   `Event::Disconnected`/`Reconnected` exist as enum variants in `src/events.rs` marked `Deferred`, and

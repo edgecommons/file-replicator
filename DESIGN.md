@@ -194,6 +194,7 @@ IDs follow the ecosystem `FR-<AREA>-<n>` convention. RFC-2119 keywords.
 - **FR-CMP-4** — Completion MUST be **crash-safe** (no loss, no silent double-delivery; idempotent re-verify on restart; §14).
 - **FR-CMP-5** — `completion` is a **separate instance section**, not part of `egress` (§20-C, accepted).
 - **FR-CMP-6** — On retry-exhaustion, MUST support **quarantine to a Failed dir** (with an error sidecar) or **retain-in-place** (configurable; §13.3).
+- **FR-CMP-7** — A file MUST be recorded as replicated **only when its completion action verifiably happened** (archive target present and matching, or source absent). A failed action is a `CleanupFailed` item, retried on its own bounded budget and surfaced to the operator — never a success (§13.2, §20-I).
 
 ### 4.5 Reliability / retry / resume / limits (REL)
 
@@ -512,7 +513,11 @@ stateDiagram-v2
   InProgress --> Failed: error (attempt++)
   Failed --> Ready: backoff elapsed, within giveUpAfter
   Failed --> Exhausted: giveUpAfter exceeded / maxAttempts hit
-  Verified --> Completed: completion action (delete or archive)
+  Verified --> CleanupPending: cleanup intent persisted (write-ahead)
+  CleanupPending --> Completed: completion action proven (target verified / source gone)
+  CleanupPending --> CleanupFailed: completion action failed (cleanupAttempt++)
+  CleanupFailed --> CleanupPending: cleanup backoff elapsed, within the cleanup attempt budget
+  CleanupFailed --> CleanupPending: trigger (operator re-drive, ignores the gate)
   Exhausted --> Quarantined: onExhausted=quarantine (move to failedDir)
   Exhausted --> Retained: onExhausted=retainInPlace
   Completed --> [*]
@@ -520,8 +525,23 @@ stateDiagram-v2
   Retained --> [*]: (retriable via trigger)
 ```
 
+| State | Meaning | Leaves it |
+|---|---|---|
+| `Ready` | Readiness passed, durably queued. | A claim (`Ready → InProgress`). |
+| `InProgress` | Claimed; delivery to the destinations is underway. | Every destination verified, or an error. |
+| `Verified` | Every configured destination delivered **and** integrity-verified. The source is untouched. | The cleanup intent write-ahead. |
+| `CleanupPending` | The source completion action (`delete`/`archive`) is authorized but not yet proven done. Persisted **before** the filesystem is touched, so a crash here is re-evaluated against observed state on restart. | The action's proof, or its failure. |
+| `CleanupFailed` | Delivered and verified everywhere, but the source was **not** released: the archive move failed, `archiveDir` is missing or unwritable, the delete failed, or the archived copy did not match. Not a success: no `FileArchived`/`FileDeleted`, and `replicated` does not move. | The cleanup backoff gate, or a `trigger`. Once the cleanup attempt budget is spent, only a `trigger`. |
+| `Completed` | Terminal success — the source was **verifiably** deleted or archived. | — |
+| `Failed` | A transfer attempt errored; awaiting backoff. | The gate elapsing, or the budget expiring. |
+| `Exhausted` | `giveUpAfter`/`maxAttempts` spent on the transfer. | `onExhausted`. |
+| `Quarantined` | Moved to `failedDir` with an `.error.json` sidecar. | — |
+| `Retained` | Left in place, marked failed; retriable via `trigger`. | — |
+
 Every transition is written to the durable store **before** the side effect it authorizes (write-ahead), so
-restart re-derives the exact position (§14).
+restart re-derives the exact position (§14). `CleanupPending` and `CleanupFailed` are **not** terminal, so a
+rescan that re-discovers their still-present source preserves the row instead of re-enqueueing an
+already-replicated file as new work.
 
 ### 8.2 Per-instance loop
 
@@ -784,16 +804,48 @@ sequenceDiagram
   D-->>W: delivered with checksum
   W->>D: verify()
   D-->>W: ok
-  W->>S: persist Verified (write-ahead)
+  W->>S: persist Verified
+  W->>S: persist CleanupPending (write-ahead)
   W->>F: completion (delete or move to archive)
+  F-->>W: target verified / source gone
   W->>S: persist Completed
-  Note over W,S: crash between Verified and Completed is recovered idempotently on restart
+  Note over W,S: crash between CleanupPending and Completed is recovered idempotently on restart
+  Note over W,S: an unproven action persists CleanupFailed instead — never Completed
 ```
 
-**Crash recovery:** a crash between *persist Verified* and *persist Completed* is safe — on restart the item
-is re-verified idempotently (the destination object already matches), then the completion action re-runs. The
-file is **never re-uploaded and never lost**. Object stores use **stable, deterministic keys** (relpath +
-prefix) so re-delivery overwrites identically (idempotent), avoiding duplicates (FR-REL-4).
+**Crash recovery:** a crash between *persist CleanupPending* and *persist Completed* is safe — on restart the
+item is re-verified idempotently (the destination object already matches), then the completion action is
+re-evaluated against observed filesystem state: a source still present means the action is retried, a source
+already gone means it landed and the item completes (`move_file` removes the source only after the target
+rename succeeds). The file is **never re-uploaded and never lost**. Object stores use **stable, deterministic
+keys** (relpath + prefix) so re-delivery overwrites identically (idempotent), avoiding duplicates (FR-REL-4).
+
+**Completion is proven, not assumed (§20-I).** `Completed` is persisted only once the action is verified:
+for `archive`, the target exists at the source's byte count and — under `completion.verify: checksum` —
+re-hashes to the checksum the destinations verified against; for `delete`, the source is absent. A failing
+move, a missing or unwritable `archiveDir`, a failing delete, or an archived copy that does not match are all
+**cleanup failures**: the item becomes `CleanupFailed`, no `FileArchived`/`FileDeleted` is emitted, and the
+`replicated` statistic does not move.
+
+**Cleanup retries** run on their own budget, independent of the transfer's: the shared full-jitter backoff
+(`retry.baseDelayMs` → `retry.maxDelayMs`) bounded by `retry.maxAttempts`, or 10 attempts when that is unset.
+The transfer's time-based `giveUpAfter` is deliberately not reused — it starts at discovery and is usually
+largely spent by the time a slow transfer finishes, which would leave exactly the files that struggled hardest
+with no cleanup retries at all. A permanent error (an unconfigured `archiveDir`, a mismatched archive copy)
+gives up on the first attempt: no retry can change either.
+
+**A locked source file is transient on this path.** A `PermissionDenied`/`ResourceBusy` I/O error — Windows
+`ERROR_SHARING_VIOLATION` (32), Unix `EBUSY` (16) — usually means a producer, antivirus scanner, indexer, or
+backup agent still holds the source open, which clears on its own within seconds. Cleanup retries it under
+the backoff rather than parking the file after one attempt. The **transfer** path keeps the opposite rule
+(`PermissionDenied` is a credential/ACL problem an operator must fix, so it fails fast to `Exhausted`); the
+two classifications are `ReplError::classify_cleanup_io` and `ReplError::classify_io`.
+
+Every reconciliation tick re-drives the `CleanupPending` rows and the `CleanupFailed` rows whose gate has
+elapsed. Once the budget is spent, the item stays `CleanupFailed` with a `FileCleanupFailed` event (§17.1),
+a `failed.items[]` entry in `get-status` carrying `state: "cleanup_failed"` and `cleanupAttempts` (§16), and
+one way back: fix the cause, then send `trigger`, which re-drives every `CleanupFailed` item regardless of
+its gate.
 
 ### 13.3 Failure handling & the Failed folder (FR-CMP-6 — your question #9)
 
@@ -1098,10 +1150,17 @@ dispatcher** (resource/verb → handler), structured to be liftable into core al
   "inProgress":[ { "path": "big.parquet", "size": 734003200, "bytesDone": 220200960, "percent": 30.0,
                    "destination": "s3", "attempt": 1 } ],
   "replicated":{ "count": 4310, "bytes": 90230411223, "last": { "path": "...", "at": "..." } },
-  "failed":    { "count": 2, "items": [ { "path": "x.csv", "attempts": 24, "lastError": "...",
-                                          "quarantinedAt": "..." } ] }
+  "failed":    { "count": 3, "items": [ { "path": "x.csv", "attempts": 24, "lastError": "...",
+                                          "quarantinedAt": "..." },
+                                        { "path": "evidence.bin", "state": "cleanup_failed",
+                                          "attempts": 1, "cleanupAttempts": 10, "lastError": "..." } ] }
 }
 ```
+
+The `failed` bucket carries every item needing an operator, discriminated by `items[].state`:
+`failed` (retrying), `exhausted`, `quarantined`, and `cleanup_failed` — the last meaning the file reached
+every destination but its source was never released (§13.2, §20-I). A `cleanup_failed` row adds
+`cleanupAttempts`, because its transfer `attempts` all succeeded.
 
 **P3 reporting notes.** `schedule.mode` reports the **configured** mode verbatim (`immediate` /
 `cron` / `window`) — never a hardcoded literal — so an instance an operator set to a window is not
@@ -1125,9 +1184,14 @@ which derives the `evt/{severity}/{type}` channel from the body — the wire bod
 ### 17.1 Event types (FR-EVT-1)
 
 `FileDiscovered`, `FileReady`, `ReplicationStarted`, `ReplicationProgress`, `ReplicationCompleted`,
-`ReplicationFailed`, `FileArchived`, `FileDeleted`, `FileQuarantined`, `RetriesExhausted`,
-`ScheduleTriggered`, `WindowOpened`, `WindowClosed`, `ScheduleComplete`, `ScanComplete`, `Disconnected`,
-`Reconnected`, **`InstanceActivated`**, **`InstanceDeactivated`**, `ComponentReady`.
+`ReplicationFailed`, `FileArchived`, `FileDeleted`, `FileCleanupFailed`, `FileQuarantined`,
+`RetriesExhausted`, `ScheduleTriggered`, `WindowOpened`, `WindowClosed`, `ScheduleComplete`, `ScanComplete`,
+`Disconnected`, `Reconnected`, **`InstanceActivated`**, **`InstanceDeactivated`**, `ComponentReady`.
+
+`FileArchived` and `FileDeleted` are emitted only for a completion action that verifiably happened.
+`FileCleanupFailed` (`{path, action, attempts}`, last error promoted to `message`, severity `critical`) is
+the counterpart: the file replicated and verified on every destination, but its source was not released and
+the cleanup attempt budget is spent (§13.2, §20-I).
 
 ### 17.2 Example — progress event
 
@@ -1239,6 +1303,38 @@ rehash of the config keys.
 - **H. UNS shape — REVISED per review:** `{thing}/{component}/{class}/{resource…}` — dropped
   `edgecommons` root, `v1` (envelope carries version), and `site`/`enterprise` (unreliable tags → envelope);
   rooted on the IoT-Core-globally-unique `thing`; fits the 256-byte / 7-slash limits (§15). ✔ (confirm §15.2)
+- **I. Source-completion failure is a failure, not a success — DECIDED:** a verified delivery whose source
+  completion action (archive move or delete) does not verifiably happen is recorded as `CleanupFailed`, never
+  `Completed`. Two durable states carry it — `CleanupPending` (the write-ahead marker persisted *before* the
+  filesystem is touched) and `CleanupFailed` (the action failed) — and `Completed` is written only once the
+  action is proven: the archive target exists at the source's byte count and re-hashes to the delivered
+  checksum under `completion.verify: checksum`, or the deleted source is absent. `FileArchived`/`FileDeleted`
+  fire only on a proven action, `FileArchived.archivePath` reports the path the file really landed at (which
+  the `suffix` collision policy can rename) rather than a computed one, and the `replicated` statistic counts
+  only `Completed`. Cleanup retries use the shared full-jitter backoff on their own attempt budget
+  (`retry.maxAttempts`, else 10), independent of the transfer's time-based `giveUpAfter`, and a **locked**
+  source (`PermissionDenied`/`ResourceBusy`, Windows `ERROR_SHARING_VIOLATION`, Unix `EBUSY`) is transient on
+  this path even though it stays permanent on the transfer path. Exhausted items stay
+  `CleanupFailed`, emit `FileCleanupFailed`, appear in `get-status` under `failed.items[]` with
+  `state: "cleanup_failed"` + `cleanupAttempts`, and are re-driven only by `trigger`. §8.1, §13.2, §16, §17.1.
+
+  *Rationale.* The prior behavior logged the filesystem error, persisted `Completed`, counted the file as
+  replicated, and emitted `FileArchived` with a computed `archivePath` that pointed at a file which was never
+  written — while the source sat untouched in the watch directory. For an evidence pipeline that is a false
+  record of custody: the operator's dashboard, the event stream, and the statistics all assert a file was
+  archived when it was not. A missing `archiveDir` was the same failure by another route, silently degrading
+  `archive` into "leave it where it is" while still reporting success. The `Completed` marker's original job —
+  stopping a stale source from being re-discovered in a loop — is preserved by making the two cleanup states
+  non-terminal: `upsert_ready` only resets a *terminal* row, so a re-discovered `CleanupPending`/`CleanupFailed`
+  source keeps its row and is never re-enqueued as new work. An attempt-bounded cleanup budget was chosen over
+  reusing `giveUpAfter` because that clock starts at discovery: a file that spent six days retrying a transfer
+  would otherwise get no cleanup retry at all. The cleanup path's locked-file rule diverges from the transfer
+  path deliberately: on egress a `PermissionDenied` is a credential or ACL an operator must fix, but on the
+  source it is normally a producer, antivirus scanner, indexer, or backup agent still holding the file — the
+  common case on Windows, and one that clears itself in seconds. Failing fast there would demand operator
+  action for a self-healing condition. The alternative of a separate top-level `cleanup` section in the
+  `get-status` document was rejected in favor of the existing `failed` bucket — the item genuinely needs an
+  operator, `failed.items[].state` already discriminates, and consumers need no new schema.
 
 **New decisions in this revision (flag if you disagree):**
 - Cron-first scheduling (`croner`), English as optional sugar; windows = open+close/duration crons (§12).

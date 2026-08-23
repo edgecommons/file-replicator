@@ -154,6 +154,19 @@ struct ScheduleTransition {
     window_closed: bool,
 }
 
+/// The operator overrides a control-plane `trigger` layers on top of an ordinary reconciliation tick
+/// (FR-CTL-3 / DESIGN §20-I). The periodic tick uses [`TickForce::default`] — no overrides.
+#[derive(Debug, Clone, Copy, Default)]
+struct TickForce {
+    /// Bypass the cron/window schedule gate and drain all ready work now (`trigger`'s
+    /// `ignoreWindow`).
+    ignore_window: bool,
+    /// Re-drive every `CleanupFailed` item, including the ones whose cleanup retry budget is spent —
+    /// the operator's way back for a file that is replicated everywhere but whose source could not be
+    /// archived or deleted.
+    redrive_cleanup: bool,
+}
+
 struct QueueMetricSnapshot {
     ready: usize,
     values: MetricValues,
@@ -457,16 +470,17 @@ impl Instance {
     /// the schedule (DESIGN §12). A deactivated instance does nothing. `now` is the single Unix-ms
     /// clock read for this tick.
     pub async fn tick(&self, now: i64) {
-        self.run_tick(now, false).await;
+        self.run_tick(now, TickForce::default()).await;
     }
 
-    /// The tick body. `force = true` is a control-plane `trigger { ignoreWindow: true }` (FR-CTL-3):
-    /// it still discovers/enqueues and promotes retries as usual, but then **bypasses the schedule
-    /// gate** and drains ALL ready work now regardless of cron/window state — an explicit operator
-    /// override. A forced tick does not disturb the cron watermark or window open-state and emits no
-    /// gate-transition events (the control plane emits its own `ScheduleTriggered`), so it never
-    /// perturbs the automatic schedule.
-    async fn run_tick(&self, now: i64, force: bool) {
+    /// The tick body. [`TickForce`] carries the operator overrides a control-plane `trigger` adds on
+    /// top of the ordinary reconciliation pass (FR-CTL-3): `ignore_window` still discovers/enqueues and
+    /// promotes retries as usual but then **bypasses the schedule gate**, draining ALL ready work now
+    /// regardless of cron/window state, and `redrive_cleanup` re-drives even the `CleanupFailed` items
+    /// whose cleanup budget is spent (DESIGN §20-I). A forced tick does not disturb the cron watermark
+    /// or window open-state and emits no gate-transition events (the control plane emits its own
+    /// `ScheduleTriggered`), so it never perturbs the automatic schedule.
+    async fn run_tick(&self, now: i64, force: TickForce) {
         if !self.is_active() {
             self.emit_schedule_metrics(0, false, false, false, false, 0)
                 .await;
@@ -573,13 +587,24 @@ impl Instance {
                 tracing::error!(instance = %self.id, error = %e, "retry promotion task failed")
             }
         }
+        // Cleanup manager (DESIGN §20-I): re-drive every item that is replicated and verified on all
+        // destinations but whose source completion action has not succeeded — a `CleanupPending` row an
+        // abort left mid-action, plus the `CleanupFailed` rows whose cleanup backoff gate has elapsed
+        // (all of them under an operator `trigger`). This runs BEFORE the schedule gate and regardless
+        // of it: the transfer is already paid for, and a source left un-archived is not something a
+        // closed replication window should hold hostage. Serialized with the rest of the tick by
+        // `tick_lock`, so it never races the batch below over the same item.
+        if let Err(e) = self.worker.drive_cleanup(now, force.redrive_cleanup).await {
+            tracing::error!(instance = %self.id, error = %e, "cleanup re-drive failed");
+        }
+
         let queue_snapshot = self.emit_queue_metrics(now).await;
 
         // Scheduling gate (DESIGN §12): decide whether/how ready work may be claimed this tick.
         // Discovery/enqueue above always ran regardless — only the CLAIM is gated, so newly-ready work
         // simply accumulates in the durable `Ready` backlog while the gate is closed. A forced trigger
         // (FR-CTL-3 `ignoreWindow`) bypasses the gate entirely and drains everything now.
-        let (admission, transition) = if force {
+        let (admission, transition) = if force.ignore_window {
             (
                 Admission::All { drain: true },
                 ScheduleTransition::default(),
@@ -1039,6 +1064,17 @@ impl Instance {
                             );
                         }
                     }
+                    // Aborted inside the write-ahead cleanup window: the completion action is still
+                    // owed, so drive it here rather than leaving the row non-terminal until the next
+                    // tick's cleanup pass (DESIGN §20-I).
+                    ItemState::CleanupPending => {
+                        if let Err(e) = self.worker.run_cleanup(&row, now).await {
+                            tracing::error!(
+                                instance = %self.id, relpath = %rp, error = %e,
+                                "completing cleanup-pending item after window-close pause failed"
+                            );
+                        }
+                    }
                     _ => {}
                 },
                 Ok(None) => {}
@@ -1194,7 +1230,19 @@ impl InstanceControl for Instance {
         // `ignore_window` the tick bypasses the schedule gate so a cron/window instance replicates
         // now regardless of its schedule (FR-CTL-3); otherwise it is exactly the periodic-rescan tick
         // (gate-respecting). A deactivated instance's tick is a no-op.
-        self.run_tick(now, ignore_window).await;
+        //
+        // Every `trigger` — with or without `ignoreWindow` — also re-drives the `CleanupFailed` items
+        // whose cleanup budget is spent (DESIGN §20-I). That is the operator's way back for a file that
+        // is replicated and verified everywhere but could not be archived or deleted: fix the cause,
+        // then `trigger`.
+        self.run_tick(
+            now,
+            TickForce {
+                ignore_window,
+                redrive_cleanup: true,
+            },
+        )
+        .await;
     }
 
     fn apply_activation(
@@ -1317,6 +1365,76 @@ mod tests {
             ItemState::Completed
         );
         assert_eq!(store.stats("i1").unwrap().replicated, 2);
+    }
+
+    #[tokio::test]
+    async fn tick_drives_a_cleanup_pending_item_to_completion() {
+        // DESIGN §20-I: the reconciliation tick owns the cleanup pass, so an item left mid-action by a
+        // crash or a window-close abort is finished on the next tick rather than sitting non-terminal.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
+        let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let inst = build(
+            instance_cfg("i1", src.path(), dst.path(), true),
+            store.clone(),
+        );
+        // A prior run delivered + verified and wrote the write-ahead cleanup marker, then died.
+        store.upsert_ready("i1", "a.txt", 5, 0, 1).unwrap();
+        store
+            .set_state("i1", "a.txt", ItemState::CleanupPending, 1)
+            .unwrap();
+
+        inst.tick(100).await;
+
+        assert_eq!(
+            store.get("i1", "a.txt").unwrap().unwrap().state,
+            ItemState::Completed
+        );
+        assert!(!src.path().join("a.txt").exists(), "source released");
+        assert_eq!(store.stats("i1").unwrap().replicated, 1);
+    }
+
+    #[tokio::test]
+    async fn a_parked_cleanup_failure_waits_for_a_trigger_not_for_the_next_tick() {
+        // A cleanup failure whose budget is spent carries a gate no clock reaches, so the ordinary
+        // tick leaves it alone; `trigger` re-drives it (DESIGN §20-I) — the operator's way back once
+        // the underlying cause is fixed.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
+        let store: Arc<dyn StateStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let inst = build(
+            instance_cfg("i1", src.path(), dst.path(), true),
+            store.clone(),
+        );
+        store.upsert_ready("i1", "a.txt", 5, 0, 1).unwrap();
+        store
+            .record_cleanup_attempt(
+                "i1",
+                "a.txt",
+                "disk full",
+                ItemState::CleanupFailed,
+                i64::MAX,
+                1,
+            )
+            .unwrap();
+
+        inst.tick(100).await;
+        assert_eq!(
+            store.get("i1", "a.txt").unwrap().unwrap().state,
+            ItemState::CleanupFailed,
+            "the ordinary tick respects the parked gate"
+        );
+        assert!(src.path().join("a.txt").exists());
+
+        inst.trigger_scan(200, false).await;
+        assert_eq!(
+            store.get("i1", "a.txt").unwrap().unwrap().state,
+            ItemState::Completed,
+            "trigger re-drives a parked cleanup failure"
+        );
+        assert!(!src.path().join("a.txt").exists());
     }
 
     #[tokio::test]

@@ -21,7 +21,15 @@ pub enum ItemState {
     InProgress,
     /// Delivered + integrity-verified; the WRITE-AHEAD point *before* the source side effect (§13.2).
     Verified,
-    /// Terminal success — the source has been deleted or archived.
+    /// Every destination is verified and the source completion action (`delete`/`archive`) is
+    /// authorized but not yet proven done — the WRITE-AHEAD point *before* the filesystem side effect
+    /// (DESIGN §13.2/§20-I). Crash recovery re-evaluates it against observed filesystem state.
+    CleanupPending,
+    /// Every destination is verified but the source completion action failed. Retried on its own
+    /// bounded backoff clock; once that budget is spent the item stays here — operator-visible in
+    /// `get-status`, re-drivable with `trigger`. Never counted as replicated (DESIGN §20-I).
+    CleanupFailed,
+    /// Terminal success — the source has been **verifiably** deleted or archived.
     Completed,
     /// Last attempt errored; awaiting backoff (attempts recorded, `next_attempt_at` set).
     Failed,
@@ -40,6 +48,8 @@ impl ItemState {
             ItemState::Ready => "ready",
             ItemState::InProgress => "in_progress",
             ItemState::Verified => "verified",
+            ItemState::CleanupPending => "cleanup_pending",
+            ItemState::CleanupFailed => "cleanup_failed",
             ItemState::Completed => "completed",
             ItemState::Failed => "failed",
             ItemState::Exhausted => "exhausted",
@@ -59,6 +69,8 @@ impl ItemState {
             "ready" => ItemState::Ready,
             "in_progress" => ItemState::InProgress,
             "verified" => ItemState::Verified,
+            "cleanup_pending" => ItemState::CleanupPending,
+            "cleanup_failed" => ItemState::CleanupFailed,
             "completed" => ItemState::Completed,
             "failed" => ItemState::Failed,
             "exhausted" => ItemState::Exhausted,
@@ -69,6 +81,11 @@ impl ItemState {
     }
 
     /// True for the terminal states no worker will re-claim: `Completed`, `Quarantined`, `Retained`.
+    ///
+    /// [`CleanupPending`](Self::CleanupPending) and [`CleanupFailed`](Self::CleanupFailed) are
+    /// deliberately **not** terminal: the source file is still on disk, so re-discovery must preserve
+    /// the row (see [`StateStore::upsert_ready`](crate::state::StateStore::upsert_ready), which only
+    /// resets a *terminal* row) rather than re-enqueue an already-replicated file as new work.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -92,8 +109,17 @@ pub struct WorkItem {
     pub size: u64,
     /// Unix ms — oldest-ready-first ordering.
     pub discovered_at: i64,
+    /// Transfer attempts (the aggregate rollup across destinations). Cleanup attempts are counted
+    /// separately in [`cleanup_attempts`](Self::cleanup_attempts).
     pub attempts: u32,
-    /// Unix ms — backoff gate for re-claim (P1 addition to the §14.2 schema).
+    /// Source-completion (`delete`/`archive`) attempts made since the item was first verified — the
+    /// cleanup retry clock, kept independent of the transfer's `attempts`/`giveUpAfter` budget so a
+    /// file that spent its whole transfer budget still gets a full set of cleanup retries
+    /// (DESIGN §20-I).
+    pub cleanup_attempts: u32,
+    /// Unix ms — backoff gate for re-claim (P1 addition to the §14.2 schema). While the item is
+    /// `CleanupPending`/`CleanupFailed` the transfer is already done, so this same column carries the
+    /// **cleanup** retry gate.
     pub next_attempt_at: i64,
     pub last_error: Option<String>,
     pub bytes_done: u64,
@@ -224,6 +250,8 @@ mod tests {
             ItemState::Ready,
             ItemState::InProgress,
             ItemState::Verified,
+            ItemState::CleanupPending,
+            ItemState::CleanupFailed,
             ItemState::Completed,
             ItemState::Failed,
             ItemState::Exhausted,
@@ -262,6 +290,8 @@ mod tests {
             ItemState::Ready,
             ItemState::InProgress,
             ItemState::Verified,
+            ItemState::CleanupPending,
+            ItemState::CleanupFailed,
             ItemState::Failed,
             ItemState::Exhausted,
         ] {

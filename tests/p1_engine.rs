@@ -246,6 +246,18 @@ impl StateStore for FailCompletedOnceStore {
         self.inner
             .record_attempt(instance, relpath, err, next_state, next_attempt_at, now)
     }
+    fn record_cleanup_attempt(
+        &self,
+        instance: &str,
+        relpath: &str,
+        err: &str,
+        next_state: ItemState,
+        next_attempt_at: i64,
+        now: i64,
+    ) -> ReplResult<()> {
+        self.inner
+            .record_cleanup_attempt(instance, relpath, err, next_state, next_attempt_at, now)
+    }
     fn set_bytes_done(&self, instance: &str, relpath: &str, bytes: u64, now: i64) -> ReplResult<()> {
         self.inner.set_bytes_done(instance, relpath, bytes, now)
     }
@@ -787,18 +799,21 @@ async fn crash_after_source_delete_before_completed_recovers_exactly_once() {
     ));
 
     // Phase A — one tick: deliver + verify succeed, the source is deleted, but persisting Completed
-    // fails (the injected crash). The item is left Verified: source gone, dest written, not counted.
+    // fails (the injected crash). The item is left CleanupPending: source gone, dest written, not
+    // counted. `CleanupPending` is the write-ahead marker written immediately before the source side
+    // effect (DESIGN §20-I), so it is exactly what a crash in this window leaves behind.
     inst.tick(1_000).await;
     assert_eq!(std::fs::read(dst.path().join("once.dat")).unwrap(), PAYLOAD, "delivered");
     assert!(!src.path().join("once.dat").exists(), "source side effect ran before Completed persist");
     assert_eq!(
         store.get("once", "once.dat").unwrap().unwrap().state,
-        ItemState::Verified,
-        "Verified persisted before the source side effect; Completed not yet written"
+        ItemState::CleanupPending,
+        "the cleanup intent is persisted before the source side effect; Completed not yet written"
     );
     assert_eq!(store.stats("once").unwrap().replicated, 0, "not counted before Completed");
 
-    // Phase B — restart: recovery re-verifies the destination (still present) and completes the item.
+    // Phase B — restart: recovery re-evaluates the cleanup against observed state (the source is
+    // already gone, so the delete landed) and completes the item.
     let cancel = CancellationToken::new();
     let handle = {
         let inst = inst.clone();
