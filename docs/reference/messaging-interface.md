@@ -8,13 +8,13 @@ Full rationale in [`DESIGN.md`](https://github.com/edgecommons/file-replicator/b
 page and the `crate::events`/`crate::control` module docs are the source of truth for the message contract.
 
 ```
-ecv1/{device}/{component}/[{instance}/]{class}[/{channel…}]
+ecv1/{device}/{component}[/{instance}]/{class}[/{channel…}]
 ```
 
 - `{device}` — the resolved ThingName (`-t`/`--thing`).
-- `{component}` — the SHORT UNS token edgecommons derives from the full name (the segment after the last
-  `.` — `com.mbreissi.edgecommons.FileReplicator` → **`FileReplicator`**), not the `file-replicator`
-  registry slug.
+- `{component}` — the resolved UNS token. The supplied configuration sets `component.token` to
+  `file-replicator`; the examples below use that token. Match the resolved token in your deployment
+  if you supply a different configuration.
 - `{instance}` — OPTIONAL. Present (a `component.instances[].id`) for instance-scoped traffic — a
   replication instance's own events (`file-ready`, `replication-*`, …) ride `gg.instance(id).events()`,
   and a command addressed at one instance rides that instance's own command inbox.
@@ -29,8 +29,8 @@ There is no configurable topic prefix and no legacy alias — the UNS grammar ab
 
 ## Commands (`cmd`, request/reply via `reply_to`)
 
-Two inboxes carry commands: the component one, `ecv1/{device}/FileReplicator/cmd/#`, and one per
-replication instance, `ecv1/{device}/FileReplicator/{instance}/cmd/#`. Publish commands with the
+Two inboxes carry commands: the component one, `ecv1/{device}/file-replicator/cmd/#`, and one per
+replication instance, `ecv1/{device}/file-replicator/{instance}/cmd/#`. Publish commands with the
 edgecommons client APIs (`MessageBuilder` + `MessagingService` request/reply, or an equivalent protobuf
 producer), not by sending JSON text to MQTT. Every decoded reply body is
 `{"ok": true, "result": <value>}` or `{"ok": false, "error": {"code", "message"}}` (the edgecommons
@@ -47,8 +47,8 @@ command-inbox contract — the request's `header.name` MUST equal the verb).
 Each verb declares an addressing **scope**, which the library enforces before the verb runs:
 
 - **`both`** (`get-status`, `trigger`) — either inbox is meaningful. Address the component
-  (`…/FileReplicator/cmd/{verb}`) for the fleet-wide answer, or one instance
-  (`…/FileReplicator/{instance}/cmd/{verb}`) for that instance alone.
+  (`…/file-replicator/cmd/{verb}`) for the fleet-wide answer, or one instance
+  (`…/file-replicator/{instance}/cmd/{verb}`) for that instance alone.
 - **`instance`** (`set-activation`) — this verb has no "all" form. It answers `INSTANCE_REQUIRED`
   when neither the topic nor the body names an instance.
 
@@ -111,7 +111,7 @@ again. See **Permission handling** in `explanation.md`. Governed by `onPermissio
 ## State / heartbeat — library-owned
 
 The UNS `state` class is **reserved** (library-owned; an app-level publish to it is rejected) and carries
-only the library's own `RUNNING`/`STOPPED` keepalive (`ecv1/{device}/FileReplicator/state`, on by
+only the library's own `RUNNING`/`STOPPED` keepalive (`ecv1/{device}/file-replicator/state`, on by
 default, 5 s, best-effort `STOPPED` on shutdown). The component publishes no `state` snapshot of its own,
 and none is retained (there are no retained MQTT messages; a timestamped app-layer cache on the consumer
 side is the substitute). The "current state on demand" path is **`get-status`** (a `cmd` verb, above),
@@ -123,7 +123,7 @@ answers `get-status` — `active: false`, `disabled: true`, `disabledReason` —
 
 Metrics are emitted through `gg.metrics()` on the reserved UNS `metric` class, using the configured
 `metricEmission` target. The compatibility `fileReplicator` group and the richer
-`FileReplicator*` groups publish under `ecv1/{device}/FileReplicator/metric/{metricName}`.
+`FileReplicator*` groups publish under `ecv1/{device}/file-replicator/metric/{metricName}`.
 For every metric's dimensions, measures, units, and diagnostic purpose, see
 [Reference - Metrics](metrics.md).
 

@@ -16,9 +16,9 @@ unsigned 64-bit (a JavaScript consumer may lose precision above 2^53). Timestamp
 
 `get-status` returns different shapes depending on which instance, if any, the request names:
 
-- **No instance named** — `…/FileReplicator/cmd/get-status` with no `instance` body field → a
+- **No instance named** — `…/file-replicator/cmd/get-status` with no `instance` body field → a
   **component-wide** document: a roster of every instance plus a summary.
-- **One instance named** — `…/FileReplicator/{id}/cmd/get-status`, or the component topic with
+- **One instance named** — `…/file-replicator/{id}/cmd/get-status`, or the component topic with
   `{ "instance": "<id>" }` → that one instance's **per-instance** document (or its **disabled**
   document if it was disabled at startup). An unknown id is the error `UNKNOWN_INSTANCE`.
 
@@ -26,7 +26,9 @@ The reply is always wrapped by the command contract: `{ "ok": true, "result": <d
 
 ### Component-wide document
 
-```json
+Illustrative JSON fragment; omitted fields and surrounding object context are not shown. This is not a complete input document.
+
+```text
 {
   "component": "com.mbreissi.edgecommons.FileReplicator",
   "thing": "gw-01",

@@ -68,7 +68,7 @@ Every lifecycle step is published on the UNS `evt` class. One wildcard covers ev
 device:
 
 ```bash
-mosquitto_sub -t 'ecv1/+/FileReplicator/+/evt/#' -v
+mosquitto_sub -t 'ecv1/+/file-replicator/+/evt/#' -v
 ```
 
 The broker payload is an EdgeCommons protobuf envelope, so a plain MQTT client shows bytes rather than
@@ -76,10 +76,10 @@ JSON. A protobuf-aware EdgeCommons client or test harness will show decoded even
 shape:
 
 ```
-ecv1/my-thing/FileReplicator/spool-to-archive/evt/info/file-ready              {"severity":"info","type":"file-ready","context":{"path":"report2.txt","size":22}, ...}
-ecv1/my-thing/FileReplicator/spool-to-archive/evt/info/replication-started     { ... "context":{"path":"report2.txt","destination":"local","attempt":1, ...} }
-ecv1/my-thing/FileReplicator/spool-to-archive/evt/info/replication-completed   { ... "context":{"path":"report2.txt","destination":"local","bytes":22, ...} }
-ecv1/my-thing/FileReplicator/spool-to-archive/evt/info/file-archived           { ... "context":{"path":"report2.txt","archivePath":"..."} }
+ecv1/my-thing/file-replicator/spool-to-archive/evt/info/file-ready              {"severity":"info","type":"file-ready","context":{"path":"report2.txt","size":22}, ...}
+ecv1/my-thing/file-replicator/spool-to-archive/evt/info/replication-started     { ... "context":{"path":"report2.txt","destination":"local","attempt":1, ...} }
+ecv1/my-thing/file-replicator/spool-to-archive/evt/info/replication-completed   { ... "context":{"path":"report2.txt","destination":"local","bytes":22, ...} }
+ecv1/my-thing/file-replicator/spool-to-archive/evt/info/file-archived           { ... "context":{"path":"report2.txt","archivePath":"..."} }
 ```
 
 The channel (`evt/{severity}/{type}`) is derived from the event body, so the topic and body can never
@@ -93,7 +93,7 @@ The component emits metrics through the library-owned UNS `metric` class when `m
 routes them to messaging:
 
 ```bash
-mosquitto_sub -t 'ecv1/+/FileReplicator/+/metric/#' -v
+mosquitto_sub -t 'ecv1/+/file-replicator/+/metric/#' -v
 ```
 
 The tutorial config emits the compatibility `fileReplicator` group plus richer operational groups such as
