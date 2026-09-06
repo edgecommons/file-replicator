@@ -14,7 +14,7 @@ The component owns the `component` section (`component.global` + `component.inst
 `metricEmission` routes the compatibility `fileReplicator` metric group and the richer
 `FileReplicatorDiscovery`, `FileReplicatorQueue`, `FileReplicatorTransfer`,
 `FileReplicatorDestination`, and `FileReplicatorSchedule` groups. With `target: "messaging"`, the
-library publishes to the reserved UNS `metric` class (`ecv1/{device}/FileReplicator/metric/{name}`);
+library publishes to the reserved UNS `metric` class (`ecv1/{device}/file-replicator/metric/{name}`);
 with CloudWatch or Prometheus, the same group names and bounded dimensions are used there. See
 [Reference - Metrics](metrics.md).
 
@@ -28,7 +28,7 @@ with CloudWatch or Prometheus, the same group names and bounded dimensions are u
 | `onPermissionError` | `"disableInstance"` \| `"fatal"` \| `"retain"` | `"disableInstance"` | Component-wide default for what happens when an instance's ingress/egress/archive/failed directory fails a startup readable/writable check. An instance's own `onPermissionError` (below) overrides this. See **Permission handling** in `explanation.md`. |
 
 > There is no `topics.prefix`/`legacyConfigTopic` config anymore — topics are minted by the edgecommons UNS
-> core (`ecv1/{device}/FileReplicator/{instance}/{class}…`, fixed grammar, no override). See
+> core (`ecv1/{device}/file-replicator/{instance}/{class}…`, fixed grammar, no override). See
 > [Reference › Messaging interface](messaging-interface.md).
 
 ## `component.instances[]` — one per watched directory

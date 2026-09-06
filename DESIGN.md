@@ -22,14 +22,15 @@ name and do not need correction — check `src/` before assuming a gap noted the
 > **migrated onto the edgecommons UNS core + message-class facades** (commit `refactor: migrate the
 > UNS/messaging surface onto the new edgecommons core + facades`, and the `edgecommons` `v0.2.0` pin). As
 > shipped today:
-> - Topics are minted by `gg.commands()`/`gg.events()` at `ecv1/{device}/FileReplicator/{instance}/{class}`
+> - Topics are minted by `gg.commands()`/`gg.events()` at `ecv1/{device}/file-replicator[/{instance}]/{class}`
 >   (`{class}` ∈ `cmd`·`evt`, plus the reserved library-owned `state`/`cfg`/`metric`/`log`). **`src/uns.rs`
 >   is deleted.**
 > - The `component.global.topics.prefix` / `InstanceCfg.topics` config and the `legacyConfigTopic` alias
 >   are **removed** (no configurable prefix, no core-`GetConfiguration` alias).
 > - The custom `get-config` verb is **retired** — the library's built-in `get-configuration` answers it,
->   returning the **redacted** effective config. Instance scoping is now a request-**body** field, not a
->   topic segment (`cmd/get-status` + `{instance?}`, not `cmd/instances/{id}/status`).
+>   returning the **redacted** effective config. Current commands support the component inbox with
+>   an `instance` body selector and the instance-scoped inbox. Conflicting selectors are rejected;
+>   see [the maintained messaging reference](docs/reference/messaging-interface.md).
 > - The retained `state/…` snapshot is **dropped outright** — `state` is now a reserved, library-owned
 >   class carrying only the RUNNING/STOPPED keepalive. This **closes the FR-EVT-4 "no `publish_retained`"
 >   gap by removing the need for it**, not by adding retention; `get-status` remains the
